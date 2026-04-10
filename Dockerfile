@@ -1,6 +1,6 @@
 FROM python:3.12-bookworm
 
-# Install Chrome + dependencies
+# Install Google Chrome + dependencies
 RUN apt-get update && apt-get install -y \
     wget \
     unzip \
@@ -34,6 +34,9 @@ RUN apt-get update && apt-get install -y \
     libxss1 \
     libxtst6 \
     xdg-utils \
+    && wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get install -y ./google-chrome-stable_current_amd64.deb \
+    && rm google-chrome-stable_current_amd64.deb \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -44,5 +47,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 ENV PYTHONUNBUFFERED=1
+ENV DISPLAY=:99
 
 CMD ["python", "app.py"]
