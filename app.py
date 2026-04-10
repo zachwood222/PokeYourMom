@@ -96,14 +96,13 @@ def get_driver():
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--window-size=1920,1080")
-        
-        # Explicit Chrome path for Render
         options.binary_location = "/usr/bin/google-chrome"
 
-        if config.get("USE_PROXY") and config.get("PROXIES"):
-            proxy = random.choice(config["PROXIES"])
-            options.add_argument(f'--proxy-server={proxy}')
-            log(f"🔌 Using proxy: {proxy}")
+        # Temporarily disable proxy for testing
+        # if config.get("USE_PROXY") and config.get("PROXIES") and config["PROXIES"][0] != "http://user:pass@residential-proxy-ip:port":
+        #     proxy = random.choice(config["PROXIES"])
+        #     options.add_argument(f'--proxy-server={proxy}')
+        #     log(f"🔌 Using proxy: {proxy}")
 
         driver = uc.Chrome(options=options, version_main=None)
         selenium_stealth.stealth(driver, languages=["en-US", "en"], vendor="Google Inc.", platform="Win32", fix_hairline=True)
@@ -111,7 +110,7 @@ def get_driver():
         log("✅ Driver started successfully")
         return driver
     except Exception as e:
-        log(f"Driver failed: {str(e)}")
+        log(f"❌ Driver failed: {str(e)}")
         raise
 
 def human_behavior(driver, intensive=False):
@@ -260,20 +259,23 @@ def bot_loop():
                 driver = get_driver()
                 build_trust(driver)
             
+            log(f"🔍 Starting scan of {len(products)} products...")
             for product in products:
                 if not bot_running:
                     break
+                log(f"🔍 Checking → {product['name']}")
                 result = check_product(driver, product)
                 if result == "ORDER_PLACED":
+                    log("🎉 ORDER PLACED! Taking long cooldown...")
                     time.sleep(random.randint(35, 65) * 60)
                     break
                 time.sleep(random.uniform(25, 50))
             
             wait = random.randint(15, 45) if config.get("AGGRESSIVE_MODE") else random.randint(180, 420)
-            log(f"✅ Scan complete. Next scan in ~{wait}s")
+            log(f"✅ Full scan done. Next scan in ~{wait} seconds")
             time.sleep(wait)
         except Exception as e:
-            log(f"Loop error: {str(e)}")
+            log(f"💥 Major loop error: {str(e)}")
             time.sleep(30)
 
 # ====================== ROUTES ======================
