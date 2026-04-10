@@ -94,7 +94,14 @@
         fetch('/api/proxies', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({proxies})})
         .then(() => alert('Proxies saved'));
     }
-
+    function saveAlertWebhooks() {
+        const hooks = document.getElementById('alertWebhooks').value.trim().split('\n').filter(Boolean);
+        fetch('/api/alerts', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({alert_webhooks: hooks})
+        }).then(() => alert('Alert webhooks saved!'));
+    }
     function enableAggressiveForDrop() {
         document.getElementById('aggressive').checked = true;
         updateConfig();
