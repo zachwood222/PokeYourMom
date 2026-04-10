@@ -6,15 +6,15 @@
     <style>
         body { font-family: Arial, sans-serif; background: #0f0f0f; color: #00ff88; margin: 0; padding: 20px; }
         .container { max-width: 1200px; margin: auto; }
-        button { padding: 12px 20px; margin: 5px; font-weight: bold; border: none; border-radius: 4px; }
+        button { padding: 12px 20px; margin: 5px; font-weight: bold; border: none; border-radius: 4px; cursor: pointer; }
         .green { background: #00cc00; color: black; }
         .red { background: #cc0000; color: white; }
         .orange { background: #ff8800; color: black; }
-        #logs { background: #000; height: 400px; overflow-y: scroll; padding: 15px; font-family: Consolas, monospace; border: 1px solid #00ff88; }
-        .box { background: #1a1a1a; padding: 15px; border-radius: 8px; margin: 15px 0; border: 2px solid #00ff88; }
-        input, textarea { background: #222; color: #0f0; border: 1px solid #0f0; padding: 8px; width: 100%; margin: 5px 0; }
+        #logs { background: #000; height: 380px; overflow-y: scroll; padding: 15px; font-family: Consolas, monospace; border: 1px solid #00ff88; }
+        .box { background: #1a1a1a; padding: 18px; border-radius: 8px; margin: 15px 0; border: 2px solid #00ff88; }
+        input, textarea { background: #222; color: #0f0; border: 1px solid #0f0; padding: 8px; margin: 5px 0; width: 100%; }
         ul { list-style: none; padding: 0; }
-        li { background: #222; padding: 8px; margin: 4px 0; border-radius: 4px; }
+        li { background: #222; padding: 10px; margin: 6px 0; border-radius: 4px; display: flex; justify-content: space-between; }
     </style>
 </head>
 <body>
@@ -22,12 +22,12 @@
     <h1>🎯 Pokémon Target Sniper Bot 2026</h1>
     
     <button onclick="toggleBot()" id="toggleBtn" class="green" style="font-size:18px;">START BOT</button>
-    <button onclick="location.reload()" style="background:#444;">Refresh Dashboard</button>
+    <button onclick="loadProducts()" style="background:#444;">Refresh Products</button>
 
     <!-- Drop Timer -->
     <div class="box">
         <h2>⏰ Next Target Drop Windows (ET)</h2>
-        <div id="dropTimer" style="font-size:18px;"></div>
+        <div id="dropTimer" style="font-size:18px; font-weight:bold;"></div>
         <button onclick="enableAggressiveForDrop()" class="orange">🚀 Enable Aggressive for Next Drop</button>
     </div>
 
@@ -44,18 +44,18 @@
         <label><input type="checkbox" id="autoCheckout" onchange="updateConfig()"> Auto Full Checkout (High Risk)</label><br>
         <label><input type="checkbox" id="aggressive" onchange="updateConfig()"> Aggressive Mode</label><br>
         <label><input type="checkbox" id="trust" onchange="updateConfig()"> Trust Building</label><br>
-        <label><input type="checkbox" id="proxy" onchange="updateConfig()"> Use Proxies</label><br>
+        <label><input type="checkbox" id="proxy" onchange="updateConfig()"> Use Proxies</label><br><br>
         Discord Webhook: <input type="text" id="webhook" style="width:500px" onchange="updateConfig()">
     </div>
 
     <h2>Add New Product</h2>
     <div class="box">
-        <input id="prodName" placeholder="Product Name">
+        <input id="prodName" placeholder="Product Name (e.g. Prismatic Evolutions ETB)">
         <input id="prodUrl" placeholder="Full Target URL" style="width:500px">
-        <button onclick="addProduct()">Add Product</button>
+        <button onclick="addProduct()">+ Add Product</button>
     </div>
 
-    <h2>Monitored Products</h2>
+    <h2>Monitored Products (<span id="productCount">0</span>)</h2>
     <div class="box">
         <ul id="productList"></ul>
     </div>
@@ -75,9 +75,7 @@
     function toggleBot() {
         const btn = document.getElementById('toggleBtn');
         const isStarting = btn.innerText.includes('START');
-        const action = isStarting ? 'start' : 'stop';
-        fetch('/api/' + action, {method: 'POST'})
-            .then(r => r.json())
+        fetch('/api/' + (isStarting ? 'start' : 'stop'), {method: 'POST'})
             .then(() => {
                 btn.innerText = isStarting ? 'STOP BOT' : 'START BOT';
                 btn.className = isStarting ? 'red' : 'green';
@@ -93,11 +91,7 @@
             DISCORD_WEBHOOK: document.getElementById('webhook').value,
             ENABLE_ALERT_LISTENER: document.getElementById('alertListener').checked
         };
-        fetch('/api/config', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(data)
-        });
+        fetch('/api/config', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)});
     }
 
     function addProduct() {
@@ -108,8 +102,30 @@
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({name, url})
-            }).then(() => location.reload());
+            }).then(() => loadProducts());
+            document.getElementById('prodName').value = '';
+            document.getElementById('prodUrl').value = '';
         }
+    }
+
+    function loadProducts() {
+        fetch('/api/products')
+            .then(r => r.json())
+            .then(data => {
+                const list = document.getElementById('productList');
+                list.innerHTML = '';
+                document.getElementById('productCount').textContent = data.length;
+                data.forEach((p, i) => {
+                    const li = document.createElement('li');
+                    li.innerHTML = `${p.name} <button onclick="removeProduct(${i})" style="background:#aa0000;color:white;font-size:12px;padding:4px 8px;">Remove</button>`;
+                    list.appendChild(li);
+                });
+            });
+    }
+
+    function removeProduct(index) {
+        fetch(`/api/products/${index}`, {method: 'DELETE'})
+            .then(() => loadProducts());
     }
 
     function saveAlertWebhooks() {
@@ -124,41 +140,30 @@
     function enableAggressiveForDrop() {
         document.getElementById('aggressive').checked = true;
         updateConfig();
-        alert("Aggressive Mode enabled for next drop!");
-    }
-
-    // Load products and settings
-    function loadData() {
-        fetch('/').then(r => r.text()).then(html => {
-            const temp = document.createElement('div');
-            temp.innerHTML = html;
-            // Simple reload works better for now
-            location.reload(); // Force refresh to load current products
-        });
+        alert("Aggressive Mode enabled!");
     }
 
     // Live Drop Timer
     function updateDropTimer() {
         const timerDiv = document.getElementById('dropTimer');
         const now = new Date();
-        let etNow = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
-        
-        let nextDrop = new Date(etNow);
-        nextDrop.setHours(10, 0, 0, 0);
-        if (etNow > nextDrop) nextDrop.setHours(14, 0, 0, 0);
-        if (etNow > nextDrop) nextDrop.setDate(nextDrop.getDate() + 1);
+        const etNow = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
+        let next = new Date(etNow);
+        next.setHours(10, 0, 0, 0);
+        if (etNow > next) next.setHours(14, 0, 0, 0);
+        if (etNow > next) next.setDate(next.getDate() + 1);
 
-        const diff = nextDrop - etNow;
-        const hours = Math.floor(diff / (1000 * 60 * 60));
-        const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-
-        timerDiv.innerHTML = `<strong>Next Drop:</strong> ${nextDrop.getHours() === 10 ? '10:00 AM' : '2:00 PM'} ET in ${hours}h ${minutes}m`;
+        const diff = next - etNow;
+        const h = Math.floor(diff / (1000*60*60));
+        const m = Math.floor((diff % (1000*60*60)) / (1000*60));
+        timerDiv.textContent = `Next Drop: ${next.getHours()===10 ? '10:00 AM' : '2:00 PM'} ET (${h}h ${m}m remaining)`;
     }
 
-    setInterval(updateDropTimer, 30000);
+    // Initial load
     window.onload = () => {
+        loadProducts();
         updateDropTimer();
-        document.getElementById('toggleBtn').innerText = "START BOT";
+        setInterval(updateDropTimer, 30000);
     };
 </script>
 </body>
