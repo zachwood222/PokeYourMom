@@ -96,6 +96,8 @@ def get_driver():
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--window-size=1920,1080")
+        
+        # Explicit Chrome path for Render
         options.binary_location = "/usr/bin/google-chrome"
 
         if config.get("USE_PROXY") and config.get("PROXIES"):
@@ -105,10 +107,11 @@ def get_driver():
 
         driver = uc.Chrome(options=options, version_main=None)
         selenium_stealth.stealth(driver, languages=["en-US", "en"], vendor="Google Inc.", platform="Win32", fix_hairline=True)
+        
         log("✅ Driver started successfully")
         return driver
     except Exception as e:
-        log(f"Driver init failed: {str(e)}")
+        log(f"Driver failed: {str(e)}")
         raise
 
 def human_behavior(driver, intensive=False):
