@@ -29,7 +29,48 @@ os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 bot_running = False
 driver = None
 bot_thread = None
-products = []
+products = PRODUCTS = [
+    {
+        "name": "Prismatic Evolutions Elite Trainer Box",
+        "url": "https://www.target.com/p/2024-pok-scarlet-violet-s8-5-elite-trainer-box/-/A-93954435"
+    },
+    {
+        "name": "Prismatic Evolutions Elite Trainer Box (Alt Listing)",
+        "url": "https://www.target.com/p/pokemon-tcg-scarlet-violet-elite-trainer-box-prismatic-evolutions-of-the-pokemon-tcg-1-fully-illustrated-promo-card-9-booster-packs-premium/-/A-1008746912"
+    },
+    {
+        "name": "Surging Sparks Elite Trainer Box",
+        "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-surging-sparks-elite-trainer-box/-/A-91619922"
+    },
+    {
+        "name": "Surging Sparks Booster Bundle",
+        "url": "https://www.target.com/p/pokemon-scarlet-violet-surging-sparks-booster-trading-cards/-/A-93486336"
+    },
+    {
+        "name": "Scarlet & Violet 151 Elite Trainer Box",
+        "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-151-elite-trainer-box/-/A-88897899"
+    },
+    {
+        "name": "Mega Evolution - Perfect Order Elite Trainer Box",
+        "url": "https://www.target.com/p/pok-233-mon-trading-card-game-mega-evolution-perfect-order-elite-trainer-box/-/A-95230445"
+    },
+    {
+        "name": "Mega Evolution - Ascended Heroes Elite Trainer Box",
+        "url": "https://www.target.com/p/2025-pok-me-2-5-elite-trainer-box/-/A-95082118"
+    },
+    {
+        "name": "Pokémon Day 2026 Collection",
+        "url": "https://www.target.com/p/2025-pok-pokemon-day/-/A-95082138"
+    },
+    {
+        "name": "Destined Rivals Elite Trainer Box",
+        "url": "https://www.target.com/p/pok-233-mon-trading-card-game-scarlet-38-violet-8212-destined-rivals-elite-trainer-box/-/A-94300069"
+    },
+    {
+        "name": "Twilight Masquerade Elite Trainer Box",
+        "url": "https://www.target.com/p/pok-233-mon-trading-card-game-scarlet-38-violet-8212-twilight-masquerade-elite-trainer-box/-/A-91619960"
+    }
+]
 config = {}
 
 def load_config():
