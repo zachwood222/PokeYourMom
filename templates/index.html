@@ -127,6 +127,14 @@
         timerDiv.innerHTML = html;
     }
 
+        <!-- GROUP ALERTS LISTENER -->
+    <div class="drop-box" style="border-color: #00aaff;">
+        <h2>📡 Group Alerts Listener (Discord)</h2>
+        <label><input type="checkbox" id="alertListener" onchange="updateConfig()" checked> Enable External Alert Listener</label><br><br>
+        <textarea id="alertWebhooks" rows="4" placeholder="Paste Discord webhook URLs (one per line)"></textarea>
+        <button onclick="saveAlertWebhooks()">Save Alert Webhooks</button>
+        <small>Paste webhooks from Pokemon Restocks, Poke Alerts, TrackaLacker, etc.</small>
+    </div>
     setInterval(updateDropTimer, 30000);
     window.onload = updateDropTimer;
 </script>
