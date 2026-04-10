@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Pokémon Target Sniper 2026 - Web Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; background: #0f0f0f; color: #00ff88; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: auto; }
+        button { padding: 12px 20px; margin: 5px; font-weight: bold; }
+        .green { background: #00cc00; color: black; }
+        .red { background: #cc0000; color: white; }
+        #logs { background: #000; height: 420px; overflow-y: scroll; padding: 15px; font-family: Consolas, monospace; border: 1px solid #00ff88; }
+        input, select { background: #222; color: #0f0; border: 1px solid #0f0; padding: 8px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>🎯 Pokémon Target Sniper Bot 2026 - Web Dashboard</h1>
+    <button onclick="toggleBot()" id="toggleBtn" class="green" style="font-size:18px;">START BOT</button>
+
+    <h2>Settings</h2>
+    <label><input type="checkbox" id="autoCheckout" onchange="updateConfig()"> Auto Full Checkout (High Risk)</label><br>
+    <label><input type="checkbox" id="aggressive" onchange="updateConfig()"> Aggressive Mode (Drop Windows)</label><br>
+    <label><input type="checkbox" id="trust" onchange="updateConfig()"> Trust Building</label><br>
+    <label><input type="checkbox" id="proxy" onchange="updateConfig()"> Use Proxies</label><br><br>
+
+    Discord Webhook: <input type="text" id="webhook" style="width:500px" onchange="updateConfig()"><br><br>
+
+    <h2>Proxies (one per line)</h2>
+    <textarea id="proxyList" rows="3" style="width:100%"></textarea>
+    <button onclick="saveProxies()">Save Proxies</button>
+
+    <h2>Add Product</h2>
+    <input id="prodName" placeholder="Product Name (e.g. Surging Sparks ETB)">
+    <input id="prodUrl" placeholder="Full Target URL" style="width:500px">
+    <button onclick="addProduct()">Add Product</button>
+
+    <h2>Monitored Products</h2>
+    <ul id="productList"></ul>
+
+    <h2>Screenshots Gallery</h2>
+    <div id="gallery"></div>
+
+    <h2>Live Logs</h2>
+    <div id="logs"></div>
+</div>
+
+<script>
+    const socket = io();
+    socket.on('log', d => {
+        const logs = document.getElementById('logs');
+        logs.innerHTML += d.message + '<br>';
+        logs.scrollTop = logs.scrollHeight;
+    });
+
+    function toggleBot() {
+        const btn = document.getElementById('toggleBtn');
+        const action = btn.innerText.includes('START') ? 'start' : 'stop';
+        fetch('/api/' + action, {method: 'POST'}).then(() => location.reload());
+    }
+
+    function updateConfig() {
+        const data = {
+            AUTO_FULL_CHECKOUT: document.getElementById('autoCheckout').checked,
+            AGGRESSIVE_MODE: document.getElementById('aggressive').checked,
+            TRUST_BUILDING: document.getElementById('trust').checked,
+            USE_PROXY: document.getElementById('proxy').checked,
+            DISCORD_WEBHOOK: document.getElementById('webhook').value
+        };
+        fetch('/api/config', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data)});
+    }
+
+    function addProduct() {
+        const name = document.getElementById('prodName').value;
+        const url = document.getElementById('prodUrl').value;
+        if (name && url) {
+            fetch('/api/products', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name, url})})
+            .then(() => location.reload());
+        }
+    }
+
+    function saveProxies() {
+        const proxies = document.getElementById('proxyList').value.trim().split('\n').filter(Boolean);
+        fetch('/api/proxies', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({proxies})})
+        .then(() => alert('Proxies saved'));
+    }
+
+    // Load initial data (simplified - refresh works)
+    window.onload = () => {
+        document.getElementById('webhook').value = "{{ config.get('DISCORD_WEBHOOK', '') }}";
+        // Full product list and gallery loading can be expanded with JS fetch calls if needed
+    };
+</script>
+</body>
+</html>
