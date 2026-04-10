@@ -54,8 +54,8 @@ def load_config():
 
 load_config()
 
-# Hot Products - April 2026
-PRODUCTS = [
+# ====================== HOT PRODUCTS (April 2026) ======================
+products = [
     {"name": "Prismatic Evolutions Elite Trainer Box", "url": "https://www.target.com/p/2024-pok-scarlet-violet-s8-5-elite-trainer-box/-/A-93954435"},
     {"name": "Prismatic Evolutions ETB Alt", "url": "https://www.target.com/p/pokemon-tcg-scarlet-violet-elite-trainer-box-prismatic-evolutions-of-the-pokemon-tcg-1-fully-illustrated-promo-card-9-booster-packs-premium/-/A-1008746912"},
     {"name": "Surging Sparks Elite Trainer Box", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-surging-sparks-elite-trainer-box/-/A-91619922"},
@@ -63,6 +63,7 @@ PRODUCTS = [
     {"name": "Scarlet & Violet 151 Elite Trainer Box", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-151-elite-trainer-box/-/A-88897899"},
     {"name": "Mega Evolution Perfect Order ETB", "url": "https://www.target.com/p/pok-233-mon-trading-card-game-mega-evolution-perfect-order-elite-trainer-box/-/A-95230445"},
     {"name": "Mega Evolution Ascended Heroes ETB", "url": "https://www.target.com/p/2025-pok-me-2-5-elite-trainer-box/-/A-95082118"},
+    {"name": "Pokémon Day 2026 Collection", "url": "https://www.target.com/p/2025-pok-pokemon-day/-/A-95082138"},
 ]
 
 def log(message):
@@ -95,23 +96,20 @@ def get_driver():
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--window-size=1920,1080")
-        options.binary_location = "/usr/bin/google-chrome"   # ← This fixes the error
+        options.binary_location = "/usr/bin/google-chrome"
 
         if config.get("USE_PROXY") and config.get("PROXIES"):
             proxy = random.choice(config["PROXIES"])
             options.add_argument(f'--proxy-server={proxy}')
             log(f"🔌 Using proxy: {proxy}")
 
-        driver = uc.Chrome(options=options, version_main=None, headless=True)
+        driver = uc.Chrome(options=options, version_main=None)
         selenium_stealth.stealth(driver, languages=["en-US", "en"], vendor="Google Inc.", platform="Win32", fix_hairline=True)
-        
         log("✅ Driver started successfully")
         return driver
     except Exception as e:
-        log(f"Driver failed: {str(e)}")
+        log(f"Driver init failed: {str(e)}")
         raise
-
-# (Rest of the functions remain the same - human_behavior, detect_challenge, etc.)
 
 def human_behavior(driver, intensive=False):
     try:
@@ -130,7 +128,7 @@ def detect_challenge(driver):
 
 def build_trust(driver):
     if config.get("TRUST_BUILDING"):
-        log("🌐 Building trust...")
+        log("🌐 Building trust session...")
         try:
             driver.get("https://www.target.com")
             time.sleep(random.uniform(7, 14))
@@ -152,7 +150,10 @@ def is_in_stock(driver):
 
 def add_to_cart(driver):
     log("🛒 Attempting Add to Cart...")
-    selectors = ["//button[@data-test='add-to-cart']", "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add to cart')]"]
+    selectors = [
+        "//button[@data-test='add-to-cart']",
+        "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add to cart')]"
+    ]
     for sel in selectors:
         try:
             btn = WebDriverWait(driver, 8).until(EC.element_to_be_clickable((By.XPATH, sel)))
@@ -165,20 +166,178 @@ def add_to_cart(driver):
             continue
     return False
 
-# ... (keep the rest of your functions: go_to_cart, proceed_to_checkout, review_and_place_order, check_product, alert_listener, bot_loop, etc.)
+def go_to_cart(driver):
+    try:
+        driver.find_element(By.XPATH, "//a[contains(@href, '/cart')]").click()
+        time.sleep(5)
+        return True
+    except:
+        return False
 
-# I'll keep it short here - use the previous full version and only replace the get_driver() function with the one above.
+def proceed_to_checkout(driver):
+    try:
+        btn = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Checkout')]")))
+        btn.click()
+        time.sleep(6)
+        return True
+    except:
+        return False
 
-# ====================== WEB ROUTES ======================
+def review_and_place_order(driver):
+    log("📦 Placing order...")
+    for _ in range(5):
+        try:
+            btn = WebDriverWait(driver, 8).until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Place order') or contains(text(),'Pay now')]")))
+            btn.click()
+            time.sleep(7)
+            if "thank you" in driver.page_source.lower() or "order confirmation" in driver.page_source.lower():
+                return True
+        except:
+            time.sleep(3)
+    return False
+
+def check_product(driver, product):
+    try:
+        driver.get(product["url"])
+        time.sleep(random.uniform(6, 12))
+        human_behavior(driver)
+
+        if detect_challenge(driver):
+            return "CHALLENGE"
+
+        if is_in_stock(driver):
+            log(f"✅ STOCK DETECTED: {product['name']}")
+            send_alert(product)
+            if config.get("AUTO_FULL_CHECKOUT"):
+                if add_to_cart(driver) and go_to_cart(driver) and proceed_to_checkout(driver):
+                    if review_and_place_order(driver):
+                        screenshot = driver.get_screenshot_as_png()
+                        send_alert(product, success=True, screenshot=screenshot)
+                        img = Image.open(io.BytesIO(screenshot))
+                        img.save(f"{SCREENSHOTS_DIR}/success_{int(time.time())}.png")
+                        return "ORDER_PLACED"
+            else:
+                add_to_cart(driver)
+            return "IN_STOCK"
+        return "OOS"
+    except Exception as e:
+        log(f"Error on {product['name']}: {str(e)}")
+        return "ERROR"
+
+def alert_listener():
+    log("📡 Group Alerts Listener started")
+    while bot_running:
+        if not config.get("ENABLE_ALERT_LISTENER") or not config.get("ALERT_WEBHOOKS"):
+            time.sleep(30)
+            continue
+        for url in config.get("ALERT_WEBHOOKS", []):
+            try:
+                resp = requests.get(url + "?limit=5", timeout=10)
+                if resp.status_code == 200:
+                    for msg in resp.json():
+                        content = (msg.get("content") or "").lower()
+                        if any(kw in content for kw in ["target", "restock", "prismatic", "surging", "etb"]) and "target" in content:
+                            log(f"🚨 GROUP ALERT: {msg.get('content')[:100]}")
+                            config["AGGRESSIVE_MODE"] = True
+                            socketio.emit('log', {'message': '🚀 AGGRESSIVE MODE AUTO ENABLED from alert!'})
+            except:
+                pass
+        time.sleep(random.randint(20, 40))
+
+def bot_loop():
+    global driver
+    log("🚀 Pokémon Target Bot STARTED - Web Dashboard Mode")
+    
+    listener_thread = threading.Thread(target=alert_listener, daemon=True)
+    listener_thread.start()
+    
+    while bot_running:
+        try:
+            if driver is None:
+                driver = get_driver()
+                build_trust(driver)
+            
+            for product in products:
+                if not bot_running:
+                    break
+                result = check_product(driver, product)
+                if result == "ORDER_PLACED":
+                    time.sleep(random.randint(35, 65) * 60)
+                    break
+                time.sleep(random.uniform(25, 50))
+            
+            wait = random.randint(15, 45) if config.get("AGGRESSIVE_MODE") else random.randint(180, 420)
+            log(f"✅ Scan complete. Next scan in ~{wait}s")
+            time.sleep(wait)
+        except Exception as e:
+            log(f"Loop error: {str(e)}")
+            time.sleep(30)
+
+# ====================== ROUTES ======================
 @app.route('/')
 def index():
-    return render_template('index.html', products=products, config=config, bot_running=bot_running)
+    return render_template('index.html')
 
 @app.route('/api/products', methods=['GET'])
 def get_products():
     return jsonify(products)
 
-# (Keep all other routes as before)
+@app.route('/api/products', methods=['POST'])
+def add_product():
+    data = request.json
+    products.append({"name": data["name"], "url": data["url"]})
+    return jsonify({"status": "added"})
+
+@app.route('/api/products/<int:index>', methods=['DELETE'])
+def remove_product(index):
+    if 0 <= index < len(products):
+        del products[index]
+        return jsonify({"status": "removed"})
+    return jsonify({"status": "error"}), 400
+
+@app.route('/api/config', methods=['POST'])
+def update_config():
+    global config
+    data = request.json
+    config.update(data)
+    return jsonify({"status": "saved"})
+
+@app.route('/api/alerts', methods=['POST'])
+def update_alerts():
+    global config
+    config["ALERT_WEBHOOKS"] = request.json.get("alert_webhooks", [])
+    return jsonify({"status": "saved"})
+
+@app.route('/api/start', methods=['POST'])
+def start_bot():
+    global bot_running, bot_thread
+    if bot_running:
+        return jsonify({"status": "already running"})
+    bot_running = True
+    bot_thread = threading.Thread(target=bot_loop, daemon=True)
+    bot_thread.start()
+    return jsonify({"status": "started"})
+
+@app.route('/api/stop', methods=['POST'])
+def stop_bot():
+    global bot_running, driver
+    bot_running = False
+    if driver:
+        try:
+            driver.quit()
+        except:
+            pass
+        driver = None
+    return jsonify({"status": "stopped"})
+
+def shutdown_handler():
+    global bot_running
+    bot_running = False
+    if driver:
+        try: driver.quit()
+        except: pass
+
+atexit.register(shutdown_handler)
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000, debug=False)
