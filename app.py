@@ -5,6 +5,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import selenium_stealth
+import threading
+import re
 import time
 import random
 import json
@@ -98,6 +100,10 @@ def save_config():
 
 load_config()
 
+# === GROUP ALERTS LISTENER ===
+config.setdefault("ALERT_WEBHOOKS", [])  # List of Discord channel webhook URLs to monitor
+config.setdefault("ENABLE_ALERT_LISTENER", True)
+ALERT_KEYWORDS = ["target", "restock", "prismatic", "surging", "151", "mega evolution", "etb", "elite trainer", "booster bundle", "pokemon tcg"]
 def log(message):
     timestamp = datetime.now().strftime("%H:%M:%S")
     entry = f"[{timestamp}] {message}"
@@ -143,6 +149,34 @@ def get_driver():
         Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 12});
     """)
     return driver
+
+def alert_listener():
+    log("📡 Group Alerts Listener started - Monitoring Discord channels")
+    last_check = {}
+    while bot_running:
+        if not config.get("ENABLE_ALERT_LISTENER") or not config.get("ALERT_WEBHOOKS"):
+            time.sleep(30)
+            continue
+            
+        for webhook_url in config.get("ALERT_WEBHOOKS", []):
+            try:
+                resp = requests.get(webhook_url.replace("webhooks/", "webhooks/") + "?limit=5", timeout=10)  # Some servers support this
+                if resp.status_code == 200:
+                    messages = resp.json()
+                    for msg in messages:
+                        content = (msg.get("content") or "").lower()
+                        if any(kw in content for kw in ALERT_KEYWORDS) and "target" in content:
+                            log(f"🚨 EXTERNAL ALERT DETECTED: {msg.get('content')[:150]}")
+                            # Auto enable aggressive mode
+                            config["AGGRESSIVE_MODE"] = True
+                            socketio.emit('log', {'message': '🚀 AGGRESSIVE MODE AUTO-ACTIVATED from group alert!'})
+                            # Optional: force a quick scan
+                            break
+            except:
+                pass
+        time.sleep(random.randint(20, 40))
+
+# Start the listener thread when bot starts
 
 def human_behavior(driver, intensive=False):
     try:
@@ -265,6 +299,9 @@ def check_product(driver, product):
 def bot_loop():
     global driver
     log("🚀 Pokémon Target Bot STARTED - Web Dashboard Mode")
+            # Start group alerts listener in background
+        listener_thread = threading.Thread(target=alert_listener, daemon=True)
+        listener_thread.start()
     while bot_running:
         try:
             if driver is None:
