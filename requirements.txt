@@ -5,3 +5,4 @@ undetected-chromedriver
 selenium-stealth
 requests
 pillow
+setuptools
