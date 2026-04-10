@@ -5,8 +5,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import selenium_stealth
-import threading
-import re
 import time
 import random
 import json
@@ -16,7 +14,6 @@ import threading
 import atexit
 from datetime import datetime
 from PIL import Image
-import base64
 import io
 
 app = Flask(__name__)
@@ -31,50 +28,10 @@ os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 bot_running = False
 driver = None
 bot_thread = None
-products = PRODUCTS = [
-    {
-        "name": "Prismatic Evolutions Elite Trainer Box",
-        "url": "https://www.target.com/p/2024-pok-scarlet-violet-s8-5-elite-trainer-box/-/A-93954435"
-    },
-    {
-        "name": "Prismatic Evolutions Elite Trainer Box (Alt Listing)",
-        "url": "https://www.target.com/p/pokemon-tcg-scarlet-violet-elite-trainer-box-prismatic-evolutions-of-the-pokemon-tcg-1-fully-illustrated-promo-card-9-booster-packs-premium/-/A-1008746912"
-    },
-    {
-        "name": "Surging Sparks Elite Trainer Box",
-        "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-surging-sparks-elite-trainer-box/-/A-91619922"
-    },
-    {
-        "name": "Surging Sparks Booster Bundle",
-        "url": "https://www.target.com/p/pokemon-scarlet-violet-surging-sparks-booster-trading-cards/-/A-93486336"
-    },
-    {
-        "name": "Scarlet & Violet 151 Elite Trainer Box",
-        "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-151-elite-trainer-box/-/A-88897899"
-    },
-    {
-        "name": "Mega Evolution - Perfect Order Elite Trainer Box",
-        "url": "https://www.target.com/p/pok-233-mon-trading-card-game-mega-evolution-perfect-order-elite-trainer-box/-/A-95230445"
-    },
-    {
-        "name": "Mega Evolution - Ascended Heroes Elite Trainer Box",
-        "url": "https://www.target.com/p/2025-pok-me-2-5-elite-trainer-box/-/A-95082118"
-    },
-    {
-        "name": "Pokémon Day 2026 Collection",
-        "url": "https://www.target.com/p/2025-pok-pokemon-day/-/A-95082138"
-    },
-    {
-        "name": "Destined Rivals Elite Trainer Box",
-        "url": "https://www.target.com/p/pok-233-mon-trading-card-game-scarlet-38-violet-8212-destined-rivals-elite-trainer-box/-/A-94300069"
-    },
-    {
-        "name": "Twilight Masquerade Elite Trainer Box",
-        "url": "https://www.target.com/p/pok-233-mon-trading-card-game-scarlet-38-violet-8212-twilight-masquerade-elite-trainer-box/-/A-91619960"
-    }
-]
+products = []
 config = {}
 
+# ====================== CONFIG ======================
 def load_config():
     global products, config
     if os.path.exists(CONFIG_FILE):
@@ -85,6 +42,7 @@ def load_config():
                 config = data.get("config", {})
         except:
             pass
+    
     config.setdefault("AUTO_FULL_CHECKOUT", False)
     config.setdefault("AGGRESSIVE_MODE", False)
     config.setdefault("TRUST_BUILDING", True)
@@ -92,24 +50,34 @@ def load_config():
     config.setdefault("DISCORD_WEBHOOK", os.getenv("DISCORD_WEBHOOK", ""))
     config.setdefault("PROXIES", ["http://user:pass@residential-proxy-ip:port"])
     config.setdefault("QUANTITY", 1)
-
-def save_config():
-    data = {"products": products, "config": config}
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    config.setdefault("ENABLE_ALERT_LISTENER", True)
+    config.setdefault("ALERT_WEBHOOKS", [])
 
 load_config()
 
-# === GROUP ALERTS LISTENER ===
-config.setdefault("ALERT_WEBHOOKS", [])  # List of Discord channel webhook URLs to monitor
-config.setdefault("ENABLE_ALERT_LISTENER", True)
-ALERT_KEYWORDS = ["target", "restock", "prismatic", "surging", "151", "mega evolution", "etb", "elite trainer", "booster bundle", "pokemon tcg"]
+# ====================== PRODUCTS (Hot ones - April 2026) ======================
+PRODUCTS = [
+    {"name": "Prismatic Evolutions Elite Trainer Box", "url": "https://www.target.com/p/2024-pok-scarlet-violet-s8-5-elite-trainer-box/-/A-93954435"},
+    {"name": "Prismatic Evolutions ETB Alt", "url": "https://www.target.com/p/pokemon-tcg-scarlet-violet-elite-trainer-box-prismatic-evolutions-of-the-pokemon-tcg-1-fully-illustrated-promo-card-9-booster-packs-premium/-/A-1008746912"},
+    {"name": "Surging Sparks Elite Trainer Box", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-surging-sparks-elite-trainer-box/-/A-91619922"},
+    {"name": "Surging Sparks Booster Bundle", "url": "https://www.target.com/p/pokemon-scarlet-violet-surging-sparks-booster-trading-cards/-/A-93486336"},
+    {"name": "Scarlet & Violet 151 Elite Trainer Box", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-151-elite-trainer-box/-/A-88897899"},
+    {"name": "Mega Evolution Perfect Order ETB", "url": "https://www.target.com/p/pok-233-mon-trading-card-game-mega-evolution-perfect-order-elite-trainer-box/-/A-95230445"},
+    {"name": "Mega Evolution Ascended Heroes ETB", "url": "https://www.target.com/p/2025-pok-me-2-5-elite-trainer-box/-/A-95082118"},
+    {"name": "Pokémon Day 2026 Collection", "url": "https://www.target.com/p/2025-pok-pokemon-day/-/A-95082138"},
+    {"name": "Destined Rivals Elite Trainer Box", "url": "https://www.target.com/p/pok-233-mon-trading-card-game-scarlet-38-violet-8212-destined-rivals-elite-trainer-box/-/A-94300069"},
+]
+
+# ====================== LOGGING ======================
 def log(message):
     timestamp = datetime.now().strftime("%H:%M:%S")
     entry = f"[{timestamp}] {message}"
     print(entry)
-    with open(LOG_FILE, "a") as f:
-        f.write(f"{datetime.now()} - {message}\n")
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{datetime.now()} - {message}\n")
+    except:
+        pass
     socketio.emit('log', {'message': entry})
 
 def send_alert(product, success=False, screenshot=None):
@@ -117,7 +85,7 @@ def send_alert(product, success=False, screenshot=None):
     msg = f"{product['name']}\n{'Order submitted!' if success else 'Adding to cart...'}"
     log(f"{title} - {product['name']}")
     
-    if config["DISCORD_WEBHOOK"]:
+    if config.get("DISCORD_WEBHOOK"):
         try:
             requests.post(config["DISCORD_WEBHOOK"], json={"content": f"**{title}**\n{msg}\nURL: {product['url']}"})
             if screenshot:
@@ -125,7 +93,7 @@ def send_alert(product, success=False, screenshot=None):
         except:
             pass
 
-# ==================== SELENIUM CORE ====================
+# ====================== SELENIUM CORE ======================
 def get_driver():
     options = uc.ChromeOptions()
     options.add_argument("--headless=new")
@@ -150,34 +118,6 @@ def get_driver():
     """)
     return driver
 
-def alert_listener():
-    log("📡 Group Alerts Listener started - Monitoring Discord channels")
-    last_check = {}
-    while bot_running:
-        if not config.get("ENABLE_ALERT_LISTENER") or not config.get("ALERT_WEBHOOKS"):
-            time.sleep(30)
-            continue
-            
-        for webhook_url in config.get("ALERT_WEBHOOKS", []):
-            try:
-                resp = requests.get(webhook_url.replace("webhooks/", "webhooks/") + "?limit=5", timeout=10)  # Some servers support this
-                if resp.status_code == 200:
-                    messages = resp.json()
-                    for msg in messages:
-                        content = (msg.get("content") or "").lower()
-                        if any(kw in content for kw in ALERT_KEYWORDS) and "target" in content:
-                            log(f"🚨 EXTERNAL ALERT DETECTED: {msg.get('content')[:150]}")
-                            # Auto enable aggressive mode
-                            config["AGGRESSIVE_MODE"] = True
-                            socketio.emit('log', {'message': '🚀 AGGRESSIVE MODE AUTO-ACTIVATED from group alert!'})
-                            # Optional: force a quick scan
-                            break
-            except:
-                pass
-        time.sleep(random.randint(20, 40))
-
-# Start the listener thread when bot starts
-
 def human_behavior(driver, intensive=False):
     try:
         for _ in range(4 if intensive else 2):
@@ -190,13 +130,13 @@ def human_behavior(driver, intensive=False):
 def detect_challenge(driver):
     text = driver.page_source.lower()
     if any(k in text for k in ["captcha", "perimeterx", "human", "verify you are human", "challenge", "cloudflare"]):
-        log("⚠️ CHALLENGE/CAPTCHA DETECTED - Solve manually if possible")
+        log("⚠️ CHALLENGE/CAPTCHA DETECTED")
         return True
     return False
 
 def build_trust(driver):
     if config.get("TRUST_BUILDING"):
-        log("🌐 Building trust (homepage + Pokémon category)")
+        log("🌐 Building trust session...")
         try:
             driver.get("https://www.target.com")
             time.sleep(random.uniform(7, 14))
@@ -284,7 +224,6 @@ def check_product(driver, product):
                     if review_and_place_order(driver):
                         screenshot = driver.get_screenshot_as_png()
                         send_alert(product, success=True, screenshot=screenshot)
-                        # Save screenshot
                         img = Image.open(io.BytesIO(screenshot))
                         img.save(f"{SCREENSHOTS_DIR}/success_{int(time.time())}.png")
                         return "ORDER_PLACED"
@@ -296,12 +235,38 @@ def check_product(driver, product):
         log(f"Error checking {product['name']}: {str(e)}")
         return "ERROR"
 
+# ====================== GROUP ALERTS LISTENER ======================
+def alert_listener():
+    log("📡 Group Alerts Listener started - Monitoring Discord channels")
+    while bot_running:
+        if not config.get("ENABLE_ALERT_LISTENER") or not config.get("ALERT_WEBHOOKS"):
+            time.sleep(30)
+            continue
+        for webhook_url in config.get("ALERT_WEBHOOKS", []):
+            try:
+                resp = requests.get(webhook_url + "?limit=5", timeout=10)
+                if resp.status_code == 200:
+                    messages = resp.json()
+                    for msg in messages:
+                        content = (msg.get("content") or "").lower()
+                        if any(kw in content for kw in ["target", "restock", "prismatic", "surging", "151", "mega", "etb"]) and "target" in content:
+                            log(f"🚨 EXTERNAL ALERT: {msg.get('content')[:120]}")
+                            config["AGGRESSIVE_MODE"] = True
+                            socketio.emit('log', {'message': '🚀 AGGRESSIVE MODE AUTO-ACTIVATED from group alert!'})
+                            break
+            except:
+                pass
+        time.sleep(random.randint(20, 40))
+
+# ====================== MAIN BOT LOOP ======================
 def bot_loop():
     global driver
     log("🚀 Pokémon Target Bot STARTED - Web Dashboard Mode")
-            # Start group alerts listener in background
-        listener_thread = threading.Thread(target=alert_listener, daemon=True)
-        listener_thread.start()
+    
+    # Start group alerts listener
+    listener_thread = threading.Thread(target=alert_listener, daemon=True)
+    listener_thread.start()
+    
     while bot_running:
         try:
             if driver is None:
@@ -309,7 +274,8 @@ def bot_loop():
                 build_trust(driver)
             
             for product in products[:]:
-                if not bot_running: break
+                if not bot_running:
+                    break
                 result = check_product(driver, product)
                 if result == "ORDER_PLACED":
                     log("🎉 SUCCESS! Long cooldown activated.")
@@ -324,7 +290,7 @@ def bot_loop():
             log(f"Major loop error: {str(e)}")
             time.sleep(30)
 
-# ==================== WEB ROUTES ====================
+# ====================== WEB ROUTES ======================
 @app.route('/')
 def index():
     return render_template('index.html', products=products, config=config, bot_running=bot_running)
@@ -379,6 +345,19 @@ def update_proxies():
     config["PROXIES"] = request.json.get("proxies", [])
     save_config()
     return jsonify({"status": "proxies updated"})
+
+@app.route('/api/alerts', methods=['POST'])
+def update_alerts():
+    global config
+    data = request.json
+    config["ALERT_WEBHOOKS"] = data.get("alert_webhooks", [])
+    save_config()
+    return jsonify({"status": "alert webhooks saved"})
+
+def save_config():
+    data = {"products": products, "config": config}
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
 @app.route('/screenshots')
 def list_screenshots():
