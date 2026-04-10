@@ -317,6 +317,10 @@ def stop_bot():
     log("Bot stopped from dashboard")
     return jsonify({"status": "stopped"})
 
+@app.route('/api/products', methods=['GET'])
+def get_products():
+    return jsonify(products)
+    
 @app.route('/api/config', methods=['POST'])
 def update_config():
     global config
