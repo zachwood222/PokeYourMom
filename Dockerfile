@@ -1,6 +1,6 @@
 FROM python:3.12-bookworm
 
-# Install Chrome + all required dependencies for undetected-chromedriver
+# Install Chrome + dependencies
 RUN apt-get update && apt-get install -y \
     wget \
     unzip \
