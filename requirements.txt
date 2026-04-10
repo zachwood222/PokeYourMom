@@ -1,0 +1,7 @@
+flask
+flask-socketio
+eventlet
+undetected-chromedriver
+selenium-stealth
+requests
+pillow
