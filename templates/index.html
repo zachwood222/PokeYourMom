@@ -9,25 +9,35 @@
         button { padding: 12px 20px; margin: 5px; font-weight: bold; }
         .green { background: #00cc00; color: black; }
         .red { background: #cc0000; color: white; }
-        #logs { background: #000; height: 420px; overflow-y: scroll; padding: 15px; font-family: Consolas, monospace; border: 1px solid #00ff88; }
-        input, select { background: #222; color: #0f0; border: 1px solid #0f0; padding: 8px; }
+        .orange { background: #ff8800; color: black; }
+        #logs { background: #000; height: 380px; overflow-y: scroll; padding: 15px; font-family: Consolas, monospace; border: 1px solid #00ff88; }
+        .drop-box { background: #1a1a1a; padding: 15px; border-radius: 8px; margin: 15px 0; border: 2px solid #ff8800; }
+        input, textarea { background: #222; color: #0f0; border: 1px solid #0f0; padding: 8px; width: 100%; margin: 5px 0; }
     </style>
 </head>
 <body>
 <div class="container">
     <h1>🎯 Pokémon Target Sniper Bot 2026 - Web Dashboard</h1>
+    
     <button onclick="toggleBot()" id="toggleBtn" class="green" style="font-size:18px;">START BOT</button>
+
+    <!-- === DROP TIMER SECTION === -->
+    <div class="drop-box">
+        <h2>⏰ Next Target Pokémon Drop Windows (ET)</h2>
+        <div id="dropTimer"></div>
+        <button onclick="enableAggressiveForDrop()" class="orange">🚀 Enable Aggressive Mode for Next Drop</button>
+    </div>
 
     <h2>Settings</h2>
     <label><input type="checkbox" id="autoCheckout" onchange="updateConfig()"> Auto Full Checkout (High Risk)</label><br>
-    <label><input type="checkbox" id="aggressive" onchange="updateConfig()"> Aggressive Mode (Drop Windows)</label><br>
+    <label><input type="checkbox" id="aggressive" onchange="updateConfig()"> Aggressive Mode (Fast Scans)</label><br>
     <label><input type="checkbox" id="trust" onchange="updateConfig()"> Trust Building</label><br>
     <label><input type="checkbox" id="proxy" onchange="updateConfig()"> Use Proxies</label><br><br>
 
     Discord Webhook: <input type="text" id="webhook" style="width:500px" onchange="updateConfig()"><br><br>
 
     <h2>Proxies (one per line)</h2>
-    <textarea id="proxyList" rows="3" style="width:100%"></textarea>
+    <textarea id="proxyList" rows="3"></textarea>
     <button onclick="saveProxies()">Save Proxies</button>
 
     <h2>Add Product</h2>
@@ -85,11 +95,40 @@
         .then(() => alert('Proxies saved'));
     }
 
-    // Load initial data (simplified - refresh works)
-    window.onload = () => {
-        document.getElementById('webhook').value = "{{ config.get('DISCORD_WEBHOOK', '') }}";
-        // Full product list and gallery loading can be expanded with JS fetch calls if needed
-    };
+    function enableAggressiveForDrop() {
+        document.getElementById('aggressive').checked = true;
+        updateConfig();
+        socket.emit('log', {message: '🚀 Aggressive Mode enabled for upcoming drop!'});
+        alert("Aggressive Mode turned ON for next drop window!");
+    }
+
+    // Live Drop Timer
+    function updateDropTimer() {
+        const timerDiv = document.getElementById('dropTimer');
+        const now = new Date();
+        const etOffset = -4; // ET (adjust for DST if needed)
+        const etNow = new Date(now.getTime() + (etOffset * 60 * 60 * 1000));
+
+        let nextDrop = new Date(etNow);
+        nextDrop.setHours(10, 0, 0, 0); // 10 AM ET
+        if (etNow > nextDrop) nextDrop.setHours(14, 0, 0, 0); // 2 PM ET
+        if (etNow > nextDrop) nextDrop.setDate(nextDrop.getDate() + 1);
+
+        const diff = nextDrop - etNow;
+        const hours = Math.floor(diff / (1000 * 60 * 60));
+        const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+
+        let html = `<strong>Next Drop:</strong> ${nextDrop.getHours() === 10 ? '10:00 AM' : '2:00 PM'} ET `;
+        html += `(${hours}h ${minutes}m remaining)`;
+
+        if (hours === 0 && minutes < 30) {
+            html = `<span style="color:#ff4444;">⚠️ DROP IMMINENT - ${minutes} min left!</span>`;
+        }
+        timerDiv.innerHTML = html;
+    }
+
+    setInterval(updateDropTimer, 30000);
+    window.onload = updateDropTimer;
 </script>
 </body>
 </html>
