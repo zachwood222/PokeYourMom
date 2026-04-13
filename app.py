@@ -18,6 +18,8 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 bot_running = False
 driver = None
+
+# Hot Products
 products = [
     {"name": "Prismatic Evolutions ETB", "url": "https://www.target.com/p/2024-pok-scarlet-violet-s8-5-elite-trainer-box/-/A-93954435"},
     {"name": "Surging Sparks ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-surging-sparks-elite-trainer-box/-/A-91619922"},
@@ -25,7 +27,11 @@ products = [
     {"name": "Mega Evolution Perfect Order ETB", "url": "https://www.target.com/p/pok-233-mon-trading-card-game-mega-evolution-perfect-order-elite-trainer-box/-/A-95230445"},
 ]
 
-config = {"AUTO_FULL_CHECKOUT": False, "AGGRESSIVE_MODE": False, "TRUST_BUILDING": False}
+config = {
+    "AUTO_FULL_CHECKOUT": False,
+    "AGGRESSIVE_MODE": False,
+    "USE_PROXY": False
+}
 
 def log(message):
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -34,64 +40,77 @@ def log(message):
     socketio.emit('log', {'message': entry})
 
 def get_driver():
-    options = uc.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.binary_location = "/usr/bin/google-chrome"
-    
-    driver = uc.Chrome(options=options, version_main=None)
-    selenium_stealth.stealth(driver, languages=["en-US", "en"], vendor="Google Inc.", platform="Win32", fix_hairline=True)
-    log("✅ Driver started")
-    return driver
+    try:
+        options = uc.ChromeOptions()
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.binary_location = "/usr/bin/google-chrome"
+
+        driver = uc.Chrome(options=options, version_main=None)
+        selenium_stealth.stealth(driver, languages=["en-US", "en"], vendor="Google Inc.", platform="Win32", fix_hairline=True)
+        log("✅ Driver started successfully")
+        return driver
+    except Exception as e:
+        log(f"❌ Driver failed: {str(e)[:100]}")
+        raise
 
 def is_in_stock(driver):
-    text = driver.page_source.lower()
-    if any(word in text for word in ["out of stock", "sold out", "unavailable", "busy right now"]):
-        return False
     try:
+        text = driver.page_source.lower()
+        if any(w in text for w in ["out of stock", "sold out", "unavailable", "busy right now", "notify me"]):
+            return False
         return len(driver.find_elements(By.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add to cart')]")) > 0
     except:
-        return "add to cart" in text
+        return False
 
 def check_product(driver, product):
     try:
         log(f"🔍 Checking → {product['name']}")
         driver.get(product["url"])
-        time.sleep(random.uniform(5, 9))
+        time.sleep(random.uniform(6, 10))
         
         if is_in_stock(driver):
-            log(f"✅ STOCK FOUND! → {product['name']}")
-            return "IN_STOCK"
+            log(f"✅ STOCK FOUND → {product['name']}")
+            return True
         else:
-            log(f"❌ Out of stock - {product['name']}")
-            return "OOS"
+            log(f"❌ Out of stock")
+            return False
     except Exception as e:
-        log(f"Error checking {product['name']}: {str(e)[:80]}")
-        return "ERROR"
+        log(f"Connection error on {product['name']}")
+        return False
 
 def bot_loop():
     global driver
-    log("🚀 Bot Started - Simplified Mode")
+    log("🚀 Bot Started - Stable Mode")
     
     while bot_running:
         try:
             if driver is None:
                 driver = get_driver()
             
-            log(f"🔍 Scanning {len(products)} products...")
-            for p in products:
-                if not bot_running: break
-                check_product(driver, p)
-                time.sleep(random.uniform(8, 15))
+            log(f"🔍 Starting scan of {len(products)} products...")
+            for product in products:
+                if not bot_running:
+                    break
+                check_product(driver, product)
+                time.sleep(random.uniform(10, 18))   # Longer delay to be gentle
             
-            wait = 30 if config["AGGRESSIVE_MODE"] else 180
-            log(f"✅ Scan done. Waiting {wait} seconds...")
+            wait = 25 if config["AGGRESSIVE_MODE"] else 180
+            log(f"✅ Scan done. Next scan in {wait} seconds")
             time.sleep(wait)
+            
         except Exception as e:
-            log(f"Loop error: {str(e)[:100]}")
-            time.sleep(30)
+            log(f"💥 Error: {str(e)[:120]} - Restarting browser")
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+                driver = None
+            time.sleep(15)
 
 # ====================== ROUTES ======================
 @app.route('/')
@@ -99,16 +118,17 @@ def index():
     return render_template('index.html')
 
 @app.route('/api/start', methods=['POST'])
-def start():
+def start_bot():
     global bot_running, bot_thread
-    if bot_running: return jsonify({"status": "running"})
+    if bot_running:
+        return jsonify({"status": "already running"})
     bot_running = True
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
     return jsonify({"status": "started"})
 
 @app.route('/api/stop', methods=['POST'])
-def stop():
+def stop_bot():
     global bot_running
     bot_running = False
     return jsonify({"status": "stopped"})
