@@ -129,22 +129,28 @@ def detect_challenge(driver):
     return False
 
 def build_trust(driver):
-    if config.get("TRUST_BUILDING"):
-        log("🌐 Building trust session...")
-        try:
-            driver.get("https://www.target.com")
-            time.sleep(random.uniform(5, 10))
-            log("✅ Homepage loaded")
-            human_behavior(driver)
-            
-            driver.get("https://www.target.com/c/pokemon-cards/-/N-5xt1z")
-            time.sleep(random.uniform(5, 10))
-            log("✅ Pokémon category loaded")
-            human_behavior(driver)
-            
-            log("✅ Trust building completed")
-        except Exception as e:
-            log(f"Trust building warning: {str(e)}")
+    if not config.get("TRUST_BUILDING"):
+        return
+        
+    log("🌐 Building trust session...")
+    try:
+        # Homepage
+        driver.get("https://www.target.com")
+        time.sleep(random.uniform(4, 8))
+        log("✅ Homepage loaded")
+        human_behavior(driver)
+
+        # Pokémon Category
+        driver.get("https://www.target.com/c/pokemon-cards/-/N-5xt1z")
+        time.sleep(random.uniform(4, 9))
+        log("✅ Pokémon category loaded")
+        human_behavior(driver)
+
+        log("✅ Trust building completed successfully")
+        
+    except Exception as e:
+        log(f"⚠️ Trust building had an issue: {str(e)}")
+        # Continue anyway - don't let it block the bot
 
 def is_in_stock(driver):
     text = driver.page_source.lower()
@@ -255,7 +261,6 @@ def bot_loop():
     global driver
     log("🚀 Pokémon Target Bot STARTED - Web Dashboard Mode")
     
-    # Start alerts listener
     listener_thread = threading.Thread(target=alert_listener, daemon=True)
     listener_thread.start()
     
@@ -266,7 +271,7 @@ def bot_loop():
                 driver = get_driver()
                 build_trust(driver)
             
-            log(f"🔍 Starting scan of {len(products)} monitored products...")
+            log(f"🔍 Starting scan of {len(products)} products...")
             
             for product in products:
                 if not bot_running:
@@ -274,7 +279,7 @@ def bot_loop():
                 log(f"🔍 Checking → {product['name']}")
                 result = check_product(driver, product)
                 if result == "ORDER_PLACED":
-                    log("🎉 ORDER PLACED! Long cooldown activated.")
+                    log("🎉 ORDER PLACED! Taking long cooldown...")
                     time.sleep(random.randint(35, 65) * 60)
                     break
                 time.sleep(random.uniform(20, 45))
@@ -284,7 +289,13 @@ def bot_loop():
             time.sleep(wait)
             
         except Exception as e:
-            log(f"💥 Major error in loop: {str(e)}")
+            log(f"💥 Major loop error: {str(e)}")
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+                driver = None
             time.sleep(30)
 
 # ====================== ROUTES ======================
