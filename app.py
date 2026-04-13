@@ -133,13 +133,18 @@ def build_trust(driver):
         log("🌐 Building trust session...")
         try:
             driver.get("https://www.target.com")
-            time.sleep(random.uniform(7, 14))
+            time.sleep(random.uniform(5, 10))
+            log("✅ Homepage loaded")
             human_behavior(driver)
+            
             driver.get("https://www.target.com/c/pokemon-cards/-/N-5xt1z")
-            time.sleep(random.uniform(6, 13))
+            time.sleep(random.uniform(5, 10))
+            log("✅ Pokémon category loaded")
             human_behavior(driver)
-        except:
-            pass
+            
+            log("✅ Trust building completed")
+        except Exception as e:
+            log(f"Trust building warning: {str(e)}")
 
 def is_in_stock(driver):
     text = driver.page_source.lower()
@@ -250,32 +255,36 @@ def bot_loop():
     global driver
     log("🚀 Pokémon Target Bot STARTED - Web Dashboard Mode")
     
+    # Start alerts listener
     listener_thread = threading.Thread(target=alert_listener, daemon=True)
     listener_thread.start()
     
     while bot_running:
         try:
             if driver is None:
+                log("Starting new browser session...")
                 driver = get_driver()
                 build_trust(driver)
             
-            log(f"🔍 Starting scan of {len(products)} products...")
+            log(f"🔍 Starting scan of {len(products)} monitored products...")
+            
             for product in products:
                 if not bot_running:
                     break
                 log(f"🔍 Checking → {product['name']}")
                 result = check_product(driver, product)
                 if result == "ORDER_PLACED":
-                    log("🎉 ORDER PLACED! Taking long cooldown...")
+                    log("🎉 ORDER PLACED! Long cooldown activated.")
                     time.sleep(random.randint(35, 65) * 60)
                     break
-                time.sleep(random.uniform(25, 50))
+                time.sleep(random.uniform(20, 45))
             
-            wait = random.randint(15, 45) if config.get("AGGRESSIVE_MODE") else random.randint(180, 420)
-            log(f"✅ Full scan done. Next scan in ~{wait} seconds")
+            wait = random.randint(15, 45) if config.get("AGGRESSIVE_MODE", False) else random.randint(180, 420)
+            log(f"✅ Full scan completed. Next scan in ~{wait} seconds")
             time.sleep(wait)
+            
         except Exception as e:
-            log(f"💥 Major loop error: {str(e)}")
+            log(f"💥 Major error in loop: {str(e)}")
             time.sleep(30)
 
 # ====================== ROUTES ======================
