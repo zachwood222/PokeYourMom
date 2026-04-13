@@ -131,26 +131,22 @@ def detect_challenge(driver):
 def build_trust(driver):
     if not config.get("TRUST_BUILDING"):
         return
-        
     log("🌐 Building trust session...")
     try:
-        # Homepage
         driver.get("https://www.target.com")
         time.sleep(random.uniform(4, 8))
         log("✅ Homepage loaded")
         human_behavior(driver)
 
-        # Pokémon Category
         driver.get("https://www.target.com/c/pokemon-cards/-/N-5xt1z")
         time.sleep(random.uniform(4, 9))
         log("✅ Pokémon category loaded")
         human_behavior(driver)
 
-        log("✅ Trust building completed successfully")
-        
+        log("✅ Trust building completed")
     except Exception as e:
-        log(f"⚠️ Trust building had an issue: {str(e)}")
-        # Continue anyway - don't let it block the bot
+        log(f"⚠️ Trust building failed (continuing anyway): {str(e)[:100]}")
+        # Don't let this stop the bot
 
 def is_in_stock(driver):
     text = driver.page_source.lower()
@@ -279,7 +275,7 @@ def bot_loop():
                 log(f"🔍 Checking → {product['name']}")
                 result = check_product(driver, product)
                 if result == "ORDER_PLACED":
-                    log("🎉 ORDER PLACED! Taking long cooldown...")
+                    log("🎉 ORDER PLACED! Long cooldown activated.")
                     time.sleep(random.randint(35, 65) * 60)
                     break
                 time.sleep(random.uniform(20, 45))
@@ -289,14 +285,14 @@ def bot_loop():
             time.sleep(wait)
             
         except Exception as e:
-            log(f"💥 Major loop error: {str(e)}")
+            log(f"💥 Major error: {str(e)[:150]} - Restarting browser...")
             if driver:
                 try:
                     driver.quit()
                 except:
                     pass
                 driver = None
-            time.sleep(30)
+            time.sleep(20)
 
 # ====================== ROUTES ======================
 @app.route('/')
