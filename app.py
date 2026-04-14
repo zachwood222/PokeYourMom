@@ -9,21 +9,16 @@ import threading
 from datetime import datetime
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')   # ← Changed from eventlet
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 bot_running = False
 driver = None
 
-# Current hot products
 products = [
     {"name": "Prismatic Evolutions ETB", "url": "https://www.target.com/p/2024-pok-scarlet-violet-s8-5-elite-trainer-box/-/A-93954435"},
     {"name": "Surging Sparks ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-surging-sparks-elite-trainer-box/-/A-91619922"},
     {"name": "Scarlet & Violet 151 ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-151-elite-trainer-box/-/A-88897899"},
     {"name": "Mega Evolution Perfect Order ETB", "url": "https://www.target.com/p/pok-233-mon-trading-card-game-mega-evolution-perfect-order-elite-trainer-box/-/A-95230445"},
-    {"name": "Pokémon TCG: Mega Evolution-Ascended Heroes ETB", "url": "https://www.pokemoncenter.com/product/10-10315-108/pokemon-tcg-mega-evolution-ascended-heroes-pokemon-center-elite-trainer-box"},
-    {"name": "Pokémon TCG: Scarlet & Violet-Destined Rivals ETB", "url": "https://www.pokemoncenter.com/product/100-10653/pokemon-tcg-scarlet-and-violet-destined-rivals-pokemon-center-elite-trainer-box"},
-    {"name": "Pokémon TCG: Chaos Rising ETB", "url": "https://www.pokemoncenter.com/product/10-10399-112"},
-    
 ]
 
 def log(message):
@@ -43,7 +38,6 @@ def get_driver():
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--window-size=1920,1080")
         options.binary_location = "/usr/bin/google-chrome"
 
         driver = uc.Chrome(options=options, version_main=None)
@@ -57,23 +51,23 @@ def get_driver():
 def check_product(driver, product):
     try:
         log(f"🔍 Checking → {product['name']}")
-        driver.set_page_load_timeout(25)   # Prevent hanging forever
+        driver.set_page_load_timeout(30)
         driver.get(product["url"])
-        time.sleep(random.uniform(6, 11))
+        time.sleep(random.uniform(7, 13))
         
         text = driver.page_source.lower()
-        if any(w in text for w in ["out of stock", "sold out", "unavailable", "busy right now", "notify me when available"]):
+        if any(w in text for w in ["out of stock", "sold out", "unavailable", "busy right now", "notify me"]):
             log(f"❌ Out of stock - {product['name']}")
         else:
             log(f"✅ POSSIBLE STOCK → {product['name']}")
         return True
     except Exception as e:
-        log(f"❌ Connection timeout/error on {product['name']}")
+        log(f"❌ Connection error on {product['name']}")
         return False
 
 def bot_loop():
     global driver
-    log("🚀 Bot Started - Clean Threading Mode")
+    log("🚀 Bot Started - Final Stable Mode")
     
     while bot_running:
         try:
@@ -82,26 +76,21 @@ def bot_loop():
             
             log(f"🔍 Starting scan of {len(products)} products...")
             for product in products:
-                if not bot_running:
-                    break
+                if not bot_running: break
                 check_product(driver, product)
-                time.sleep(random.uniform(10, 18))
+                time.sleep(random.uniform(12, 20))
             
             wait = 35 if False else 160
             log(f"✅ Scan completed. Next scan in ~{wait} seconds")
             time.sleep(wait)
-            
         except Exception as e:
-            log(f"💥 Major error: {str(e)[:120]} - Restarting browser")
+            log(f"💥 Error: {str(e)[:100]} - Restarting browser")
             if driver:
-                try:
-                    driver.quit()
-                except:
-                    pass
+                try: driver.quit()
+                except: pass
                 driver = None
             time.sleep(20)
 
-# ====================== ROUTES ======================
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -109,8 +98,7 @@ def index():
 @app.route('/api/start', methods=['POST'])
 def start_bot():
     global bot_running, bot_thread
-    if bot_running:
-        return jsonify({"status": "already running"})
+    if bot_running: return jsonify({"status": "already running"})
     bot_running = True
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
@@ -127,4 +115,4 @@ def get_products():
     return jsonify(products)
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
