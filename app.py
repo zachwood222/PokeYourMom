@@ -38,10 +38,23 @@ def get_driver():
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--window-size=1920,1080")
         options.binary_location = "/usr/bin/google-chrome"
 
+        # Extra stealth
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-plugins-discovery")
+        options.add_argument(f"user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
+
         driver = uc.Chrome(options=options, version_main=None)
-        selenium_stealth.stealth(driver, languages=["en-US", "en"], vendor="Google Inc.", platform="Win32", fix_hairline=True)
+        selenium_stealth.stealth(driver,
+            languages=["en-US", "en"],
+            vendor="Google Inc.",
+            platform="Win32",
+            webgl_vendor="Intel Inc.",
+            renderer="Intel Iris OpenGL Engine",
+            fix_hairline=True)
+        
         log("✅ Driver started successfully")
         return driver
     except Exception as e:
@@ -51,23 +64,23 @@ def get_driver():
 def check_product(driver, product):
     try:
         log(f"🔍 Checking → {product['name']}")
-        driver.set_page_load_timeout(30)
+        driver.set_page_load_timeout(35)
         driver.get(product["url"])
-        time.sleep(random.uniform(7, 13))
+        time.sleep(random.uniform(8, 15))
         
         text = driver.page_source.lower()
-        if any(w in text for w in ["out of stock", "sold out", "unavailable", "busy right now", "notify me"]):
+        if any(w in text for w in ["out of stock", "sold out", "unavailable", "busy right now", "notify me when available"]):
             log(f"❌ Out of stock - {product['name']}")
         else:
-            log(f"✅ POSSIBLE STOCK → {product['name']}")
+            log(f"✅ POSSIBLE STOCK DETECTED → {product['name']}")
         return True
     except Exception as e:
-        log(f"❌ Connection error on {product['name']}")
+        log(f"❌ Connection failed on {product['name']}")
         return False
 
 def bot_loop():
     global driver
-    log("🚀 Bot Started - Final Stable Mode")
+    log("🚀 Bot Started - Max Stealth Mode")
     
     while bot_running:
         try:
@@ -76,20 +89,24 @@ def bot_loop():
             
             log(f"🔍 Starting scan of {len(products)} products...")
             for product in products:
-                if not bot_running: break
+                if not bot_running:
+                    break
                 check_product(driver, product)
-                time.sleep(random.uniform(12, 20))
+                time.sleep(random.uniform(15, 25))   # Increased delay to avoid blocks
             
-            wait = 35 if False else 160
+            wait = 40 if False else 180
             log(f"✅ Scan completed. Next scan in ~{wait} seconds")
             time.sleep(wait)
+            
         except Exception as e:
-            log(f"💥 Error: {str(e)[:100]} - Restarting browser")
+            log(f"💥 Major error: {str(e)[:100]} - Restarting browser")
             if driver:
-                try: driver.quit()
-                except: pass
+                try:
+                    driver.quit()
+                except:
+                    pass
                 driver = None
-            time.sleep(20)
+            time.sleep(25)
 
 @app.route('/')
 def index():
@@ -98,7 +115,8 @@ def index():
 @app.route('/api/start', methods=['POST'])
 def start_bot():
     global bot_running, bot_thread
-    if bot_running: return jsonify({"status": "already running"})
+    if bot_running:
+        return jsonify({"status": "already running"})
     bot_running = True
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
