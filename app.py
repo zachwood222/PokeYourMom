@@ -19,6 +19,10 @@ products = [
     {"name": "Surging Sparks ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-surging-sparks-elite-trainer-box/-/A-91619922"},
     {"name": "Scarlet & Violet 151 ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-151-elite-trainer-box/-/A-88897899"},
     {"name": "Mega Evolution Perfect Order ETB", "url": "https://www.target.com/p/pok-233-mon-trading-card-game-mega-evolution-perfect-order-elite-trainer-box/-/A-95230445"},
+    {"name": "Pokémon TCG: Mega Evolution-Ascended Heroes ETB", "url": "https://www.pokemoncenter.com/product/10-10315-108/pokemon-tcg-mega-evolution-ascended-heroes-pokemon-center-elite-trainer-box"},
+    {"name": "Pokémon TCG: Scarlet & Violet-Destined Rivals ETB", "url": "https://www.pokemoncenter.com/product/100-10653/pokemon-tcg-scarlet-and-violet-destined-rivals-pokemon-center-elite-trainer-box"},
+    {"name": "Pokémon TCG: Chaos Rising ETB", "url": "https://www.pokemoncenter.com/product/10-10399-112"},
+    
 ]
 
 def log(message):
