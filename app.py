@@ -14,15 +14,14 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 bot_running = False
 driver = None
+bot_thread = None
 
 # ================== CONFIG ==================
 config = {
-    "DISCORD_WEBHOOK": "",           # ← PUT YOUR REAL DISCORD WEBHOOK HERE
-    "ZIP_CODE": "32301",             # Tallahassee, FL
-    "USE_PROXY": False,              # Change to True once you add real proxies
-    "PROXIES": [                     # ← ADD YOUR RESIDENTIAL PROXIES HERE
-        # Example: "http://user:pass@ip:port"
-    ],
+    "DISCORD_WEBHOOK": "",           # ← PUT YOUR REAL WEBHOOK HERE
+    "ZIP_CODE": "32301",
+    "USE_PROXY": False,
+    "PROXIES": [],
     "AGGRESSIVE_MODE": False
 }
 
@@ -65,23 +64,23 @@ def check_product(driver, product):
     try:
         log(f"🔍 Checking {product['retailer']} → {product['name']}")
         driver.get(product["url"])
-        time.sleep(random.uniform(9, 16))
+        time.sleep(random.uniform(10, 16))
         
         text = driver.page_source.lower()
         if any(w in text for w in ["out of stock", "sold out", "unavailable", "busy right now", "notify me"]):
-            log(f"❌ Out of stock - {product['name']}")
+            log(f"❌ Out of stock")
         else:
-            log(f"✅ STOCK FOUND → {product['name']} at {product['retailer']}")
+            log(f"✅ STOCK FOUND → {product['name']}")
             if config["DISCORD_WEBHOOK"]:
                 requests.post(config["DISCORD_WEBHOOK"], json={"content": f"🚨 STOCK ALERT!\n{product['name']} at {product['retailer']}\n{product['url']}"})
         return True
-    except Exception as e:
-        log(f"❌ Connection error on {product['name']}")
+    except:
+        log(f"❌ Connection error")
         return False
 
 def bot_loop():
     global driver
-    log("🚀 Smart Multi-Retailer Bot Started (Target + Walmart + Best Buy)")
+    log("🚀 Smart Multi-Retailer Bot Started")
     
     while bot_running:
         try:
@@ -113,7 +112,8 @@ def index():
 @app.route('/api/start', methods=['POST'])
 def start_bot():
     global bot_running, bot_thread
-    if bot_running: return jsonify({"status": "already running"})
+    if bot_running:
+        return jsonify({"status": "already running"})
     bot_running = True
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
@@ -128,13 +128,6 @@ def stop_bot():
 @app.route('/api/products', methods=['GET'])
 def get_products():
     return jsonify(products)
-
-@app.route('/api/config', methods=['POST'])
-def update_config():
-    global config
-    data = request.json
-    config.update(data)
-    return jsonify({"status": "saved"})
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
