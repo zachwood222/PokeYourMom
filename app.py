@@ -2,14 +2,9 @@ from flask import Flask, render_template, request, jsonify
 from flask_socketio import SocketIO, emit
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 import selenium_stealth
 import time
 import random
-import json
-import os
-import requests
 import threading
 from datetime import datetime
 
@@ -19,19 +14,12 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 bot_running = False
 driver = None
 
-# Hot Products
 products = [
     {"name": "Prismatic Evolutions ETB", "url": "https://www.target.com/p/2024-pok-scarlet-violet-s8-5-elite-trainer-box/-/A-93954435"},
     {"name": "Surging Sparks ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-surging-sparks-elite-trainer-box/-/A-91619922"},
     {"name": "Scarlet & Violet 151 ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-151-elite-trainer-box/-/A-88897899"},
     {"name": "Mega Evolution Perfect Order ETB", "url": "https://www.target.com/p/pok-233-mon-trading-card-game-mega-evolution-perfect-order-elite-trainer-box/-/A-95230445"},
 ]
-
-config = {
-    "AUTO_FULL_CHECKOUT": False,
-    "AGGRESSIVE_MODE": False,
-    "USE_PROXY": False
-}
 
 def log(message):
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -54,37 +42,28 @@ def get_driver():
         log("✅ Driver started successfully")
         return driver
     except Exception as e:
-        log(f"❌ Driver failed: {str(e)[:100]}")
+        log(f"❌ Driver failed: {str(e)[:80]}")
         raise
-
-def is_in_stock(driver):
-    try:
-        text = driver.page_source.lower()
-        if any(w in text for w in ["out of stock", "sold out", "unavailable", "busy right now", "notify me"]):
-            return False
-        return len(driver.find_elements(By.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add to cart')]")) > 0
-    except:
-        return False
 
 def check_product(driver, product):
     try:
         log(f"🔍 Checking → {product['name']}")
         driver.get(product["url"])
-        time.sleep(random.uniform(6, 10))
+        time.sleep(random.uniform(8, 14))
         
-        if is_in_stock(driver):
-            log(f"✅ STOCK FOUND → {product['name']}")
-            return True
+        text = driver.page_source.lower()
+        if any(w in text for w in ["out of stock", "sold out", "unavailable", "busy right now", "notify me when available"]):
+            log(f"❌ Out of stock - {product['name']}")
         else:
-            log(f"❌ Out of stock")
-            return False
+            log(f"✅ POSSIBLE STOCK ALERT → {product['name']}")
+        return True
     except Exception as e:
-        log(f"Connection error on {product['name']}")
+        log(f"❌ Connection error on {product['name']}")
         return False
 
 def bot_loop():
     global driver
-    log("🚀 Bot Started - Stable Mode")
+    log("🚀 Bot Started - Improved Stable Mode")
     
     while bot_running:
         try:
@@ -96,21 +75,21 @@ def bot_loop():
                 if not bot_running:
                     break
                 check_product(driver, product)
-                time.sleep(random.uniform(10, 18))   # Longer delay to be gentle
+                time.sleep(random.uniform(12, 22))   # Increased delay to be gentler on Target
             
-            wait = 25 if config["AGGRESSIVE_MODE"] else 180
-            log(f"✅ Scan done. Next scan in {wait} seconds")
+            wait = 35 if False else 160   # Set to True for aggressive mode
+            log(f"✅ Scan completed. Next scan in ~{wait} seconds")
             time.sleep(wait)
             
         except Exception as e:
-            log(f"💥 Error: {str(e)[:120]} - Restarting browser")
+            log(f"💥 Major error: {str(e)[:100]} - Restarting browser")
             if driver:
                 try:
                     driver.quit()
                 except:
                     pass
                 driver = None
-            time.sleep(15)
+            time.sleep(25)
 
 # ====================== ROUTES ======================
 @app.route('/')
