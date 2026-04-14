@@ -9,11 +9,12 @@ import threading
 from datetime import datetime
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')   # ← Changed from eventlet
 
 bot_running = False
 driver = None
 
+# Current hot products
 products = [
     {"name": "Prismatic Evolutions ETB", "url": "https://www.target.com/p/2024-pok-scarlet-violet-s8-5-elite-trainer-box/-/A-93954435"},
     {"name": "Surging Sparks ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-surging-sparks-elite-trainer-box/-/A-91619922"},
@@ -29,7 +30,10 @@ def log(message):
     timestamp = datetime.now().strftime("%H:%M:%S")
     entry = f"[{timestamp}] {message}"
     print(entry)
-    socketio.emit('log', {'message': entry})
+    try:
+        socketio.emit('log', {'message': entry})
+    except:
+        pass
 
 def get_driver():
     try:
@@ -39,6 +43,7 @@ def get_driver():
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--window-size=1920,1080")
         options.binary_location = "/usr/bin/google-chrome"
 
         driver = uc.Chrome(options=options, version_main=None)
@@ -46,28 +51,29 @@ def get_driver():
         log("✅ Driver started successfully")
         return driver
     except Exception as e:
-        log(f"❌ Driver failed: {str(e)[:80]}")
+        log(f"❌ Driver failed: {str(e)[:100]}")
         raise
 
 def check_product(driver, product):
     try:
         log(f"🔍 Checking → {product['name']}")
+        driver.set_page_load_timeout(25)   # Prevent hanging forever
         driver.get(product["url"])
-        time.sleep(random.uniform(8, 14))
+        time.sleep(random.uniform(6, 11))
         
         text = driver.page_source.lower()
         if any(w in text for w in ["out of stock", "sold out", "unavailable", "busy right now", "notify me when available"]):
             log(f"❌ Out of stock - {product['name']}")
         else:
-            log(f"✅ POSSIBLE STOCK ALERT → {product['name']}")
+            log(f"✅ POSSIBLE STOCK → {product['name']}")
         return True
     except Exception as e:
-        log(f"❌ Connection error on {product['name']}")
+        log(f"❌ Connection timeout/error on {product['name']}")
         return False
 
 def bot_loop():
     global driver
-    log("🚀 Bot Started - Improved Stable Mode")
+    log("🚀 Bot Started - Clean Threading Mode")
     
     while bot_running:
         try:
@@ -79,21 +85,21 @@ def bot_loop():
                 if not bot_running:
                     break
                 check_product(driver, product)
-                time.sleep(random.uniform(12, 22))   # Increased delay to be gentler on Target
+                time.sleep(random.uniform(10, 18))
             
-            wait = 35 if False else 160   # Set to True for aggressive mode
+            wait = 35 if False else 160
             log(f"✅ Scan completed. Next scan in ~{wait} seconds")
             time.sleep(wait)
             
         except Exception as e:
-            log(f"💥 Major error: {str(e)[:100]} - Restarting browser")
+            log(f"💥 Major error: {str(e)[:120]} - Restarting browser")
             if driver:
                 try:
                     driver.quit()
                 except:
                     pass
                 driver = None
-            time.sleep(25)
+            time.sleep(20)
 
 # ====================== ROUTES ======================
 @app.route('/')
