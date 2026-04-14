@@ -20,8 +20,8 @@ bot_thread = None
 config = {
     "DISCORD_WEBHOOK": "",           # ← PUT YOUR REAL WEBHOOK HERE
     "ZIP_CODE": "32301",
-    "USE_PROXY": False,
-    "PROXIES": [],
+    "USE_PROXY": True,
+    "PROXIES": [http://205.178.144.96:8447, http://37.59.112.197:443, http://205.178.144.167:8443],
     "AGGRESSIVE_MODE": False
 }
 
