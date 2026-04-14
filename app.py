@@ -17,21 +17,19 @@ driver = None
 
 # ================== CONFIG ==================
 config = {
-    "DISCORD_WEBHOOK": "",           # ← PASTE YOUR DISCORD WEBHOOK HERE
-    "ZIP_CODE": "32301",             # Tallahassee, FL - change if needed
-    "USE_PROXY": False,
-    "PROXIES": [],                   # Add real residential proxies here later
+    "DISCORD_WEBHOOK": "",           # ← PUT YOUR REAL DISCORD WEBHOOK HERE
+    "ZIP_CODE": "32301",             # Tallahassee, FL
+    "USE_PROXY": False,              # Change to True once you add real proxies
+    "PROXIES": [                     # ← ADD YOUR RESIDENTIAL PROXIES HERE
+        # Example: "http://user:pass@ip:port"
+    ],
     "AGGRESSIVE_MODE": False
 }
 
 products = [
-    # Target
     {"retailer": "Target", "name": "Prismatic Evolutions ETB", "url": "https://www.target.com/p/2024-pok-scarlet-violet-s8-5-elite-trainer-box/-/A-93954435"},
     {"retailer": "Target", "name": "Surging Sparks ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-surging-sparks-elite-trainer-box/-/A-91619922"},
-    # Walmart
     {"retailer": "Walmart", "name": "Prismatic Evolutions ETB", "url": "https://www.walmart.com/ip/Pokemon-Scarlet-and-Violet-8-5-Prismatic-Evolutions-Elite-Trainer-Box/13816151308"},
-    {"retailer": "Walmart", "name": "Surging Sparks ETB", "url": "https://www.walmart.com/ip/Pokemon-Scarlet-and-Violet-Surging-Sparks-Elite-Trainer-Box/5123456789"},
-    # Best Buy
     {"retailer": "Best Buy", "name": "Prismatic Evolutions ETB", "url": "https://www.bestbuy.com/site/pokemon-trading-card-game-scarlet-violet-prismatic-evolutions-elite-trainer-box/6578901.p"},
 ]
 
@@ -60,34 +58,22 @@ def get_driver():
 
     driver = uc.Chrome(options=options, version_main=None)
     selenium_stealth.stealth(driver, languages=["en-US", "en"], vendor="Google Inc.", platform="Win32", fix_hairline=True)
-    log("✅ Driver started")
+    log("✅ Driver started successfully")
     return driver
-
-def check_in_store(product):
-    if product["retailer"] != "Best Buy":
-        return "In-store check only for Best Buy"
-    try:
-        log(f"📍 Checking in-store near ZIP {config['ZIP_CODE']} → {product['name']}")
-        # Best Buy public availability check (simplified)
-        log(f"✅ In-store check complete for {product['name']}")
-        return True
-    except:
-        return False
 
 def check_product(driver, product):
     try:
         log(f"🔍 Checking {product['retailer']} → {product['name']}")
         driver.get(product["url"])
-        time.sleep(random.uniform(8, 15))
+        time.sleep(random.uniform(9, 16))
         
         text = driver.page_source.lower()
         if any(w in text for w in ["out of stock", "sold out", "unavailable", "busy right now", "notify me"]):
             log(f"❌ Out of stock - {product['name']}")
         else:
-            log(f"✅ ONLINE STOCK FOUND → {product['name']} at {product['retailer']}")
+            log(f"✅ STOCK FOUND → {product['name']} at {product['retailer']}")
             if config["DISCORD_WEBHOOK"]:
-                requests.post(config["DISCORD_WEBHOOK"], json={"content": f"🚨 ONLINE STOCK: {product['name']} at {product['retailer']}\n{product['url']}"})
-            check_in_store(product)
+                requests.post(config["DISCORD_WEBHOOK"], json={"content": f"🚨 STOCK ALERT!\n{product['name']} at {product['retailer']}\n{product['url']}"})
         return True
     except Exception as e:
         log(f"❌ Connection error on {product['name']}")
@@ -95,7 +81,7 @@ def check_product(driver, product):
 
 def bot_loop():
     global driver
-    log("🚀 Smart Multi-Retailer + In-Store Bot Started")
+    log("🚀 Smart Multi-Retailer Bot Started (Target + Walmart + Best Buy)")
     
     while bot_running:
         try:
@@ -106,9 +92,9 @@ def bot_loop():
             for product in products:
                 if not bot_running: break
                 check_product(driver, product)
-                time.sleep(random.uniform(12, 22))
+                time.sleep(random.uniform(15, 25))
             
-            wait = 35 if config["AGGRESSIVE_MODE"] else 160
+            wait = 35 if config["AGGRESSIVE_MODE"] else 180
             log(f"✅ Scan completed. Next scan in ~{wait} seconds")
             time.sleep(wait)
         except Exception as e:
@@ -119,7 +105,7 @@ def bot_loop():
                 driver = None
             time.sleep(25)
 
-# ====================== DASHBOARD ROUTES ======================
+# ====================== ROUTES ======================
 @app.route('/')
 def index():
     return render_template('index.html')
