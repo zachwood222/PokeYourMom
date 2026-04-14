@@ -1,43 +1,33 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Pokémon Target Sniper 2026</title>
+    <title>Pokémon TCG Smart Hunter 2026</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
     <style>
         body { font-family: Arial; background: #0f0f0f; color: #00ff88; padding: 20px; }
-        .box { background: #1a1a1a; padding: 15px; margin: 15px 0; border-radius: 8px; border: 2px solid #00ff88; }
+        .box { background: #1a1a1a; padding: 18px; margin: 15px 0; border-radius: 8px; border: 2px solid #00ff88; }
         button { padding: 10px 16px; margin: 5px; font-weight: bold; }
-        .green { background:#00cc00; color:black; }
-        .red { background:#cc0000; color:white; }
-        input[type="checkbox"] { transform: scale(1.3); margin-right: 8px; }
+        input, textarea { background: #222; color: #0f0; border: 1px solid #0f0; padding: 8px; width: 100%; margin: 5px 0; }
     </style>
 </head>
 <body>
 <div class="container">
-    <h1>🎯 Pokémon Target Sniper Bot</h1>
-    
+    <h1>🎯 Pokémon TCG Smart Hunter</h1>
     <button onclick="toggleBot()" id="toggleBtn" class="green" style="font-size:18px;">START BOT</button>
-    <button onclick="location.reload()">Refresh Dashboard</button>
 
     <div class="box">
         <h2>Settings</h2>
-        <label><input type="checkbox" id="autoCheckout"> Auto Full Checkout (High Risk)</label><br><br>
-        <label><input type="checkbox" id="aggressive"> Aggressive Mode</label><br><br>
-        <label><input type="checkbox" id="trust"> Trust Building</label><br><br>
-        <label><input type="checkbox" id="proxy"> Use Proxies</label><br><br>
-        <button onclick="saveSettings()">💾 Save Settings</button>
+        <label><input type="checkbox" id="aggressive" onchange="saveConfig()"> Aggressive Mode</label><br>
+        <label><input type="checkbox" id="proxy" onchange="saveConfig()"> Use Proxies</label><br><br>
+        ZIP Code: <input id="zip" value="32301" onchange="saveConfig()"><br><br>
+        Discord Webhook: <input id="webhook" style="width:100%" onchange="saveConfig()">
+        <button onclick="saveConfig()">Save All Settings</button>
     </div>
 
     <div class="box">
-        <h2>Add Product</h2>
-        <input id="prodName" placeholder="Product Name" style="width:30%">
-        <input id="prodUrl" placeholder="Target URL" style="width:60%">
-        <button onclick="addProduct()">Add</button>
-    </div>
-
-    <div class="box">
-        <h2>Monitored Products (<span id="count">0</span>)</h2>
-        <ul id="productList" style="list-style:none; padding:0;"></ul>
+        <h2>Add Residential Proxy</h2>
+        <input id="newProxy" placeholder="http://user:pass@ip:port">
+        <button onclick="addProxy()">Add Proxy</button>
     </div>
 
     <div class="box">
@@ -56,57 +46,26 @@
     function toggleBot() {
         const btn = document.getElementById('toggleBtn');
         const action = btn.innerText.includes('START') ? 'start' : 'stop';
-        fetch('/api/' + action, {method: 'POST'})
-            .then(() => btn.innerText = btn.innerText.includes('START') ? 'STOP BOT' : 'START BOT');
+        fetch('/api/' + action, {method: 'POST'}).then(() => btn.innerText = btn.innerText.includes('START') ? 'STOP BOT' : 'START BOT');
     }
 
-    function saveSettings() {
+    function saveConfig() {
         const data = {
-            AUTO_FULL_CHECKOUT: document.getElementById('autoCheckout').checked,
             AGGRESSIVE_MODE: document.getElementById('aggressive').checked,
-            TRUST_BUILDING: document.getElementById('trust').checked,
-            USE_PROXY: document.getElementById('proxy').checked
+            USE_PROXY: document.getElementById('proxy').checked,
+            ZIP_CODE: document.getElementById('zip').value,
+            DISCORD_WEBHOOK: document.getElementById('webhook').value
         };
-        fetch('/api/config', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(data)
-        }).then(() => alert('Settings Saved!'));
+        fetch('/api/config', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data)});
     }
 
-    function addProduct() {
-        const name = document.getElementById('prodName').value.trim();
-        const url = document.getElementById('prodUrl').value.trim();
-        if (name && url) {
-            fetch('/api/products', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({name, url})
-            }).then(() => loadProducts());
-        }
+    function addProxy() {
+        alert("Proxy added to config (edit app.py manually for now)");
     }
 
-    function loadProducts() {
-        fetch('/api/products')
-            .then(r => r.json())
-            .then(data => {
-                const list = document.getElementById('productList');
-                list.innerHTML = '';
-                document.getElementById('count').textContent = data.length;
-                data.forEach((p, i) => {
-                    const li = document.createElement('li');
-                    li.innerHTML = `${p.name} <small>${p.url.substring(0,60)}...</small> 
-                        <button onclick="removeProduct(${i})" style="background:#aa0000;color:white;float:right;">Remove</button>`;
-                    list.appendChild(li);
-                });
-            });
-    }
-
-    function removeProduct(i) {
-        fetch(`/api/products/${i}`, {method: 'DELETE'}).then(() => loadProducts());
-    }
-
-    window.onload = loadProducts;
+    window.onload = () => {
+        document.getElementById('toggleBtn').innerText = "START BOT";
+    };
 </script>
 </body>
 </html>
