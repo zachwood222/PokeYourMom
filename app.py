@@ -20,7 +20,7 @@ driver = None
 # ================== CONFIG ==================
 config = {
     "DISCORD_WEBHOOK": "https://discord.com/api/webhooks/1494042625966084146/-3RBLTxpjG-1bTqLvnetQ1ns_5Trz3FBxEj0cbXgjj--lmZjG6O5XsWZcYvDJh2EKti_",
-    "ZIP_CODE": "32301",
+    "ZIP_CODE": "32405",
     "USE_PROXY": True,
     "PROXIES": [
         "http://186.46.220.117:443",
@@ -79,50 +79,31 @@ def check_product(driver, product):
     try:
         log(f"🔍 Checking {product['retailer']} → {product['name']}")
         driver.get(product["url"])
-        time.sleep(random.uniform(10, 16))   # Give page time to fully load
-
-        # Scroll down to force button to load
-        driver.execute_script("window.scrollBy(0, 1000);")
-        time.sleep(3)
+        time.sleep(random.uniform(10, 18))
 
         page_text = driver.page_source.lower()
 
-        # Out of stock check
-        if any(word in page_text for word in ["out of stock", "sold out", "unavailable", "notify me when available", "get notified", "temporarily out of stock"]):
+        if any(word in page_text for word in ["out of stock", "sold out", "unavailable", "notify me when available", "get notified"]):
             log(f"❌ Out of stock - {product['name']}")
             return False
 
-        # === ROBUST ADD TO CART DETECTION ===
-        selectors = [
+        # Try multiple ways to find active Add to Cart
+        for xpath in [
             "//button[@data-test='add-to-cart']",
             "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add to cart')]",
-            "//button[contains(@aria-label, 'add to cart')]",
-            "//button[contains(@class, 'add-to-cart')]",
-            "//button[contains(text(), 'Add') and contains(text(), 'Cart')]"
-        ]
-
-        for sel in selectors:
+            "//button[contains(@aria-label, 'add to cart')]"
+        ]:
             try:
-                btn = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.XPATH, sel))
-                )
-                if btn.is_displayed():
-                    # Click it once to see if it works (safe because we don't actually add)
-                    driver.execute_script("arguments[0].click();", btn)
-                    time.sleep(2)
-                    
-                    # If it didn't redirect to error or "sold out", it's real stock
-                    if "add to cart" in driver.page_source.lower() or "cart" in driver.current_url.lower():
-                        log(f"✅ REAL STOCK DETECTED → {product['name']}")
-                        if config["DISCORD_WEBHOOK"]:
-                            requests.post(config["DISCORD_WEBHOOK"], json={
-                                "content": f"🚨 **REAL STOCK ALERT!**\n{product['name']} at {product['retailer']}\n{product['url']}"
-                            })
-                        return True
+                btn = WebDriverWait(driver, 8).until(EC.element_to_be_clickable((By.XPATH, xpath)))
+                if btn.is_displayed() and btn.is_enabled():
+                    log(f"✅ REAL STOCK DETECTED → {product['name']}")
+                    if config["DISCORD_WEBHOOK"]:
+                        requests.post(config["DISCORD_WEBHOOK"], json={"content": f"🚨 **REAL STOCK ALERT!**\n{product['name']} at {product['retailer']}\n{product['url']}"})
+                    return True
             except:
                 continue
 
-        log(f"❌ No active Add to Cart button found (likely grayed out or phantom)")
+        log(f"❌ Add to Cart not active - {product['name']}")
         return False
 
     except Exception as e:
@@ -131,7 +112,7 @@ def check_product(driver, product):
 
 def bot_loop():
     global driver
-    log("🚀 Smart Multi-Retailer Bot Running with MSRP + Sold-By Filter")
+    log("🚀 Smart Pokémon Hunter Running")
     
     while bot_running:
         try:
@@ -142,7 +123,7 @@ def bot_loop():
             for product in products:
                 if not bot_running: break
                 check_product(driver, product)
-                time.sleep(random.uniform(14, 24))
+                time.sleep(random.uniform(15, 25))
             
             wait = 35 if config["AGGRESSIVE_MODE"] else 160
             log(f"✅ Scan completed. Next scan in ~{wait} seconds")
@@ -155,7 +136,6 @@ def bot_loop():
                 driver = None
             time.sleep(25)
 
-# ====================== ROUTES ======================
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -181,19 +161,9 @@ def get_products():
 
 @app.route('/api/test-alert', methods=['POST'])
 def test_alert():
-    if config.get("DISCORD_WEBHOOK"):
-        try:
-            r = requests.post(config["DISCORD_WEBHOOK"], json={
-                "content": "🧪 **TEST ALERT** - The Pokémon Sniper webhook is working correctly! 🎉\nIf you see this, alerts are working."
-            })
-            if r.status_code == 204:
-                log("🧪 Test alert sent successfully to Discord")
-            else:
-                log(f"❌ Test alert failed (status {r.status_code})")
-        except Exception as e:
-            log(f"❌ Test alert error: {str(e)}")
-    else:
-        log("⚠️ No Discord webhook configured")
+    if config["DISCORD_WEBHOOK"]:
+        requests.post(config["DISCORD_WEBHOOK"], json={"content": "🧪 **Test Alert** - Webhook is working! 🎉"})
+        log("🧪 Test alert sent")
     return jsonify({"status": "sent"})
 
 if __name__ == '__main__':
