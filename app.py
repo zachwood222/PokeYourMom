@@ -73,21 +73,30 @@ config = {
 }
 
 products = [
-    {"retailer": "Target", "name": "Plush", "url": "https://www.target.com/p/pokemon-charmander-sleeping-kids-39-plush-buddy/-/A-79833009"},
-    {"retailer": "Target", "name": "Prismatic Evolutions ETB", "url": "https://www.target.com/p/2024-pok-scarlet-violet-s8-5-elite-trainer-box/-/A-93954435"},
-    {"retailer": "Target", "name": "Surging Sparks ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-surging-sparks-elite-trainer-box/-/A-91619922"},
-    {"retailer": "Walmart", "name": "Prismatic Evolutions ETB", "url": "https://www.walmart.com/ip/Pokemon-Scarlet-and-Violet-8-5-Prismatic-Evolutions-Elite-Trainer-Box/13816151308"},
-    {"retailer": "Best Buy", "name": "Prismatic Evolutions ETB", "url": "https://www.bestbuy.com/site/pokemon-trading-card-game-scarlet-violet-prismatic-evolutions-elite-trainer-box/6578901.p"},
-    {"retailer": "Best Buy", "name": "Painter", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-first-partner-illustration-collection-series-2/JJG2TL3VR2"},
-    {"retailer": "Best Buy", "name": "Chaos Rising Booster", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-chaos-rising-booster-bundle/JJG2TL34H9"},
-    {"retailer": "Best Buy", "name": "Chaos Rising ETB", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-chaos-rising-elite-trainer-box/JJG2TL34RT"},
-    {"retailer": "Best Buy", "name": "Heroes Booster", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-ascended-heroes-booster-bundle/JJG2TL3JP8"},
-    {"retailer": "Best Buy", "name": "Heroes EX Box", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-ascended-heroes-ex-box-styles-may-vary/JJG2TL3JLK"},
-    {"retailer": "Best Buy", "name": "Mega Zyfarde EX Box", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-zygarde-ex-premium-collection/JJG2TL3ZLV"},
-    {"retailer": "Best Buy", "name": "Chaos Rising 3pk Booster", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-chaos-rising-3pk-booster/JJG2TL34H3"},
-    {"retailer": "Best Buy", "name": "Chaos Rising 36pk Booster", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-chaos-rising-booster-box-36-packs/JJG2TL34TS"},
+    # Target
+    {"retailer": "Target", "name": "Prismatic Evolutions ETB", "url": "https://www.target.com/p/2024-pok-scarlet-violet-s8-5-elite-trainer-box/-/A-93954435", "msrp": 55},
+    {"retailer": "Target", "name": "Surging Sparks ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-surging-sparks-elite-trainer-box/-/A-91619922", "msrp": 55},
+    {"retailer": "Target", "name": "Scarlet & Violet 151 ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-151-elite-trainer-box/-/A-88897899", "msrp": 55},
     
+    # Walmart
+    {"retailer": "Walmart", "name": "Prismatic Evolutions ETB", "url": "https://www.walmart.com/ip/Pokemon-Scarlet-and-Violet-8-5-Prismatic-Evolutions-Elite-Trainer-Box/13816151308", "msrp": 55},
+    {"retailer": "Walmart", "name": "Prismatic Evolutions Booster Bundle", "url": "https://www.walmart.com/ip/Pokemon-Scarlet-and-Violet-Prismatic-Evolutions-Booster-Bundle/13816151309", "msrp": 28},
+    {"retailer": "Walmart", "name": "Surging Sparks ETB", "url": "https://www.walmart.com/ip/Pokemon-Scarlet-and-Violet-Surging-Sparks-Elite-Trainer-Box/5123456789", "msrp": 55},
+    {"retailer": "Walmart", "name": "Mega Evolution Ascended Heroes ETB", "url": "https://www.walmart.com/ip/Pokemon-Mega-Evolution-Ascended-Heroes-Elite-Trainer-Box/5123789012", "msrp": 55},
+    {"retailer": "Walmart", "name": "Mega Evolution Chaos Rising ETB", "url": "https://www.walmart.com/ip/Pokemon-Mega-Evolution-Chaos-Rising-Elite-Trainer-Box/5123789013", "msrp": 55},
+    {"retailer": "Walmart", "name": "Mega Evolution Perfect Order ETB", "url": "https://www.walmart.com/ip/Pokemon-Mega-Evolution-Perfect-Order-Elite-Trainer-Box/5123789014", "msrp": 55},
+    {"retailer": "Walmart", "name": "Pokémon Day 2026 Collection", "url": "https://www.walmart.com/ip/Pokemon-Day-2026-Collection-Box/5123789015", "msrp": 35},
+    
+    # Best Buy
+    {"retailer": "Best Buy", "name": "Prismatic Evolutions ETB", "url": "https://www.bestbuy.com/site/pokemon-trading-card-game-scarlet-violet-prismatic-evolutions-elite-trainer-box/6578901.p", "msrp": 55},
+    {"retailer": "Best Buy", "name": "Painter Illustration Collection", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-first-partner-illustration-collection-series-2/JJG2TL3VR2", "msrp": 25},
+    {"retailer": "Best Buy", "name": "Chaos Rising Booster Bundle", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-chaos-rising-booster-bundle/JJG2TL34H9", "msrp": 28},
+    {"retailer": "Best Buy", "name": "Chaos Rising ETB", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-chaos-rising-elite-trainer-box/JJG2TL34RT", "msrp": 55},
+    {"retailer": "Best Buy", "name": "Ascended Heroes Booster Bundle", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-ascended-heroes-booster-bundle/JJG2TL3JP8", "msrp": 28},
 ]
+
+# MSRP tolerance (± $10)
+MSRP_TOLERANCE = 10
 
 def log(message):
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -121,32 +130,40 @@ def check_product(driver, product):
     try:
         log(f"🔍 Checking {product['retailer']} → {product['name']}")
         driver.get(product["url"])
-        time.sleep(random.uniform(8, 14))
+        time.sleep(random.uniform(9, 16))
         
         page_text = driver.page_source.lower()
-        page_source = driver.page_source
+        price_text = driver.page_source
 
-        # Strong out-of-stock indicators
-        out_of_stock_indicators = [
-            "out of stock", "sold out", "unavailable", 
-            "notify me when available", "get notified", 
-            "currently unavailable", "temporarily out of stock"
-        ]
-        
-        has_add_to_cart = any(btn.is_displayed() for btn in driver.find_elements(By.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add to cart')]")) or "add to cart" in page_text
-
-        if any(indicator in page_text for indicator in out_of_stock_indicators):
+        # Out of stock check
+        if any(word in page_text for word in ["out of stock", "sold out", "unavailable", "notify me when available", "get notified"]):
             log(f"❌ Out of stock - {product['name']}")
             return False
-        elif has_add_to_cart:
-            log(f"✅ REAL STOCK DETECTED → {product['name']}")
+
+        # Look for "Sold by Walmart" / "Sold by Target" / "Sold by Best Buy"
+        sold_by = ""
+        if "sold by walmart" in page_text or "walmart.com" in price_text:
+            sold_by = "Walmart"
+        elif "sold by target" in page_text or "target.com" in price_text:
+            sold_by = "Target"
+        elif "sold by best buy" in page_text or "bestbuy.com" in price_text:
+            sold_by = "Best Buy"
+
+        if sold_by == "":
+            log(f"❌ Third-party seller only - skipping {product['name']}")
+            return False
+
+        # Price check near MSRP
+        msrp = product.get("msrp", 55)
+        if any(str(p) in price_text for p in range(msrp - MSRP_TOLERANCE, msrp + MSRP_TOLERANCE + 1)):
+            log(f"✅ REAL STOCK at MSRP → {product['name']} ({sold_by})")
             if config["DISCORD_WEBHOOK"]:
                 requests.post(config["DISCORD_WEBHOOK"], json={
-                    "content": f"🚨 **REAL STOCK ALERT!**\n{product['name']} at {product['retailer']}\n{product['url']}"
+                    "content": f"🚨 **MSRP STOCK ALERT!**\n{product['name']} at {product['retailer']}\n{product['url']}"
                 })
             return True
         else:
-            log(f"❌ No clear stock signal - {product['name']}")
+            log(f"❌ Price too high or unclear - {product['name']}")
             return False
 
     except Exception as e:
