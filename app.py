@@ -192,6 +192,15 @@ def start_bot():
     bot_thread.start()
     return jsonify({"status": "started"})
 
+@app.route('/api/test-alert', methods=['POST'])
+def test_alert():
+    if config.get("DISCORD_WEBHOOK"):
+        requests.post(config["DISCORD_WEBHOOK"], json={
+            "content": "🧪 **Test Alert**\nPokémon Sniper Bot is connected and working! 🎉"
+        });
+        log("🧪 Test alert sent to Discord")
+    return jsonify({"status": "sent"})
+    
 @app.route('/api/stop', methods=['POST'])
 def stop_bot():
     global bot_running
