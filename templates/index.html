@@ -7,29 +7,32 @@
         @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
         
         body {
-            font-family: 'Press Start 2P', cursive;
-            background: linear-gradient(#0a0a0a, #1a0033);
+            background: linear-gradient(180deg, #0a0a2a 0%, #1a0033 100%);
             color: #ffcc00;
+            font-family: 'Press Start 2P', cursive;
             margin: 0;
             padding: 20px;
             min-height: 100vh;
+            image-rendering: pixelated;
         }
         .container { max-width: 1100px; margin: auto; }
         h1 {
             text-align: center;
-            color: #ff0000;
-            text-shadow: 0 0 10px #ffff00;
-            margin-bottom: 20px;
+            font-size: 2.2em;
+            text-shadow: 0 0 15px #ff0000;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
         }
         .pokeball {
-            width: 60px;
-            height: 60px;
-            background: radial-gradient(circle, #fff 40%, #ff0000 40%);
+            width: 50px;
+            height: 50px;
+            background: radial-gradient(circle, #fff 0%, #fff 40%, #ff0000 40%, #ff0000 60%, #000 60%, #000 100%);
             border-radius: 50%;
             border: 4px solid #000;
             position: relative;
-            display: inline-block;
-            margin: 0 10px;
         }
         .pokeball::after {
             content: '';
@@ -37,49 +40,52 @@
             top: 50%;
             left: 50%;
             transform: translate(-50%, -50%);
-            width: 20px;
-            height: 20px;
+            width: 18px;
+            height: 18px;
             background: #000;
             border-radius: 50%;
             border: 3px solid #fff;
         }
-
         .box {
-            background: rgba(0,0,0,0.85);
-            border: 3px solid #ffcc00;
+            background: rgba(0, 0, 0, 0.85);
+            border: 4px solid #ffcc00;
             border-radius: 12px;
             padding: 20px;
             margin: 20px 0;
-            box-shadow: 0 0 15px rgba(255, 204, 0, 0.4);
+            box-shadow: 0 0 20px rgba(255, 204, 0, 0.5);
         }
         button {
             font-family: 'Press Start 2P', cursive;
-            padding: 12px 24px;
+            padding: 14px 24px;
             margin: 8px;
-            font-size: 14px;
-            cursor: pointer;
-            border: 3px solid #ffcc00;
+            font-size: 1em;
+            border: 4px solid #ff0000;
             background: #000;
             color: #ffcc00;
+            cursor: pointer;
+            transition: all 0.2s;
         }
-        button:hover { background: #ffcc00; color: #000; }
+        button:hover {
+            transform: scale(1.05);
+            box-shadow: 0 0 15px #ff0000;
+        }
         .green { border-color: #00ff00; color: #00ff00; }
         .red { border-color: #ff0000; color: #ff0000; }
         .blue { border-color: #00aaff; color: #00aaff; }
-
+        
         #logs {
             background: #000;
-            border: 3px solid #00ff00;
+            border: 4px solid #00ff00;
             height: 380px;
-            overflow-y: scroll;
+            overflow-y: auto;
             padding: 15px;
             font-family: monospace;
-            color: #00ff88;
-            white-space: pre-wrap;
+            font-size: 14px;
+            line-height: 1.4;
         }
-        .product-card {
-            background: #1a0033;
-            border: 2px solid #ffcc00;
+        .product-list li {
+            background: #111;
+            border: 3px solid #00ffcc;
             padding: 12px;
             margin: 8px 0;
             border-radius: 8px;
@@ -91,29 +97,33 @@
 </head>
 <body>
 <div class="container">
-    <h1><span class="pokeball"></span> POKÉMON TCG SNIPER 2026 <span class="pokeball"></span></h1>
-    
+    <h1>
+        <span class="pokeball"></span>
+        POKÉMON TCG SNIPER 2026
+        <span class="pokeball"></span>
+    </h1>
+
     <div style="text-align:center; margin:15px 0;">
-        <button onclick="toggleBot()" id="toggleBtn" class="green">▶ START BOT</button>
-        <button onclick="sendTestAlert()" class="blue">🧪 TEST ALERT</button>
+        <button onclick="toggleBot()" id="toggleBtn" class="green" style="font-size:1.3em; padding:18px 40px;">START BOT</button>
+        <button onclick="sendTestAlert()" class="blue" style="font-size:1.1em;">🧪 TEST DISCORD ALERT</button>
     </div>
 
     <div class="box">
         <h2>⚙️ Settings</h2>
-        <label><input type="checkbox" id="aggressive" onchange="saveConfig()"> 🔥 Aggressive Mode</label><br><br>
-        <label><input type="checkbox" id="proxy" onchange="saveConfig()"> 🌐 Use Proxies</label><br><br>
-        ZIP: <input id="zip" value="32301" style="width:80px" onchange="saveConfig()">
-        Webhook: <input id="webhook" style="width:60%" onchange="saveConfig()">
-        <button onclick="saveConfig()">SAVE</button>
+        <label><input type="checkbox" id="aggressive" onchange="saveConfig()"> AGGRESSIVE MODE</label><br><br>
+        <label><input type="checkbox" id="proxy" onchange="saveConfig()"> USE RESIDENTIAL PROXIES</label><br><br>
+        ZIP Code: <input id="zip" value="32301" onchange="saveConfig()" style="width:120px"><br><br>
+        Discord Webhook: <input id="webhook" style="width:100%" onchange="saveConfig()">
+        <button onclick="saveConfig()" style="margin-top:15px;">💾 SAVE SETTINGS</button>
     </div>
 
     <div class="box">
         <h2>📦 Monitored Products</h2>
-        <div id="productList"></div>
+        <ul id="productList" class="product-list" style="list-style:none; padding:0;"></ul>
     </div>
 
     <div class="box">
-        <h2>📜 Live Logs</h2>
+        <h2>📜 LIVE LOGS</h2>
         <div id="logs"></div>
     </div>
 </div>
@@ -131,8 +141,8 @@
         const action = btn.innerText.includes('START') ? 'start' : 'stop';
         fetch('/api/' + action, {method: 'POST'})
             .then(() => {
-                btn.innerText = btn.innerText.includes('START') ? '⏹ STOP BOT' : '▶ START BOT';
-                btn.className = btn.innerText.includes('STOP') ? 'red' : 'green';
+                btn.innerText = btn.innerText.includes('START') ? 'STOP BOT' : 'START BOT';
+                btn.className = btn.innerText.includes('START') ? 'green' : 'red';
             });
     }
 
@@ -162,17 +172,16 @@
                 const list = document.getElementById('productList');
                 list.innerHTML = '';
                 data.forEach(p => {
-                    const div = document.createElement('div');
-                    div.className = 'product-card';
-                    div.innerHTML = `<strong>${p.retailer}</strong> ${p.name} <small style="color:#888">${p.url.substring(0,45)}...</small>`;
-                    list.appendChild(div);
+                    const li = document.createElement('li');
+                    li.innerHTML = `<strong>${p.retailer}</strong> — ${p.name}`;
+                    list.appendChild(li);
                 });
             });
     }
 
     window.onload = () => {
         loadProducts();
-        document.getElementById('toggleBtn').innerText = '▶ START BOT';
+        document.getElementById('toggleBtn').innerText = "START BOT";
     };
 </script>
 </body>
