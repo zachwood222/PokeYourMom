@@ -111,23 +111,41 @@ def check_product(driver, product):
     try:
         log(f"🔍 Checking {product['retailer']} → {product['name']}")
         driver.get(product["url"])
-        time.sleep(random.uniform(10, 18))
+        time.sleep(random.uniform(8, 14))
         
-        text = driver.page_source.lower()
-        if any(w in text for w in ["out of stock", "sold out", "unavailable", "busy right now", "notify me"]):
-            log(f"❌ Out of stock")
-        else:
-            log(f"✅ STOCK FOUND → {product['name']}")
+        page_text = driver.page_source.lower()
+        page_source = driver.page_source
+
+        # Strong out-of-stock indicators
+        out_of_stock_indicators = [
+            "out of stock", "sold out", "unavailable", 
+            "notify me when available", "get notified", 
+            "currently unavailable", "temporarily out of stock"
+        ]
+        
+        has_add_to_cart = any(btn.is_displayed() for btn in driver.find_elements(By.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add to cart')]")) or "add to cart" in page_text
+
+        if any(indicator in page_text for indicator in out_of_stock_indicators):
+            log(f"❌ Out of stock - {product['name']}")
+            return False
+        elif has_add_to_cart:
+            log(f"✅ REAL STOCK DETECTED → {product['name']}")
             if config["DISCORD_WEBHOOK"]:
-                requests.post(config["DISCORD_WEBHOOK"], json={"content": f"🚨 STOCK ALERT!\n{product['name']} at {product['retailer']}\n{product['url']}"})
-        return True
-    except:
+                requests.post(config["DISCORD_WEBHOOK"], json={
+                    "content": f"🚨 **REAL STOCK ALERT!**\n{product['name']} at {product['retailer']}\n{product['url']}"
+                })
+            return True
+        else:
+            log(f"❌ No clear stock signal - {product['name']}")
+            return False
+
+    except Exception as e:
         log(f"❌ Connection error on {product['name']}")
         return False
 
 def bot_loop():
     global driver
-    log("🚀 Smart Multi-Retailer Bot Running")
+    log("🚀 Smart Multi-Retailer Bot Running - Improved Stock Detection")
     
     while bot_running:
         try:
@@ -135,16 +153,16 @@ def bot_loop():
                 driver = get_driver()
             
             log(f"🔍 Starting scan of {len(products)} products...")
-            for p in products:
+            for product in products:
                 if not bot_running: break
-                check_product(driver, p)
+                check_product(driver, product)
                 time.sleep(random.uniform(15, 25))
             
             wait = 35 if config["AGGRESSIVE_MODE"] else 180
             log(f"✅ Scan completed. Next scan in ~{wait} seconds")
             time.sleep(wait)
         except Exception as e:
-            log(f"💥 Error: {str(e)[:100]}")
+            log(f"💥 Error: {str(e)[:100]} - Restarting browser")
             if driver:
                 try: driver.quit()
                 except: pass
