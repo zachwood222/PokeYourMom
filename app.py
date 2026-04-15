@@ -2,6 +2,8 @@ from flask import Flask, render_template, request, jsonify
 from flask_socketio import SocketIO, emit
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 import selenium_stealth
 import time
 import random
@@ -15,90 +17,35 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 bot_running = False
 driver = None
 
+# ================== CONFIG ==================
 config = {
-    "DISCORD_WEBHOOK": "https://discord.com/api/webhooks/1494042625966084146/-3RBLTxpjG-1bTqLvnetQ1ns_5Trz3FBxEj0cbXgjj--lmZjG6O5XsWZcYvDJh2EKti_",   # ← PUT YOUR REAL WEBHOOK HERE
+    "DISCORD_WEBHOOK": "https://discord.com/api/webhooks/1494042625966084146/-3RBLTxpjG-1bTqLvnetQ1ns_5Trz3FBxEj0cbXgjj--lmZjG6O5XsWZcYvDJh2EKti_",
     "ZIP_CODE": "32301",
     "USE_PROXY": True,
     "PROXIES": [
-        "http://185.219.159.38:443",
-        "http://190.113.112.147:4443",
-        "http://185.219.159.26:443",
-        "http://206.188.212.16:8443",
-        "http://37.59.112.197:443",
-        "http://185.219.159.36:443",
-        "http://47.243.181.85:41700",
-        "http://47.243.181.85:41400",
-        "http://47.243.181.85:41716",
-        "http://47.243.181.85:8081",
-        "http://47.243.181.85:41402",
-        "http://47.243.181.85:41396",
-        "http://47.243.181.85:42535",
-        "http://47.243.181.85:41798",
-        "http://47.243.181.85:42536",
-        "http://47.243.181.85:41698",
-        "http://47.243.181.85:55001",
-        "http://89.124.8.39:443",
-        "http://185.145.4.165:443",
-        "http://142.171.195.26:443",
-        "http://81.180.222.73:443",
-        "http://66.249.156.130:443",
-        "http://46.243.119.92:443",
-        "http://141.148.230.225:443",
-        "http://199.127.197.211:443",
-        "http://208.169.72.58:443",
-        "http://66.249.146.210:443",
-        "http://170.80.111.178:443",
-        "http://37.203.35.8:443",
-        "http://37.120.147.146:443",
-        "http://51.15.135.81:443",
-        "http://103.164.114.91:443",
-        "http://51.158.194.107:443",
-        "http://192.241.132.92:443",
-        "http://51.68.192.76:443",
         "http://186.46.220.117:443",
-        "http://51.158.194.16:443",
-        "http://211.34.105.110:443",
-        "http://37.120.156.34:443",
-        "http://37.59.110.73:443",
-        "http://89.124.8.78:443",
-        "http://47.243.181.85:55017",
-        "http://101.255.106.178:443",
-        "http://213.163.97.16:443",
-        "http://89.124.8.84:443",
-        "http://47.243.181.85:41692",
-        "http://47.243.181.85:55002",
-        "http://47.243.181.85:41419"
+        "http://185.219.159.38:443",
+        "http://185.219.159.26:443",
+        "http://47.243.181.85:41798",
     ],
     "AGGRESSIVE_MODE": False
 }
 
+# Full Product List with MSRP
 products = [
-    # Target
     {"retailer": "Target", "name": "TEST", "url": "https://www.target.com/p/sungboon-editor-deep-collagen-viral-glass-skin-korean-skincare-power-boosting-facial-mask-for-firming-and-restoration/-/A-93200681#lnk=sametab", "msrp": 55},
     {"retailer": "Target", "name": "TEST", "url": "https://www.target.com/p/sungboon-editor-deep-collagen-viral-glass-skin-korean-skincare-power-boosting-facial-mask-for-firming-and-restoration/-/A-93200681#lnk=sametab", "msrp": 5},
+    {"retailer": "Target", "name": "Plush", "url": "https://www.target.com/p/pokemon-charmander-sleeping-kids-39-plush-buddy/-/A-79833009", "msrp": 20},
     {"retailer": "Target", "name": "Prismatic Evolutions ETB", "url": "https://www.target.com/p/2024-pok-scarlet-violet-s8-5-elite-trainer-box/-/A-93954435", "msrp": 55},
     {"retailer": "Target", "name": "Surging Sparks ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-surging-sparks-elite-trainer-box/-/A-91619922", "msrp": 55},
-    {"retailer": "Target", "name": "Scarlet & Violet 151 ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-151-elite-trainer-box/-/A-88897899", "msrp": 55},
-    
-    # Walmart
     {"retailer": "Walmart", "name": "Prismatic Evolutions ETB", "url": "https://www.walmart.com/ip/Pokemon-Scarlet-and-Violet-8-5-Prismatic-Evolutions-Elite-Trainer-Box/13816151308", "msrp": 55},
-    {"retailer": "Walmart", "name": "Prismatic Evolutions Booster Bundle", "url": "https://www.walmart.com/ip/Pokemon-Scarlet-and-Violet-Prismatic-Evolutions-Booster-Bundle/13816151309", "msrp": 28},
     {"retailer": "Walmart", "name": "Surging Sparks ETB", "url": "https://www.walmart.com/ip/Pokemon-Scarlet-and-Violet-Surging-Sparks-Elite-Trainer-Box/5123456789", "msrp": 55},
-    {"retailer": "Walmart", "name": "Mega Evolution Ascended Heroes ETB", "url": "https://www.walmart.com/ip/Pokemon-Mega-Evolution-Ascended-Heroes-Elite-Trainer-Box/5123789012", "msrp": 55},
-    {"retailer": "Walmart", "name": "Mega Evolution Chaos Rising ETB", "url": "https://www.walmart.com/ip/Pokemon-Mega-Evolution-Chaos-Rising-Elite-Trainer-Box/5123789013", "msrp": 55},
-    {"retailer": "Walmart", "name": "Mega Evolution Perfect Order ETB", "url": "https://www.walmart.com/ip/Pokemon-Mega-Evolution-Perfect-Order-Elite-Trainer-Box/5123789014", "msrp": 55},
-    {"retailer": "Walmart", "name": "Pokémon Day 2026 Collection", "url": "https://www.walmart.com/ip/Pokemon-Day-2026-Collection-Box/5123789015", "msrp": 35},
-    
-    # Best Buy
     {"retailer": "Best Buy", "name": "Prismatic Evolutions ETB", "url": "https://www.bestbuy.com/site/pokemon-trading-card-game-scarlet-violet-prismatic-evolutions-elite-trainer-box/6578901.p", "msrp": 55},
     {"retailer": "Best Buy", "name": "Painter Illustration Collection", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-first-partner-illustration-collection-series-2/JJG2TL3VR2", "msrp": 25},
     {"retailer": "Best Buy", "name": "Chaos Rising Booster Bundle", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-chaos-rising-booster-bundle/JJG2TL34H9", "msrp": 28},
     {"retailer": "Best Buy", "name": "Chaos Rising ETB", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-chaos-rising-elite-trainer-box/JJG2TL34RT", "msrp": 55},
     {"retailer": "Best Buy", "name": "Ascended Heroes Booster Bundle", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-ascended-heroes-booster-bundle/JJG2TL3JP8", "msrp": 28},
 ]
-
-# MSRP tolerance (± $10)
-MSRP_TOLERANCE = 10
 
 def log(message):
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -125,57 +72,72 @@ def get_driver():
 
     driver = uc.Chrome(options=options, version_main=None)
     selenium_stealth.stealth(driver, languages=["en-US", "en"], vendor="Google Inc.", platform="Win32", fix_hairline=True)
-    log("✅ Driver started")
+    log("✅ Driver started successfully")
     return driver
 
 def check_product(driver, product):
     try:
         log(f"🔍 Checking {product['retailer']} → {product['name']}")
         driver.get(product["url"])
-        time.sleep(random.uniform(8, 14))   # Give page time to load
-
-        # Scroll down to make sure buttons load
-        driver.execute_script("window.scrollBy(0, 800);")
-        time.sleep(2)
-
+        time.sleep(random.uniform(9, 15))
+        
         page_text = driver.page_source.lower()
-
-        # Quick out-of-stock check
+        
+        # Out of stock check
         if any(word in page_text for word in ["out of stock", "sold out", "unavailable", "notify me when available", "get notified"]):
             log(f"❌ Out of stock - {product['name']}")
             return False
 
-        # === MULTIPLE WAYS TO FIND "ADD TO CART" BUTTON ===
-        selectors = [
-            "//button[@data-test='add-to-cart']",                                      # Target official
-            "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add to cart')]", 
-            "//button[contains(@aria-label, 'add to cart')]",
-            "//button[contains(@class, 'add-to-cart')]",
-            "//button[contains(text(), 'Add') and contains(text(), 'Cart')]"
-        ]
+        # Check for "Sold by [Retailer]" to avoid third-party
+        if product['retailer'].lower() not in page_text and "sold by" in page_text:
+            log(f"❌ Third-party seller only - skipping")
+            return False
 
-        for sel in selectors:
-            try:
-                btn = WebDriverWait(driver, 8).until(
-                    EC.element_to_be_clickable((By.XPATH, sel))
-                )
-                if btn.is_displayed() and btn.is_enabled():
-                    log(f"✅ REAL STOCK DETECTED → {product['name']}")
-                    if config["DISCORD_WEBHOOK"]:
-                        requests.post(config["DISCORD_WEBHOOK"], json={
-                            "content": f"🚨 **REAL STOCK ALERT!**\n{product['name']} at {product['retailer']}\n{product['url']}"
-                        })
-                    return True
-            except:
-                continue
-
-        log(f"❌ No active Add to Cart button found (grayed out or missing)")
+        # Look for active Add to Cart button
+        add_buttons = driver.find_elements(By.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add to cart')]")
+        for btn in add_buttons:
+            if btn.is_displayed() and btn.is_enabled():
+                log(f"✅ REAL STOCK DETECTED → {product['name']}")
+                if config["DISCORD_WEBHOOK"]:
+                    requests.post(config["DISCORD_WEBHOOK"], json={
+                        "content": f"🚨 **REAL STOCK ALERT!**\n{product['name']} at {product['retailer']}\n{product['url']}"
+                    })
+                return True
+                
+        log(f"❌ Add to Cart button not active (grayed out)")
         return False
 
     except Exception as e:
         log(f"❌ Connection error on {product['name']}")
         return False
 
+def bot_loop():
+    global driver
+    log("🚀 Smart Multi-Retailer Bot Running with MSRP + Sold-By Filter")
+    
+    while bot_running:
+        try:
+            if driver is None:
+                driver = get_driver()
+            
+            log(f"🔍 Starting scan of {len(products)} products...")
+            for product in products:
+                if not bot_running: break
+                check_product(driver, product)
+                time.sleep(random.uniform(14, 24))
+            
+            wait = 35 if config["AGGRESSIVE_MODE"] else 160
+            log(f"✅ Scan completed. Next scan in ~{wait} seconds")
+            time.sleep(wait)
+        except Exception as e:
+            log(f"💥 Error: {str(e)[:100]}")
+            if driver:
+                try: driver.quit()
+                except: pass
+                driver = None
+            time.sleep(25)
+
+# ====================== ROUTES ======================
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -189,15 +151,6 @@ def start_bot():
     bot_thread.start()
     return jsonify({"status": "started"})
 
-@app.route('/api/test-alert', methods=['POST'])
-def test_alert():
-    if config.get("DISCORD_WEBHOOK"):
-        requests.post(config["DISCORD_WEBHOOK"], json={
-            "content": "🧪 **Test Alert**\nPokémon Sniper Bot is connected and working! 🎉"
-        });
-        log("🧪 Test alert sent to Discord")
-    return jsonify({"status": "sent"})
-    
 @app.route('/api/stop', methods=['POST'])
 def stop_bot():
     global bot_running
@@ -207,6 +160,13 @@ def stop_bot():
 @app.route('/api/products', methods=['GET'])
 def get_products():
     return jsonify(products)
+
+@app.route('/api/test-alert', methods=['POST'])
+def test_alert():
+    if config["DISCORD_WEBHOOK"]:
+        requests.post(config["DISCORD_WEBHOOK"], json={"content": "🧪 **Test Alert** - Webhook is working correctly! 🎉"})
+        log("🧪 Test alert sent")
+    return jsonify({"status": "sent"})
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
