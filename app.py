@@ -14,14 +14,61 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 bot_running = False
 driver = None
-bot_thread = None
 
-# ================== CONFIG ==================
 config = {
-    "DISCORD_WEBHOOK": "",           # ← PUT YOUR REAL WEBHOOK HERE
+    "DISCORD_WEBHOOK": "",   # ← PUT YOUR REAL WEBHOOK HERE
     "ZIP_CODE": "32301",
     "USE_PROXY": True,
-    "PROXIES": [http://205.178.144.96:8447, http://37.59.112.197:443, http://205.178.144.167:8443]
+    "PROXIES": [
+        "http://185.219.159.38:443",
+        "http://190.113.112.147:4443",
+        "http://185.219.159.26:443",
+        "http://206.188.212.16:8443",
+        "http://37.59.112.197:443",
+        "http://185.219.159.36:443",
+        "http://47.243.181.85:41700",
+        "http://47.243.181.85:41400",
+        "http://47.243.181.85:41716",
+        "http://47.243.181.85:8081",
+        "http://47.243.181.85:41402",
+        "http://47.243.181.85:41396",
+        "http://47.243.181.85:42535",
+        "http://47.243.181.85:41798",
+        "http://47.243.181.85:42536",
+        "http://47.243.181.85:41698",
+        "http://47.243.181.85:55001",
+        "http://89.124.8.39:443",
+        "http://185.145.4.165:443",
+        "http://142.171.195.26:443",
+        "http://81.180.222.73:443",
+        "http://66.249.156.130:443",
+        "http://46.243.119.92:443",
+        "http://141.148.230.225:443",
+        "http://199.127.197.211:443",
+        "http://208.169.72.58:443",
+        "http://66.249.146.210:443",
+        "http://170.80.111.178:443",
+        "http://37.203.35.8:443",
+        "http://37.120.147.146:443",
+        "http://51.15.135.81:443",
+        "http://103.164.114.91:443",
+        "http://51.158.194.107:443",
+        "http://192.241.132.92:443",
+        "http://51.68.192.76:443",
+        "http://186.46.220.117:443",
+        "http://51.158.194.16:443",
+        "http://211.34.105.110:443",
+        "http://37.120.156.34:443",
+        "http://37.59.110.73:443",
+        "http://89.124.8.78:443",
+        "http://47.243.181.85:55017",
+        "http://101.255.106.178:443",
+        "http://213.163.97.16:443",
+        "http://89.124.8.84:443",
+        "http://47.243.181.85:41692",
+        "http://47.243.181.85:55002",
+        "http://47.243.181.85:41419"
+    ],
     "AGGRESSIVE_MODE": False
 }
 
@@ -57,14 +104,14 @@ def get_driver():
 
     driver = uc.Chrome(options=options, version_main=None)
     selenium_stealth.stealth(driver, languages=["en-US", "en"], vendor="Google Inc.", platform="Win32", fix_hairline=True)
-    log("✅ Driver started successfully")
+    log("✅ Driver started")
     return driver
 
 def check_product(driver, product):
     try:
         log(f"🔍 Checking {product['retailer']} → {product['name']}")
         driver.get(product["url"])
-        time.sleep(random.uniform(10, 16))
+        time.sleep(random.uniform(10, 18))
         
         text = driver.page_source.lower()
         if any(w in text for w in ["out of stock", "sold out", "unavailable", "busy right now", "notify me"]):
@@ -75,12 +122,12 @@ def check_product(driver, product):
                 requests.post(config["DISCORD_WEBHOOK"], json={"content": f"🚨 STOCK ALERT!\n{product['name']} at {product['retailer']}\n{product['url']}"})
         return True
     except:
-        log(f"❌ Connection error")
+        log(f"❌ Connection error on {product['name']}")
         return False
 
 def bot_loop():
     global driver
-    log("🚀 Smart Multi-Retailer Bot Started")
+    log("🚀 Smart Multi-Retailer Bot Running")
     
     while bot_running:
         try:
@@ -88,23 +135,22 @@ def bot_loop():
                 driver = get_driver()
             
             log(f"🔍 Starting scan of {len(products)} products...")
-            for product in products:
+            for p in products:
                 if not bot_running: break
-                check_product(driver, product)
+                check_product(driver, p)
                 time.sleep(random.uniform(15, 25))
             
             wait = 35 if config["AGGRESSIVE_MODE"] else 180
             log(f"✅ Scan completed. Next scan in ~{wait} seconds")
             time.sleep(wait)
         except Exception as e:
-            log(f"💥 Error: {str(e)[:100]} - Restarting browser")
+            log(f"💥 Error: {str(e)[:100]}")
             if driver:
                 try: driver.quit()
                 except: pass
                 driver = None
             time.sleep(25)
 
-# ====================== ROUTES ======================
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -112,8 +158,7 @@ def index():
 @app.route('/api/start', methods=['POST'])
 def start_bot():
     global bot_running, bot_thread
-    if bot_running:
-        return jsonify({"status": "already running"})
+    if bot_running: return jsonify({"status": "already running"})
     bot_running = True
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
