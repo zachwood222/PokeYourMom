@@ -133,37 +133,37 @@ def check_product(driver, product):
         time.sleep(random.uniform(9, 16))
         
         page_text = driver.page_source.lower()
-        price_text = driver.page_source
-
-        # Out of stock check
-        if any(word in page_text for word in ["out of stock", "sold out", "unavailable", "notify me when available", "get notified"]):
+        
+        # Strong out-of-stock signals
+        out_of_stock_phrases = ["out of stock", "sold out", "unavailable", "notify me when available", "get notified", "temporarily out of stock", "currently unavailable"]
+        if any(phrase in page_text for phrase in out_of_stock_phrases):
             log(f"❌ Out of stock - {product['name']}")
             return False
 
-        # Look for "Sold by Walmart" / "Sold by Target" / "Sold by Best Buy"
-        sold_by = ""
-        if "sold by walmart" in page_text or "walmart.com" in price_text:
-            sold_by = "Walmart"
-        elif "sold by target" in page_text or "target.com" in price_text:
-            sold_by = "Target"
-        elif "sold by best buy" in page_text or "bestbuy.com" in price_text:
-            sold_by = "Best Buy"
-
-        if sold_by == "":
-            log(f"❌ Third-party seller only - skipping {product['name']}")
+        # Find all Add to Cart buttons
+        add_buttons = driver.find_elements(By.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add to cart')]")
+        
+        if not add_buttons:
+            log(f"❌ No Add to Cart button visible")
             return False
 
-        # Price check near MSRP
-        msrp = product.get("msrp", 55)
-        if any(str(p) in price_text for p in range(msrp - MSRP_TOLERANCE, msrp + MSRP_TOLERANCE + 1)):
-            log(f"✅ REAL STOCK at MSRP → {product['name']} ({sold_by})")
+        real_stock = False
+        for btn in add_buttons:
+            # Check if button is enabled and clickable
+            is_disabled = btn.get_attribute("disabled") or "disabled" in btn.get_attribute("class") or btn.get_attribute("aria-disabled") == "true"
+            if not is_disabled and btn.is_displayed() and btn.is_enabled():
+                real_stock = True
+                break
+
+        if real_stock:
+            log(f"✅ REAL STOCK DETECTED → {product['name']}")
             if config["DISCORD_WEBHOOK"]:
                 requests.post(config["DISCORD_WEBHOOK"], json={
-                    "content": f"🚨 **MSRP STOCK ALERT!**\n{product['name']} at {product['retailer']}\n{product['url']}"
+                    "content": f"🚨 **REAL MSRP STOCK ALERT!**\n{product['name']} at {product['retailer']}\n{product['url']}"
                 })
             return True
         else:
-            log(f"❌ Price too high or unclear - {product['name']}")
+            log(f"❌ Add to Cart is grayed out / disabled - Phantom stock")
             return False
 
     except Exception as e:
