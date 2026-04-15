@@ -16,7 +16,7 @@ bot_running = False
 driver = None
 
 config = {
-    "DISCORD_WEBHOOK": "",   # ← PUT YOUR REAL WEBHOOK HERE
+    "DISCORD_WEBHOOK": "https://discord.com/api/webhooks/1494042625966084146/-3RBLTxpjG-1bTqLvnetQ1ns_5Trz3FBxEj0cbXgjj--lmZjG6O5XsWZcYvDJh2EKti_",   # ← PUT YOUR REAL WEBHOOK HERE
     "ZIP_CODE": "32301",
     "USE_PROXY": True,
     "PROXIES": [
@@ -78,6 +78,15 @@ products = [
     {"retailer": "Target", "name": "Surging Sparks ETB", "url": "https://www.target.com/p/pokemon-trading-card-game-scarlet-38-violet-surging-sparks-elite-trainer-box/-/A-91619922"},
     {"retailer": "Walmart", "name": "Prismatic Evolutions ETB", "url": "https://www.walmart.com/ip/Pokemon-Scarlet-and-Violet-8-5-Prismatic-Evolutions-Elite-Trainer-Box/13816151308"},
     {"retailer": "Best Buy", "name": "Prismatic Evolutions ETB", "url": "https://www.bestbuy.com/site/pokemon-trading-card-game-scarlet-violet-prismatic-evolutions-elite-trainer-box/6578901.p"},
+    {"retailer": "Best Buy", "name": "Painter", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-first-partner-illustration-collection-series-2/JJG2TL3VR2"},
+    {"retailer": "Best Buy", "name": "Chaos Rising Booster", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-chaos-rising-booster-bundle/JJG2TL34H9"},
+    {"retailer": "Best Buy", "name": "Chaos Rising ETB", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-chaos-rising-elite-trainer-box/JJG2TL34RT"},
+    {"retailer": "Best Buy", "name": "Heroes Booster", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-ascended-heroes-booster-bundle/JJG2TL3JP8"},
+    {"retailer": "Best Buy", "name": "Heroes EX Box", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-ascended-heroes-ex-box-styles-may-vary/JJG2TL3JLK"},
+    {"retailer": "Best Buy", "name": "Mega Zyfarde EX Box", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-zygarde-ex-premium-collection/JJG2TL3ZLV"},
+    {"retailer": "Best Buy", "name": "Chaos Rising 3pk Booster", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-chaos-rising-3pk-booster/JJG2TL34H3"},
+    {"retailer": "Best Buy", "name": "Chaos Rising 36pk Booster", "url": "https://www.bestbuy.com/product/pokemon-trading-card-game-mega-evolution-chaos-rising-booster-box-36-packs/JJG2TL34TS"},
+    
 ]
 
 def log(message):
