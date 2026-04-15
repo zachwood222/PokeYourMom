@@ -33,7 +33,7 @@ config = {
 
 # Full Product List with MSRP
 products = [
-    {"retailer": "Target", "name": "TEST", "url": "https://www.target.com/p/sungboon-editor-deep-collagen-viral-glass-skin-korean-skincare-power-boosting-facial-mask-for-firming-and-restoration/-/A-93200681#lnk=sametab", "msrp": 55},
+    {"retailer": "Target", "name": "TEST", "url": "https://www.target.com/p/world-rug-gallery-indoor-outdoor-high-low-textured-area-rug-floral-gray-ivory-easy-clean-patio-rug/-/A-1009629434?preselect=1009629476#lnk=sametab", "msrp": 55},
     {"retailer": "Target", "name": "TEST", "url": "https://www.target.com/p/sungboon-editor-deep-collagen-viral-glass-skin-korean-skincare-power-boosting-facial-mask-for-firming-and-restoration/-/A-93200681#lnk=sametab", "msrp": 5},
     {"retailer": "Target", "name": "Plush", "url": "https://www.target.com/p/pokemon-charmander-sleeping-kids-39-plush-buddy/-/A-79833009", "msrp": 20},
     {"retailer": "Target", "name": "Prismatic Evolutions ETB", "url": "https://www.target.com/p/2024-pok-scarlet-violet-s8-5-elite-trainer-box/-/A-93954435", "msrp": 55},
