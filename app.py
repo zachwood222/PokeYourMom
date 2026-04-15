@@ -132,71 +132,49 @@ def check_product(driver, product):
     try:
         log(f"🔍 Checking {product['retailer']} → {product['name']}")
         driver.get(product["url"])
-        time.sleep(random.uniform(9, 16))
-        
+        time.sleep(random.uniform(8, 14))   # Give page time to load
+
+        # Scroll down to make sure buttons load
+        driver.execute_script("window.scrollBy(0, 800);")
+        time.sleep(2)
+
         page_text = driver.page_source.lower()
-        
-        # Strong out-of-stock signals
-        out_of_stock_phrases = ["out of stock", "sold out", "unavailable", "notify me when available", "get notified", "temporarily out of stock", "currently unavailable"]
-        if any(phrase in page_text for phrase in out_of_stock_phrases):
+
+        # Quick out-of-stock check
+        if any(word in page_text for word in ["out of stock", "sold out", "unavailable", "notify me when available", "get notified"]):
             log(f"❌ Out of stock - {product['name']}")
             return False
 
-        # Find all Add to Cart buttons
-        add_buttons = driver.find_elements(By.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add to cart')]")
-        
-        if not add_buttons:
-            log(f"❌ No Add to Cart button visible")
-            return False
+        # === MULTIPLE WAYS TO FIND "ADD TO CART" BUTTON ===
+        selectors = [
+            "//button[@data-test='add-to-cart']",                                      # Target official
+            "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add to cart')]", 
+            "//button[contains(@aria-label, 'add to cart')]",
+            "//button[contains(@class, 'add-to-cart')]",
+            "//button[contains(text(), 'Add') and contains(text(), 'Cart')]"
+        ]
 
-        real_stock = False
-        for btn in add_buttons:
-            # Check if button is enabled and clickable
-            is_disabled = btn.get_attribute("disabled") or "disabled" in btn.get_attribute("class") or btn.get_attribute("aria-disabled") == "true"
-            if not is_disabled and btn.is_displayed() and btn.is_enabled():
-                real_stock = True
-                break
+        for sel in selectors:
+            try:
+                btn = WebDriverWait(driver, 8).until(
+                    EC.element_to_be_clickable((By.XPATH, sel))
+                )
+                if btn.is_displayed() and btn.is_enabled():
+                    log(f"✅ REAL STOCK DETECTED → {product['name']}")
+                    if config["DISCORD_WEBHOOK"]:
+                        requests.post(config["DISCORD_WEBHOOK"], json={
+                            "content": f"🚨 **REAL STOCK ALERT!**\n{product['name']} at {product['retailer']}\n{product['url']}"
+                        })
+                    return True
+            except:
+                continue
 
-        if real_stock:
-            log(f"✅ REAL STOCK DETECTED → {product['name']}")
-            if config["DISCORD_WEBHOOK"]:
-                requests.post(config["DISCORD_WEBHOOK"], json={
-                    "content": f"🚨 **REAL MSRP STOCK ALERT!**\n{product['name']} at {product['retailer']}\n{product['url']}"
-                })
-            return True
-        else:
-            log(f"❌ Add to Cart is grayed out / disabled - Phantom stock")
-            return False
+        log(f"❌ No active Add to Cart button found (grayed out or missing)")
+        return False
 
     except Exception as e:
         log(f"❌ Connection error on {product['name']}")
         return False
-
-def bot_loop():
-    global driver
-    log("🚀 Smart Multi-Retailer Bot Running - Improved Stock Detection")
-    
-    while bot_running:
-        try:
-            if driver is None:
-                driver = get_driver()
-            
-            log(f"🔍 Starting scan of {len(products)} products...")
-            for product in products:
-                if not bot_running: break
-                check_product(driver, product)
-                time.sleep(random.uniform(15, 25))
-            
-            wait = 35 if config["AGGRESSIVE_MODE"] else 180
-            log(f"✅ Scan completed. Next scan in ~{wait} seconds")
-            time.sleep(wait)
-        except Exception as e:
-            log(f"💥 Error: {str(e)[:100]} - Restarting browser")
-            if driver:
-                try: driver.quit()
-                except: pass
-                driver = None
-            time.sleep(25)
 
 @app.route('/')
 def index():
