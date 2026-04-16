@@ -113,12 +113,24 @@ def send_discord_alert(content):
 
 def get_driver():
     options = uc.ChromeOptions()
+    options.page_load_strategy = "eager"
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-ipc-flooding-protection")
     options.add_argument("--window-size=1920,1080")
+    options.add_experimental_option(
+        "prefs",
+        {
+            "profile.managed_default_content_settings.images": 2,
+        },
+    )
 
     if config["USE_PROXY"] and config["PROXIES"]:
         proxy = random.choice(config["PROXIES"])
@@ -211,7 +223,7 @@ def is_msrp_or_below(found_price, msrp):
 
 
 def should_reset_driver(exc):
-    if isinstance(exc, (TimeoutException, WebDriverException)):
+    if isinstance(exc, WebDriverException):
         return True
 
     msg = str(exc).lower()
@@ -234,7 +246,12 @@ def check_product(driver_obj, product):
                 f"🔎 [{product['retailer']}] Checking {product['name']} "
                 f"(attempt {attempt}/{retries + 1})"
             )
-            driver_obj.get(product["url"])
+            try:
+                driver_obj.get(product["url"])
+            except TimeoutException:
+                # Continue with partially loaded DOM instead of hard-failing every timeout.
+                log("⏳ Page load timeout reached, proceeding with current DOM snapshot")
+                driver_obj.execute_script("window.stop();")
             time.sleep(random.uniform(4, 8))
 
             page_text = driver_obj.page_source
