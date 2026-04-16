@@ -4,6 +4,7 @@ import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
 import selenium_stealth
 import time
 import random
@@ -209,7 +210,22 @@ def is_msrp_or_below(found_price, msrp):
     return found_price <= (msrp + 1.00)
 
 
+def should_reset_driver(exc):
+    if isinstance(exc, (TimeoutException, WebDriverException)):
+        return True
+
+    msg = str(exc).lower()
+    reset_signals = [
+        "timed out receiving message from renderer",
+        "session deleted because of page crash",
+        "invalid session id",
+        "disconnected",
+    ]
+    return any(signal in msg for signal in reset_signals)
+
+
 def check_product(driver_obj, product):
+    global driver
     retries = config["MAX_RETRIES_PER_PRODUCT"]
 
     for attempt in range(1, retries + 2):
@@ -252,6 +268,15 @@ def check_product(driver_obj, product):
         except Exception as e:
             status["last_error"] = str(e)
             log(f"⚠️ Error checking {product['name']}: {e}")
+
+            if should_reset_driver(e):
+                log("♻️ Resetting browser driver after Selenium/browser error")
+                dispose_driver()
+                ensure_driver()
+                driver_obj = driver
+
+            if attempt <= retries:
+                log(f"🔁 Retrying {product['name']} ({attempt}/{retries + 1} attempts used)")
             time.sleep(random.uniform(1.5, 3.5))
 
     return False
