@@ -189,6 +189,17 @@ def get_workspace(workspace_id: int = 1) -> sqlite3.Row:
     return row
 
 
+def get_workspace_from_auth() -> sqlite3.Row:
+    workspace_header = request.headers.get("X-Workspace-Id", "1").strip()
+    try:
+        workspace_id = int(workspace_header)
+        if workspace_id < 1:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("Invalid workspace context") from exc
+    return get_workspace(workspace_id)
+
+
 def enforce_plan_limits(workspace_id: int, poll_interval_seconds: int) -> None:
     workspace = get_workspace(workspace_id)
     limits = PLAN_LIMITS[workspace["plan"]]
@@ -399,6 +410,63 @@ def cents_to_dollars(cents: int | None) -> str:
     return f"${cents / 100:.2f}"
 
 
+def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return dict(row)
+
+
+def should_send_to_webhook(monitor: sqlite3.Row, hook: sqlite3.Row, eligible: bool) -> bool:
+    if not hook["enabled"]:
+        return False
+    if eligible and not hook["notify_success"]:
+        return False
+    if not eligible and not hook["notify_failures"]:
+        return False
+    if hook["notify_restock_only"] and monitor["last_in_stock"]:
+        return False
+    return True
+
+
+def update_webhook_health(
+    conn: sqlite3.Connection,
+    webhook_id: int,
+    status: str,
+    status_code: int | None = None,
+    error_text: str | None = None,
+    tested: bool = False,
+) -> None:
+    now_iso = utc_now()
+    tested_at = now_iso if tested else None
+    conn.execute(
+        """
+        update webhooks
+        set last_tested_at = coalesce(?, last_tested_at),
+            last_test_status = coalesce(?, last_test_status),
+            last_delivery_status = ?,
+            last_delivery_at = ?,
+            fail_streak = case when ? = 'failed' then fail_streak + 1 else 0 end,
+            last_error = ?,
+            last_status_code = ?
+        where id = ?
+        """,
+        (
+            tested_at,
+            status if tested else None,
+            status,
+            now_iso,
+            status,
+            (error_text or "")[:500] if error_text else None,
+            status_code,
+            webhook_id,
+        ),
+    )
+
+
+def create_monitor_error_events(monitor: sqlite3.Row, error_text: str) -> None:
+    log(f"⚠️ Monitor {monitor['id']} error event: {error_text[:200]}")
+
+
 def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
     try:
         result = fetch_monitor(monitor)
@@ -530,7 +598,10 @@ def api_meta_check_update():
 
 @app.get("/api/workspace")
 def api_workspace():
-    row = get_workspace(1)
+    try:
+        row = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     return jsonify(dict(row))
 
 
@@ -539,8 +610,12 @@ def api_update_plan():
     plan = (request.json or {}).get("plan", "basic")
     if plan not in PLAN_LIMITS:
         return jsonify({"error": "Invalid plan"}), 400
+    try:
+        workspace = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     conn = db()
-    conn.execute("update workspaces set plan = ? where id = 1", (plan,))
+    conn.execute("update workspaces set plan = ? where id = ?", (plan, workspace["id"]))
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "plan": plan})
@@ -548,8 +623,14 @@ def api_update_plan():
 
 @app.get("/api/monitors")
 def api_list_monitors():
+    try:
+        workspace = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     conn = db()
-    rows = conn.execute("select * from monitors order by id desc").fetchall()
+    rows = conn.execute(
+        "select * from monitors where workspace_id = ? order by id desc", (workspace["id"],)
+    ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
@@ -602,6 +683,7 @@ def api_dashboard_summary():
 def api_create_monitor():
     body = request.json or {}
     try:
+        workspace = get_workspace_from_auth()
         retailer = body["retailer"].strip().lower()
         url = body["product_url"].strip()
         poll_interval = int(body.get("poll_interval_seconds", 20))
@@ -622,7 +704,7 @@ def api_create_monitor():
         if not (url.startswith("http://") or url.startswith("https://")):
             raise ValueError("product_url must start with http:// or https://")
 
-        enforce_plan_limits(1, poll_interval)
+        enforce_plan_limits(workspace["id"], poll_interval)
     except (KeyError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -630,9 +712,9 @@ def api_create_monitor():
     cur = conn.execute(
         """
         insert into monitors(workspace_id, retailer, product_url, keyword, max_price_cents, msrp_cents, poll_interval_seconds, created_at)
-        values (1, ?, ?, ?, ?, ?, ?, ?)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (retailer, url, keyword, max_price_cents, msrp_cents, poll_interval, utc_now()),
+        (workspace["id"], retailer, url, keyword, max_price_cents, msrp_cents, poll_interval, utc_now()),
     )
     conn.commit()
     monitor_id = cur.lastrowid
@@ -647,10 +729,19 @@ def api_update_monitor(monitor_id: int):
     enabled = body.get("enabled")
     if enabled is None:
         return jsonify({"error": "enabled is required"}), 400
+    try:
+        workspace = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     conn = db()
-    conn.execute("update monitors set enabled = ? where id = ?", (int(bool(enabled)), monitor_id))
+    conn.execute(
+        "update monitors set enabled = ? where id = ? and workspace_id = ?",
+        (int(bool(enabled)), monitor_id, workspace["id"]),
+    )
     conn.commit()
-    row = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
+    row = conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?", (monitor_id, workspace["id"])
+    ).fetchone()
     conn.close()
     if not row:
         return jsonify({"error": "Monitor not found"}), 404
@@ -659,8 +750,12 @@ def api_update_monitor(monitor_id: int):
 
 @app.delete("/api/monitors/<int:monitor_id>")
 def api_delete_monitor(monitor_id: int):
+    try:
+        workspace = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     conn = db()
-    conn.execute("delete from monitors where id = ?", (monitor_id,))
+    conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace["id"]))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -668,8 +763,14 @@ def api_delete_monitor(monitor_id: int):
 
 @app.post("/api/monitors/<int:monitor_id>/check")
 def api_check_monitor(monitor_id: int):
+    try:
+        workspace = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     conn = db()
-    row = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
+    row = conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?", (monitor_id, workspace["id"])
+    ).fetchone()
     conn.close()
     if not row:
         return jsonify({"error": "Monitor not found"}), 404
@@ -678,14 +779,19 @@ def api_check_monitor(monitor_id: int):
 
 @app.get("/api/events")
 def api_events():
+    try:
+        workspace = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     conn = db()
     rows = conn.execute(
         """
         select e.*, m.retailer as monitor_retailer from events e
         join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ?
         order by e.id desc limit 100
         """
-    ).fetchall()
+    , (workspace["id"],)).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
@@ -701,13 +807,17 @@ def api_add_webhook():
     if not url.startswith("https://discord.com/api/webhooks/"):
         return jsonify({"error": "Invalid Discord webhook URL"}), 400
 
+    try:
+        workspace = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     conn = db()
     cur = conn.execute(
         """
         insert into webhooks(workspace_id, name, webhook_url, notify_success, notify_failures, notify_restock_only, created_at)
-        values (1, ?, ?, ?, ?, ?, ?)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (name, url, notify_success, notify_failures, notify_restock_only, utc_now()),
+        (workspace["id"], name, url, notify_success, notify_failures, notify_restock_only, utc_now()),
     )
     conn.commit()
     row = conn.execute("select * from webhooks where id = ?", (cur.lastrowid,)).fetchone()
@@ -717,16 +827,28 @@ def api_add_webhook():
 
 @app.get("/api/webhooks")
 def api_list_webhooks():
+    try:
+        workspace = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     conn = db()
-    rows = conn.execute("select * from webhooks order by id desc").fetchall()
+    rows = conn.execute(
+        "select * from webhooks where workspace_id = ? order by id desc", (workspace["id"],)
+    ).fetchall()
     conn.close()
     return jsonify([serialize_webhook(r) for r in rows])
 
 
 @app.post("/api/webhooks/<int:webhook_id>/test")
 def api_test_webhook(webhook_id: int):
+    try:
+        workspace = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     conn = db()
-    hook = conn.execute("select * from webhooks where id = ?", (webhook_id,)).fetchone()
+    hook = conn.execute(
+        "select * from webhooks where id = ? and workspace_id = ?", (webhook_id, workspace["id"])
+    ).fetchone()
     conn.close()
     if not hook:
         return jsonify({"error": "Webhook not found"}), 404
@@ -774,11 +896,20 @@ def api_update_webhook(webhook_id: int):
         fields.append(("notify_restock_only", int(bool(body["notify_restock_only"]))))
     if not fields:
         return jsonify({"error": "No mutable fields provided"}), 400
+    try:
+        workspace = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     conn = db()
     for key, value in fields:
-        conn.execute(f"update webhooks set {key} = ? where id = ?", (value, webhook_id))
+        conn.execute(
+            f"update webhooks set {key} = ? where id = ? and workspace_id = ?",
+            (value, webhook_id, workspace["id"]),
+        )
     conn.commit()
-    row = conn.execute("select * from webhooks where id = ?", (webhook_id,)).fetchone()
+    row = conn.execute(
+        "select * from webhooks where id = ? and workspace_id = ?", (webhook_id, workspace["id"])
+    ).fetchone()
     conn.close()
     if not row:
         return jsonify({"error": "Webhook not found"}), 404
@@ -787,8 +918,12 @@ def api_update_webhook(webhook_id: int):
 
 @app.delete("/api/webhooks/<int:webhook_id>")
 def api_delete_webhook(webhook_id: int):
+    try:
+        workspace = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     conn = db()
-    conn.execute("delete from webhooks where id = ?", (webhook_id,))
+    conn.execute("delete from webhooks where id = ? and workspace_id = ?", (webhook_id, workspace["id"]))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
