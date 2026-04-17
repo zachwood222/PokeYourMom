@@ -917,7 +917,15 @@ def api_update_monitor(monitor_id: int):
     ).fetchone()
     conn.close()
     if not row:
+        conn.close()
         return jsonify({"error": "Monitor not found"}), 404
+    conn.execute(
+        "update monitors set enabled = ? where id = ? and workspace_id = ?",
+        (int(bool(enabled)), monitor_id, workspace_id),
+    )
+    conn.commit()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    conn.close()
     return jsonify(dict(row))
 
 
