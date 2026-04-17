@@ -21,6 +21,8 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 POLL_LOOP_SECONDS = int(os.getenv("POLL_LOOP_SECONDS", "15"))
 DEFAULT_PLAN = os.getenv("DEFAULT_PLAN", "basic")
 POKEMON_MSRP_BUFFER_CENTS = int(os.getenv("POKEMON_MSRP_BUFFER_CENTS", "1000"))
+APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
+RELEASE_CHANNEL = os.getenv("RELEASE_CHANNEL", "stable")
 
 PLAN_LIMITS = {
     "basic": {"max_monitors": 20, "min_poll_seconds": 20},
@@ -64,6 +66,12 @@ def db() -> sqlite3.Connection:
     return conn
 
 
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    columns = {r["name"] for r in conn.execute(f"pragma table_info({table})").fetchall()}
+    if column not in columns:
+        conn.execute(f"alter table {table} add column {column} {ddl}")
+
+
 def init_db() -> None:
     conn = db()
     conn.executescript(
@@ -97,6 +105,16 @@ def init_db() -> None:
             name text not null,
             webhook_url text not null,
             enabled integer not null default 1,
+            notify_success integer not null default 1,
+            notify_failures integer not null default 0,
+            notify_restock_only integer not null default 1,
+            last_tested_at text,
+            last_test_status text,
+            last_delivery_status text,
+            last_delivery_at text,
+            fail_streak integer not null default 0,
+            last_error text,
+            last_status_code integer,
             created_at text not null,
             foreign key(workspace_id) references workspaces(id)
         );
@@ -125,6 +143,16 @@ def init_db() -> None:
             foreign key(event_id) references events(id),
             foreign key(webhook_id) references webhooks(id)
         );
+
+        create table if not exists monitor_schedules (
+            id integer primary key autoincrement,
+            monitor_id integer not null,
+            new_poll_interval_seconds integer not null,
+            run_at text not null,
+            applied_at text,
+            created_at text not null,
+            foreign key(monitor_id) references monitors(id)
+        );
         """
     )
     existing = conn.execute("select id from workspaces limit 1").fetchone()
@@ -135,9 +163,19 @@ def init_db() -> None:
         )
         log("✅ Initialized default workspace")
     conn.commit()
-    monitor_columns = {r["name"] for r in conn.execute("pragma table_info(monitors)").fetchall()}
-    if "msrp_cents" not in monitor_columns:
-        conn.execute("alter table monitors add column msrp_cents integer")
+    ensure_column(conn, "monitors", "msrp_cents", "integer")
+    ensure_column(conn, "monitors", "failure_streak", "integer not null default 0")
+    ensure_column(conn, "monitors", "last_error", "text")
+    ensure_column(conn, "webhooks", "notify_success", "integer not null default 1")
+    ensure_column(conn, "webhooks", "notify_failures", "integer not null default 0")
+    ensure_column(conn, "webhooks", "notify_restock_only", "integer not null default 1")
+    ensure_column(conn, "webhooks", "last_tested_at", "text")
+    ensure_column(conn, "webhooks", "last_test_status", "text")
+    ensure_column(conn, "webhooks", "last_delivery_status", "text")
+    ensure_column(conn, "webhooks", "last_delivery_at", "text")
+    ensure_column(conn, "webhooks", "fail_streak", "integer not null default 0")
+    ensure_column(conn, "webhooks", "last_error", "text")
+    ensure_column(conn, "webhooks", "last_status_code", "integer")
     conn.commit()
     conn.close()
 
@@ -329,6 +367,8 @@ def create_event_and_deliver(
     }
 
     for hook in webhooks:
+        if not should_send_to_webhook(monitor, hook, eligible):
+            continue
         status, code, body = "queued", None, ""
         try:
             resp = requests.post(hook["webhook_url"], json=payload, timeout=8)
@@ -346,6 +386,7 @@ def create_event_and_deliver(
             """,
             (event_id, hook["id"], status, code, body, utc_now()),
         )
+        update_webhook_health(conn, hook["id"], status=status, status_code=code, error_text=body)
 
     conn.commit()
     conn.close()
@@ -362,6 +403,18 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
     try:
         result = fetch_monitor(monitor)
     except Exception as exc:  # noqa: BLE001
+        conn = db()
+        conn.execute(
+            """
+            update monitors
+            set last_checked_at = ?, failure_streak = failure_streak + 1, last_error = ?
+            where id = ?
+            """,
+            (utc_now(), str(exc)[:500], monitor["id"]),
+        )
+        conn.commit()
+        conn.close()
+        create_monitor_error_events(monitor, str(exc))
         log(f"⚠️ Monitor {monitor['id']} fetch failed: {exc}")
         return {"ok": False, "error": str(exc)}
 
@@ -371,7 +424,7 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
     conn.execute(
         """
         update monitors
-        set last_checked_at = ?, last_in_stock = ?, last_price_cents = ?
+        set last_checked_at = ?, last_in_stock = ?, last_price_cents = ?, failure_streak = 0, last_error = NULL
         where id = ?
         """,
         (utc_now(), int(eligible), result.price_cents, monitor["id"]),
@@ -396,11 +449,33 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def apply_due_schedules(conn: sqlite3.Connection) -> None:
+    now_iso = utc_now()
+    rows = conn.execute(
+        """
+        select * from monitor_schedules
+        where applied_at is null and run_at <= ?
+        order by id asc
+        """,
+        (now_iso,),
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "update monitors set poll_interval_seconds = ? where id = ?",
+            (row["new_poll_interval_seconds"], row["monitor_id"]),
+        )
+        conn.execute("update monitor_schedules set applied_at = ? where id = ?", (now_iso, row["id"]))
+        log(
+            f"🗓️ Applied schedule {row['id']} for monitor {row['monitor_id']} (poll={row['new_poll_interval_seconds']}s)"
+        )
+
+
 def monitor_loop() -> None:
     log("▶️ Monitor loop started")
     while running:
         with lock:
             conn = db()
+            apply_due_schedules(conn)
             monitors = conn.execute("select * from monitors where enabled = 1").fetchall()
             conn.close()
 
@@ -426,6 +501,31 @@ def index():
 @app.get("/healthz")
 def healthz():
     return jsonify({"ok": True, "running": running})
+
+
+@app.get("/api/meta")
+def api_meta():
+    return jsonify(
+        {
+            "app_version": APP_VERSION,
+            "release_channel": RELEASE_CHANNEL,
+            "python_version": os.sys.version.split()[0],
+        }
+    )
+
+
+@app.get("/api/meta/check-update")
+def api_meta_check_update():
+    latest = APP_VERSION
+    return jsonify(
+        {
+            "ok": True,
+            "current_version": APP_VERSION,
+            "latest_version": latest,
+            "update_available": latest != APP_VERSION,
+            "release_channel": RELEASE_CHANNEL,
+        }
+    )
 
 
 @app.get("/api/workspace")
@@ -595,13 +695,19 @@ def api_add_webhook():
     body = request.json or {}
     name = (body.get("name") or "Discord").strip()
     url = (body.get("webhook_url") or "").strip()
+    notify_success = int(bool(body.get("notify_success", True)))
+    notify_failures = int(bool(body.get("notify_failures", False)))
+    notify_restock_only = int(bool(body.get("notify_restock_only", True)))
     if not url.startswith("https://discord.com/api/webhooks/"):
         return jsonify({"error": "Invalid Discord webhook URL"}), 400
 
     conn = db()
     cur = conn.execute(
-        "insert into webhooks(workspace_id, name, webhook_url, created_at) values (1, ?, ?, ?)",
-        (name, url, utc_now()),
+        """
+        insert into webhooks(workspace_id, name, webhook_url, notify_success, notify_failures, notify_restock_only, created_at)
+        values (1, ?, ?, ?, ?, ?, ?)
+        """,
+        (name, url, notify_success, notify_failures, notify_restock_only, utc_now()),
     )
     conn.commit()
     row = conn.execute("select * from webhooks where id = ?", (cur.lastrowid,)).fetchone()
@@ -612,7 +718,7 @@ def api_add_webhook():
 @app.get("/api/webhooks")
 def api_list_webhooks():
     conn = db()
-    rows = conn.execute("select id, workspace_id, name, enabled, created_at from webhooks order by id desc").fetchall()
+    rows = conn.execute("select * from webhooks order by id desc").fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
@@ -629,11 +735,125 @@ def api_test_webhook(webhook_id: int):
         "username": "Stock Sentinel",
         "content": "🧪 Test alert from Stock Sentinel",
     }
+    started = time.perf_counter()
+    conn = db()
     try:
         resp = requests.post(hook["webhook_url"], json=payload, timeout=8)
-        return jsonify({"ok": 200 <= resp.status_code < 300, "status_code": resp.status_code})
+        ok = 200 <= resp.status_code < 300
+        status = "sent" if ok else "failed"
+        body = (resp.text or "")[:500]
+        update_webhook_health(conn, webhook_id, status=status, status_code=resp.status_code, error_text=body, tested=True)
+        conn.commit()
+        conn.close()
+        return jsonify(
+            {
+                "ok": ok,
+                "status_code": resp.status_code,
+                "response_body": body,
+                "latency_ms": int((time.perf_counter() - started) * 1000),
+            }
+        )
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        update_webhook_health(conn, webhook_id, status="failed", error_text=str(exc), tested=True)
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": False, "error": str(exc), "latency_ms": int((time.perf_counter() - started) * 1000)}), 500
+
+
+@app.patch("/api/webhooks/<int:webhook_id>")
+def api_update_webhook(webhook_id: int):
+    body = request.json or {}
+    fields: list[tuple[str, Any]] = []
+    if "enabled" in body:
+        fields.append(("enabled", int(bool(body["enabled"]))))
+    if "notify_success" in body:
+        fields.append(("notify_success", int(bool(body["notify_success"]))))
+    if "notify_failures" in body:
+        fields.append(("notify_failures", int(bool(body["notify_failures"]))))
+    if "notify_restock_only" in body:
+        fields.append(("notify_restock_only", int(bool(body["notify_restock_only"]))))
+    if not fields:
+        return jsonify({"error": "No mutable fields provided"}), 400
+    conn = db()
+    for key, value in fields:
+        conn.execute(f"update webhooks set {key} = ? where id = ?", (value, webhook_id))
+    conn.commit()
+    row = conn.execute("select * from webhooks where id = ?", (webhook_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Webhook not found"}), 404
+    return jsonify(dict(row))
+
+
+@app.delete("/api/webhooks/<int:webhook_id>")
+def api_delete_webhook(webhook_id: int):
+    conn = db()
+    conn.execute("delete from webhooks where id = ?", (webhook_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/schedules")
+def api_list_schedules():
+    conn = db()
+    rows = conn.execute(
+        """
+        select s.*, m.retailer, m.product_url
+        from monitor_schedules s
+        join monitors m on m.id = s.monitor_id
+        order by s.id desc
+        """
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/schedules")
+def api_create_schedule():
+    body = request.json or {}
+    monitor_ids = body.get("monitor_ids") or []
+    run_at = (body.get("run_at") or "").strip()
+    new_poll = body.get("new_poll_interval_seconds")
+    if not monitor_ids or not isinstance(monitor_ids, list):
+        return jsonify({"error": "monitor_ids array is required"}), 400
+    if not run_at:
+        return jsonify({"error": "run_at is required"}), 400
+    try:
+        datetime.fromisoformat(run_at.replace("Z", "+00:00"))
+        new_poll_int = int(new_poll)
+        if new_poll_int < 1:
+            raise ValueError
+    except ValueError:
+        return jsonify({"error": "Invalid schedule payload"}), 400
+
+    conn = db()
+    created = []
+    for monitor_id in monitor_ids:
+        row = conn.execute("select * from monitors where id = ?", (int(monitor_id),)).fetchone()
+        if not row:
+            continue
+        cur = conn.execute(
+            """
+            insert into monitor_schedules(monitor_id, new_poll_interval_seconds, run_at, created_at)
+            values (?, ?, ?, ?)
+            """,
+            (int(monitor_id), new_poll_int, run_at, utc_now()),
+        )
+        created.append(cur.lastrowid)
+    conn.commit()
+    rows = conn.execute("select * from monitor_schedules where id in ({})".format(",".join("?" * len(created))), created).fetchall() if created else []
+    conn.close()
+    return jsonify({"ok": True, "created": [dict(r) for r in rows]})
+
+
+@app.delete("/api/schedules/<int:schedule_id>")
+def api_delete_schedule(schedule_id: int):
+    conn = db()
+    conn.execute("delete from monitor_schedules where id = ? and applied_at is null", (schedule_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
 
 
 @app.post("/api/start")
