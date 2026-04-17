@@ -38,3 +38,9 @@ This project is a scaffold for a subscription monitoring SaaS and should be expa
 - Stripe billing webhooks,
 - stronger HTML parsing adapters per retailer,
 - observability and error dashboards.
+
+## Phase 2 baseline shipped
+
+- Keyword filters are now evaluated during page checks and can suppress alerts when no match is found.
+- Max price filters are now enforced before creating in-stock events and sending Discord webhooks.
+- `last_in_stock` now reflects "eligible for alert" state (in stock + filters pass), not raw page stock marker detection.

@@ -43,6 +43,8 @@ class MonitorResult:
     price_cents: int | None
     title: str
     status_text: str
+    keyword_matched: bool | None = None
+    price_within_limit: bool | None = None
 
 
 def utc_now() -> str:
@@ -175,7 +177,7 @@ def extract_price_cents(text: str) -> int | None:
     return min(values) if values else None
 
 
-def evaluate_page(html: str) -> MonitorResult:
+def evaluate_page(html: str, keyword: str | None = None) -> MonitorResult:
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
     title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "Product"
     text = re.sub(r"<[^>]+>", " ", html).lower()
@@ -200,9 +202,18 @@ def evaluate_page(html: str) -> MonitorResult:
     has_in = any(m in text for m in in_markers)
 
     in_stock = has_in and not has_out
+    keyword_matched: bool | None = None
+    if keyword:
+        keyword_matched = keyword.lower() in text
     price_cents = extract_price_cents(re.sub(r"<[^>]+>", " ", html))
     status_text = "in_stock" if in_stock else "out_or_unknown"
-    return MonitorResult(in_stock=in_stock, price_cents=price_cents, title=title[:180], status_text=status_text)
+    return MonitorResult(
+        in_stock=in_stock,
+        price_cents=price_cents,
+        title=title[:180],
+        status_text=status_text,
+        keyword_matched=keyword_matched,
+    )
 
 
 def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
@@ -212,7 +223,25 @@ def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
     }
     r = requests.get(monitor["product_url"], headers=headers, timeout=15)
     r.raise_for_status()
-    return evaluate_page(r.text)
+    keyword = (monitor["keyword"] or "").strip() or None
+    return evaluate_page(r.text, keyword=keyword)
+
+
+def alert_eligibility(monitor: sqlite3.Row, result: MonitorResult) -> bool:
+    if not result.in_stock:
+        return False
+
+    keyword_ok = result.keyword_matched in (True, None)
+
+    max_price_cents = monitor["max_price_cents"]
+    if max_price_cents is None:
+        result.price_within_limit = None
+        price_ok = True
+    else:
+        result.price_within_limit = result.price_cents is not None and result.price_cents <= max_price_cents
+        price_ok = bool(result.price_within_limit)
+
+    return keyword_ok and price_ok
 
 
 def dedupe_key(monitor: sqlite3.Row, result: MonitorResult) -> str:
@@ -221,8 +250,8 @@ def dedupe_key(monitor: sqlite3.Row, result: MonitorResult) -> str:
     return f"{monitor['id']}:{result.in_stock}:{bucket}:{minute}"
 
 
-def create_event_and_deliver(monitor: sqlite3.Row, result: MonitorResult) -> None:
-    if not result.in_stock:
+def create_event_and_deliver(monitor: sqlite3.Row, result: MonitorResult, eligible: bool) -> None:
+    if not eligible:
         return
 
     key = dedupe_key(monitor, result)
@@ -313,6 +342,8 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
         log(f"⚠️ Monitor {monitor['id']} fetch failed: {exc}")
         return {"ok": False, "error": str(exc)}
 
+    eligible = alert_eligibility(monitor, result)
+
     conn = db()
     conn.execute(
         """
@@ -320,12 +351,12 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
         set last_checked_at = ?, last_in_stock = ?, last_price_cents = ?
         where id = ?
         """,
-        (utc_now(), int(result.in_stock), result.price_cents, monitor["id"]),
+        (utc_now(), int(eligible), result.price_cents, monitor["id"]),
     )
     conn.commit()
     conn.close()
 
-    create_event_and_deliver(monitor, result)
+    create_event_and_deliver(monitor, result, eligible)
 
     log(
         f"✅ Checked monitor {monitor['id']} | {monitor['retailer']} | {result.status_text} | {cents_to_dollars(result.price_cents)}"
@@ -333,7 +364,10 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
     return {
         "ok": True,
         "in_stock": result.in_stock,
+        "eligible_for_alert": eligible,
         "price_cents": result.price_cents,
+        "keyword_matched": result.keyword_matched,
+        "price_within_limit": result.price_within_limit,
         "title": result.title,
     }
 
