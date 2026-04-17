@@ -204,3 +204,25 @@ def test_init_db_migrates_existing_monitors_table_with_msrp_column(tmp_path, mon
     conn.close()
 
     assert "msrp_cents" in columns
+
+
+def test_api_routes_require_auth(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/monitors")
+
+    assert resp.status_code == 401
+    assert resp.get_json() == {"error": "Unauthorized"}
+
+
+def test_api_routes_allow_authenticated_requests_and_include_context(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/workspace", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["workspace"]["id"] == 1
+    assert payload["user"]["id"] == "local-dev"

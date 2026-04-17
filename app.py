@@ -25,6 +25,7 @@ DEFAULT_PLAN = os.getenv("DEFAULT_PLAN", "basic")
 POKEMON_MSRP_BUFFER_CENTS = int(os.getenv("POKEMON_MSRP_BUFFER_CENTS", "1000"))
 APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
 RELEASE_CHANNEL = os.getenv("RELEASE_CHANNEL", "stable")
+API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "dev-token")
 
 PLAN_LIMITS = {
     "basic": {"max_monitors": 20, "min_poll_seconds": 20},
@@ -40,6 +41,12 @@ DEFAULT_WORKSPACE = {
 DEFAULT_USER_EMAIL = os.getenv("DEFAULT_USER_EMAIL", "owner@local.test")
 DEFAULT_USER_NAME = os.getenv("DEFAULT_USER_NAME", "Workspace Owner")
 DEFAULT_BEARER_TOKEN = os.getenv("DEFAULT_BEARER_TOKEN", "dev-token")
+
+DEFAULT_USER = {
+    "id": "local-dev",
+    "email": "local-dev@example.com",
+    "name": "Local Developer",
+}
 
 running = False
 monitor_thread: threading.Thread | None = None
@@ -288,6 +295,36 @@ def get_workspace(workspace_id: int) -> sqlite3.Row:
     if not row:
         raise ValueError("Workspace not found")
     return row
+
+
+def get_workspace_for_request() -> sqlite3.Row:
+    workspace = getattr(g, "current_workspace", None)
+    if workspace is None:
+        workspace = get_workspace(1)
+    return workspace
+
+
+def get_workspace_id_for_request() -> int:
+    return int(get_workspace_for_request()["id"])
+
+
+def _token_from_request() -> str | None:
+    auth_header = (request.headers.get("Authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return (request.headers.get("X-API-Token") or "").strip() or None
+
+
+@app.before_request
+def require_api_auth() -> tuple[dict[str, str], int] | None:
+    if not request.path.startswith("/api/"):
+        return None
+    token = _token_from_request()
+    if not token or token != API_AUTH_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 401
+    g.current_user = dict(DEFAULT_USER)
+    g.current_workspace = get_workspace(1)
+    return None
 
 
 def enforce_plan_limits(workspace_id: int, poll_interval_seconds: int) -> None:
@@ -642,7 +679,9 @@ def api_update_plan():
     plan = (request.json or {}).get("plan", "basic")
     if plan not in PLAN_LIMITS:
         return jsonify({"error": "Invalid plan"}), 400
+    workspace_id = get_workspace_id_for_request()
     conn = db()
+    conn.execute("update workspaces set plan = ? where id = ?", (plan, workspace_id))
     conn.execute("update workspaces set plan = ? where id = ?", (plan, current_workspace_id()))
     conn.commit()
     conn.close()
@@ -652,8 +691,10 @@ def api_update_plan():
 @app.get("/api/monitors")
 @require_auth
 def api_list_monitors():
+    workspace_id = get_workspace_id_for_request()
     conn = db()
     rows = conn.execute(
+        "select * from monitors where workspace_id = ? order by id desc", (workspace_id,)
         "select * from monitors where workspace_id = ? order by id desc",
         (current_workspace_id(),),
     ).fetchall()
@@ -664,7 +705,13 @@ def api_list_monitors():
 @app.get("/api/dashboard/summary")
 @require_auth
 def api_dashboard_summary():
+    workspace_id = get_workspace_id_for_request()
     conn = db()
+    total_monitors = conn.execute(
+        "select count(*) as c from monitors where workspace_id = ?", (workspace_id,)
+    ).fetchone()["c"]
+    enabled_monitors = conn.execute(
+        "select count(*) as c from monitors where workspace_id = ? and enabled = 1", (workspace_id,)
     workspace_id = current_workspace_id()
     total_monitors = conn.execute(
         "select count(*) as c from monitors where workspace_id = ?",
@@ -680,6 +727,7 @@ def api_dashboard_summary():
         where workspace_id = ?
           and last_checked_at is not null
           and datetime(last_checked_at) >= datetime('now', '-1 day')
+        """,
         """
         ,
         (workspace_id,),
@@ -692,6 +740,7 @@ def api_dashboard_summary():
         """
         select count(*) as c from events e
         join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ? and datetime(event_time) >= datetime('now', '-1 day')
         where m.workspace_id = ?
           and datetime(e.event_time) >= datetime('now', '-1 day')
         """,
@@ -701,6 +750,7 @@ def api_dashboard_summary():
         """
         select count(*) as c from events e
         join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ? and datetime(event_time) >= datetime('now', '-7 day')
         where m.workspace_id = ?
           and datetime(e.event_time) >= datetime('now', '-7 day')
         """,
@@ -788,6 +838,7 @@ def api_create_monitor():
 @app.patch("/api/monitors/<int:monitor_id>")
 @require_auth
 def api_update_monitor(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
     body = request.json or {}
     enabled = body.get("enabled")
     if enabled is None:
@@ -811,6 +862,7 @@ def api_update_monitor(monitor_id: int):
 @app.delete("/api/monitors/<int:monitor_id>")
 @require_auth
 def api_delete_monitor(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
     conn = db()
     conn.execute(
         "delete from monitors where id = ? and workspace_id = ?",
@@ -824,6 +876,7 @@ def api_delete_monitor(monitor_id: int):
 @app.post("/api/monitors/<int:monitor_id>/check")
 @require_auth
 def api_check_monitor(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
     conn = db()
     row = conn.execute(
         "select * from monitors where id = ? and workspace_id = ?",
@@ -838,6 +891,7 @@ def api_check_monitor(monitor_id: int):
 @app.get("/api/events")
 @require_auth
 def api_events():
+    workspace_id = get_workspace_id_for_request()
     conn = db()
     rows = conn.execute(
         """
@@ -856,6 +910,7 @@ def api_events():
 @app.post("/api/webhooks")
 @require_auth
 def api_add_webhook():
+    workspace_id = get_workspace_id_for_request()
     body = request.json or {}
     name = (body.get("name") or "Discord").strip()
     url = (body.get("webhook_url") or "").strip()
@@ -882,6 +937,7 @@ def api_add_webhook():
 @app.get("/api/webhooks")
 @require_auth
 def api_list_webhooks():
+    workspace_id = get_workspace_id_for_request()
     conn = db()
     rows = conn.execute(
         "select * from webhooks where workspace_id = ? order by id desc",
@@ -894,6 +950,7 @@ def api_list_webhooks():
 @app.post("/api/webhooks/<int:webhook_id>/test")
 @require_auth
 def api_test_webhook(webhook_id: int):
+    workspace_id = get_workspace_id_for_request()
     conn = db()
     hook = conn.execute(
         "select * from webhooks where id = ? and workspace_id = ?",
@@ -935,6 +992,7 @@ def api_test_webhook(webhook_id: int):
 @app.patch("/api/webhooks/<int:webhook_id>")
 @require_auth
 def api_update_webhook(webhook_id: int):
+    workspace_id = get_workspace_id_for_request()
     body = request.json or {}
     fields: list[tuple[str, Any]] = []
     if "enabled" in body:
@@ -967,6 +1025,7 @@ def api_update_webhook(webhook_id: int):
 @app.delete("/api/webhooks/<int:webhook_id>")
 @require_auth
 def api_delete_webhook(webhook_id: int):
+    workspace_id = get_workspace_id_for_request()
     conn = db()
     conn.execute(
         "delete from webhooks where id = ? and workspace_id = ?",
@@ -980,6 +1039,7 @@ def api_delete_webhook(webhook_id: int):
 @app.get("/api/schedules")
 @require_auth
 def api_list_schedules():
+    workspace_id = get_workspace_id_for_request()
     conn = db()
     rows = conn.execute(
         """
@@ -999,6 +1059,7 @@ def api_list_schedules():
 @app.post("/api/schedules")
 @require_auth
 def api_create_schedule():
+    workspace_id = get_workspace_id_for_request()
     body = request.json or {}
     monitor_ids = body.get("monitor_ids") or []
     run_at = (body.get("run_at") or "").strip()
@@ -1041,6 +1102,7 @@ def api_create_schedule():
 @app.delete("/api/schedules/<int:schedule_id>")
 @require_auth
 def api_delete_schedule(schedule_id: int):
+    workspace_id = get_workspace_id_for_request()
     conn = db()
     conn.execute(
         """
