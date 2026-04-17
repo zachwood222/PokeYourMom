@@ -26,6 +26,7 @@ PLAN_LIMITS = {
     "pro": {"max_monitors": 100, "min_poll_seconds": 10},
     "team": {"max_monitors": 500, "min_poll_seconds": 5},
 }
+SUPPORTED_RETAILERS = {"walmart", "target", "bestbuy"}
 
 DEFAULT_WORKSPACE = {
     "name": "My Workspace",
@@ -44,10 +45,18 @@ class MonitorResult:
     title: str
     status_text: str
 
+@dataclass
+class MonitorResult:
+    in_stock: bool
+    price_cents: int | None
+    title: str
+    status_text: str
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 def log(message: str) -> None:
     entry = f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] {message}"
