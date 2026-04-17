@@ -1,188 +1,223 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Pokémon TCG Sniper 2026</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
-        
-        body {
-            background: linear-gradient(180deg, #0a0a2a 0%, #1a0033 100%);
-            color: #ffcc00;
-            font-family: 'Press Start 2P', cursive;
-            margin: 0;
-            padding: 20px;
-            min-height: 100vh;
-            image-rendering: pixelated;
-        }
-        .container { max-width: 1100px; margin: auto; }
-        h1 {
-            text-align: center;
-            font-size: 2.2em;
-            text-shadow: 0 0 15px #ff0000;
-            margin-bottom: 10px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 15px;
-        }
-        .pokeball {
-            width: 50px;
-            height: 50px;
-            background: radial-gradient(circle, #fff 0%, #fff 40%, #ff0000 40%, #ff0000 60%, #000 60%, #000 100%);
-            border-radius: 50%;
-            border: 4px solid #000;
-            position: relative;
-        }
-        .pokeball::after {
-            content: '';
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            width: 18px;
-            height: 18px;
-            background: #000;
-            border-radius: 50%;
-            border: 3px solid #fff;
-        }
-        .box {
-            background: rgba(0, 0, 0, 0.85);
-            border: 4px solid #ffcc00;
-            border-radius: 12px;
-            padding: 20px;
-            margin: 20px 0;
-            box-shadow: 0 0 20px rgba(255, 204, 0, 0.5);
-        }
-        button {
-            font-family: 'Press Start 2P', cursive;
-            padding: 14px 24px;
-            margin: 8px;
-            font-size: 1em;
-            border: 4px solid #ff0000;
-            background: #000;
-            color: #ffcc00;
-            cursor: pointer;
-            transition: all 0.2s;
-        }
-        button:hover {
-            transform: scale(1.05);
-            box-shadow: 0 0 15px #ff0000;
-        }
-        .green { border-color: #00ff00; color: #00ff00; }
-        .red { border-color: #ff0000; color: #ff0000; }
-        .blue { border-color: #00aaff; color: #00aaff; }
-        
-        #logs {
-            background: #000;
-            border: 4px solid #00ff00;
-            height: 380px;
-            overflow-y: auto;
-            padding: 15px;
-            font-family: monospace;
-            font-size: 14px;
-            line-height: 1.4;
-        }
-        .product-list li {
-            background: #111;
-            border: 3px solid #00ffcc;
-            padding: 12px;
-            margin: 8px 0;
-            border-radius: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-    </style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stock Sentinel</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    body { font-family: Inter, system-ui, Arial, sans-serif; margin: 0; background: #0d1117; color: #e6edf3; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 16px; }
+    h1, h2 { margin-top: 0; }
+    label { display: block; margin: 8px 0 4px; font-size: 13px; color: #9fb0c1; }
+    input, select, button { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; }
+    button { cursor: pointer; font-weight: 600; }
+    button:hover { border-color: #58a6ff; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .logs { height: 260px; overflow-y: auto; white-space: pre-wrap; background: #010409; border: 1px solid #30363d; border-radius: 8px; padding: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px; border-bottom: 1px solid #30363d; text-align: left; }
+    .actions { display: flex; gap: 8px; }
+    .actions button { width: auto; }
+    .warn { color: #f7b955; font-size: 13px; }
+  </style>
 </head>
 <body>
-<div class="container">
-    <h1>
-        <span class="pokeball"></span>
-        POKÉMON TCG SNIPER 2026
-        <span class="pokeball"></span>
-    </h1>
+  <div class="wrap">
+    <h1>Stock Sentinel</h1>
+    <p class="warn">This app intentionally supports stock monitoring + Discord alerts only. Auto-checkout is not implemented.</p>
 
-    <div style="text-align:center; margin:15px 0;">
-        <button onclick="toggleBot()" id="toggleBtn" class="green" style="font-size:1.3em; padding:18px 40px;">START BOT</button>
-        <button onclick="sendTestAlert()" class="blue" style="font-size:1.1em;">🧪 TEST DISCORD ALERT</button>
+    <div class="grid">
+      <div class="card">
+        <h2>Workspace</h2>
+        <label>Subscription Plan</label>
+        <select id="plan">
+          <option value="basic">basic</option>
+          <option value="pro">pro</option>
+          <option value="team">team</option>
+        </select>
+        <div class="actions" style="margin-top:10px;">
+          <button onclick="savePlan()">Save Plan</button>
+          <button onclick="toggleLoop()" id="loopBtn">Start Monitor Loop</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Add Discord Webhook</h2>
+        <label>Name</label>
+        <input id="webhook_name" value="Main Discord" />
+        <label>Webhook URL</label>
+        <input id="webhook_url" placeholder="https://discord.com/api/webhooks/..." />
+        <div class="actions" style="margin-top:10px;">
+          <button onclick="addWebhook()">Add Webhook</button>
+          <button onclick="testFirstWebhook()">Test First Webhook</button>
+        </div>
+      </div>
     </div>
 
-    <div class="box">
-        <h2>⚙️ Settings</h2>
-        <label><input type="checkbox" id="aggressive" onchange="saveConfig()"> AGGRESSIVE MODE</label><br><br>
-        <label><input type="checkbox" id="proxy" onchange="saveConfig()"> USE RESIDENTIAL PROXIES</label><br><br>
-        ZIP Code: <input id="zip" value="32301" onchange="saveConfig()" style="width:120px"><br><br>
-        Discord Webhook: <input id="webhook" style="width:100%" onchange="saveConfig()">
-        <button onclick="saveConfig()" style="margin-top:15px;">💾 SAVE SETTINGS</button>
+    <div class="card" style="margin-top:16px;">
+      <h2>Add Product Monitor</h2>
+      <div class="row">
+        <div>
+          <label>Retailer</label>
+          <select id="retailer">
+            <option>walmart</option>
+            <option>target</option>
+            <option>bestbuy</option>
+          </select>
+        </div>
+        <div>
+          <label>Poll Interval (seconds)</label>
+          <input id="poll_interval" type="number" value="20" />
+        </div>
+      </div>
+      <label>Product URL</label>
+      <input id="product_url" placeholder="https://www.walmart.com/ip/..." />
+      <div class="row">
+        <div>
+          <label>Keyword Filter (optional)</label>
+          <input id="keyword" placeholder="pokemon" />
+        </div>
+        <div>
+          <label>Max Price Cents (optional)</label>
+          <input id="max_price_cents" type="number" placeholder="4000" />
+        </div>
+      </div>
+      <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
     </div>
 
-    <div class="box">
-        <h2>📦 Monitored Products</h2>
-        <ul id="productList" class="product-list" style="list-style:none; padding:0;"></ul>
+    <div class="card" style="margin-top:16px;">
+      <h2>Monitors</h2>
+      <table>
+        <thead><tr><th>ID</th><th>Retailer</th><th>URL</th><th>Last Checked</th><th>Last State</th><th>Actions</th></tr></thead>
+        <tbody id="monitors"></tbody>
+      </table>
     </div>
 
-    <div class="box">
-        <h2>📜 LIVE LOGS</h2>
-        <div id="logs"></div>
+    <div class="card" style="margin-top:16px;">
+      <h2>Live Logs</h2>
+      <div id="logs" class="logs"></div>
     </div>
-</div>
+  </div>
 
-<script>
+  <script>
     const socket = io();
-    socket.on('log', d => {
-        const logs = document.getElementById('logs');
-        logs.innerHTML += d.message + '<br>';
-        logs.scrollTop = logs.scrollHeight;
+    let loopRunning = false;
+
+    socket.on('log', (d) => {
+      const logs = document.getElementById('logs');
+      logs.textContent += d.message + "\n";
+      logs.scrollTop = logs.scrollHeight;
     });
 
-    function toggleBot() {
-        const btn = document.getElementById('toggleBtn');
-        const action = btn.innerText.includes('START') ? 'start' : 'stop';
-        fetch('/api/' + action, {method: 'POST'})
-            .then(() => {
-                btn.innerText = btn.innerText.includes('START') ? 'STOP BOT' : 'START BOT';
-                btn.className = btn.innerText.includes('START') ? 'green' : 'red';
-            });
+    async function loadWorkspace() {
+      const data = await fetch('/api/workspace').then(r => r.json());
+      document.getElementById('plan').value = data.plan;
     }
 
-    function saveConfig() {
-        const data = {
-            AGGRESSIVE_MODE: document.getElementById('aggressive').checked,
-            USE_PROXY: document.getElementById('proxy').checked,
-            ZIP_CODE: document.getElementById('zip').value,
-            DISCORD_WEBHOOK: document.getElementById('webhook').value
-        };
-        fetch('/api/config', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(data)
-        }).then(() => alert('✅ Settings Saved!'));
+    async function savePlan() {
+      const plan = document.getElementById('plan').value;
+      const res = await fetch('/api/workspace/plan', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({plan})
+      });
+      const data = await res.json();
+      alert(data.error || `Plan updated to ${data.plan}`);
     }
 
-    function sendTestAlert() {
-        fetch('/api/test-alert', {method: 'POST'})
-            .then(() => alert('🧪 Test alert sent to Discord!'));
+    async function addWebhook() {
+      const payload = {
+        name: document.getElementById('webhook_name').value,
+        webhook_url: document.getElementById('webhook_url').value,
+      };
+      const res = await fetch('/api/webhooks', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      alert(data.error || `Webhook added (id=${data.id})`);
     }
 
-    function loadProducts() {
-        fetch('/api/products')
-            .then(r => r.json())
-            .then(data => {
-                const list = document.getElementById('productList');
-                list.innerHTML = '';
-                data.forEach(p => {
-                    const li = document.createElement('li');
-                    li.innerHTML = `<strong>${p.retailer}</strong> — ${p.name}`;
-                    list.appendChild(li);
-                });
-            });
+    async function testFirstWebhook() {
+      const hooks = await fetch('/api/webhooks').then(r => r.json());
+      if (!hooks.length) {
+        alert('Add a webhook first.');
+        return;
+      }
+      const res = await fetch(`/api/webhooks/${hooks[0].id}/test`, {method: 'POST'});
+      const data = await res.json();
+      alert(JSON.stringify(data));
     }
 
-    window.onload = () => {
-        loadProducts();
-        document.getElementById('toggleBtn').innerText = "START BOT";
-    };
-</script>
+    async function addMonitor() {
+      const maxPrice = document.getElementById('max_price_cents').value;
+      const payload = {
+        retailer: document.getElementById('retailer').value,
+        product_url: document.getElementById('product_url').value,
+        poll_interval_seconds: Number(document.getElementById('poll_interval').value),
+        keyword: document.getElementById('keyword').value || null,
+        max_price_cents: maxPrice ? Number(maxPrice) : null,
+      };
+
+      const res = await fetch('/api/monitors', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      alert(data.error || `Monitor added (id=${data.id})`);
+      await loadMonitors();
+    }
+
+    async function loadMonitors() {
+      const rows = await fetch('/api/monitors').then(r => r.json());
+      const tbody = document.getElementById('monitors');
+      tbody.innerHTML = '';
+      for (const r of rows) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${r.id}</td>
+          <td>${r.retailer}</td>
+          <td><a href="${r.product_url}" target="_blank">link</a></td>
+          <td>${r.last_checked_at || '-'}</td>
+          <td>${r.last_in_stock === null ? '-' : (r.last_in_stock ? 'in_stock' : 'out_or_unknown')}</td>
+          <td class="actions">
+            <button onclick="checkMonitor(${r.id})">Check</button>
+            <button onclick="toggleMonitor(${r.id}, ${r.enabled ? 0 : 1})">${r.enabled ? 'Disable' : 'Enable'}</button>
+            <button onclick="deleteMonitor(${r.id})">Delete</button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function checkMonitor(id) {
+      const res = await fetch(`/api/monitors/${id}/check`, {method: 'POST'});
+      const data = await res.json();
+      alert(JSON.stringify(data));
+      await loadMonitors();
+    }
+
+    async function toggleMonitor(id, enabled) {
+      await fetch(`/api/monitors/${id}`, {
+        method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled})
+      });
+      await loadMonitors();
+    }
+
+    async function deleteMonitor(id) {
+      await fetch(`/api/monitors/${id}`, {method: 'DELETE'});
+      await loadMonitors();
+    }
+
+    async function toggleLoop() {
+      const endpoint = loopRunning ? '/api/stop' : '/api/start';
+      await fetch(endpoint, {method: 'POST'});
+      loopRunning = !loopRunning;
+      document.getElementById('loopBtn').textContent = loopRunning ? 'Stop Monitor Loop' : 'Start Monitor Loop';
+    }
+
+    loadWorkspace();
+    loadMonitors();
+  </script>
 </body>
 </html>

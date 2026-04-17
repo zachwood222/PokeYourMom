@@ -1,8 +1,4 @@
-flask
-flask-socketio
-eventlet
-undetected-chromedriver
-selenium-stealth
-requests
-pillow
-setuptools
+flask==3.1.0
+flask-socketio==5.5.1
+requests==2.32.3
+simple-websocket==1.1.0
