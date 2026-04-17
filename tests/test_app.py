@@ -1,4 +1,5 @@
 import importlib
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -76,14 +77,24 @@ def test_keyword_and_max_price_filter_block_event(tmp_path, monkeypatch):
     conn.close()
 
     result_keyword_miss = app_module.MonitorResult(
-        in_stock=True, price_cents=2500, title="Sports Card Bundle", status_text="in_stock"
+        in_stock=True,
+        price_cents=2500,
+        title="Sports Card Bundle",
+        status_text="in_stock",
+        keyword_matched=False,
     )
-    app_module.create_event_and_deliver(monitor, result_keyword_miss)
+    eligible_keyword_miss = app_module.alert_eligibility(monitor, result_keyword_miss)
+    app_module.create_event_and_deliver(monitor, result_keyword_miss, eligible_keyword_miss)
 
     result_price_too_high = app_module.MonitorResult(
-        in_stock=True, price_cents=3500, title="Pokemon 151 Box", status_text="in_stock"
+        in_stock=True,
+        price_cents=3500,
+        title="Pokemon 151 Box",
+        status_text="in_stock",
+        keyword_matched=True,
     )
-    app_module.create_event_and_deliver(monitor, result_price_too_high)
+    eligible_price_too_high = app_module.alert_eligibility(monitor, result_price_too_high)
+    app_module.create_event_and_deliver(monitor, result_price_too_high, eligible_price_too_high)
 
     conn = app_module.db()
     event_count = conn.execute("select count(*) as c from events").fetchone()["c"]
@@ -91,3 +102,62 @@ def test_keyword_and_max_price_filter_block_event(tmp_path, monkeypatch):
 
     assert event_count == 0
     assert posted_payloads == []
+
+
+def test_evaluate_page_sets_keyword_and_price_fields(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    html = """
+    <html>
+      <head><title>Pokemon 151 Booster Bundle</title></head>
+      <body>
+        <button>Add to Cart</button>
+        <p>Now only $29.99</p>
+      </body>
+    </html>
+    """
+    result = app_module.evaluate_page(html, keyword="pokemon")
+
+    assert result.in_stock is True
+    assert result.keyword_matched is True
+    assert result.price_cents == 2999
+    assert result.status_text == "in_stock"
+
+
+def test_init_db_migrates_existing_monitors_table_with_msrp_column(tmp_path, monkeypatch):
+    db_path = tmp_path / "legacy.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        create table monitors (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            retailer text not null,
+            product_url text not null,
+            keyword text,
+            max_price_cents integer,
+            poll_interval_seconds integer not null,
+            enabled integer not null default 1,
+            last_checked_at text,
+            last_in_stock integer,
+            last_price_cents integer,
+            created_at text not null
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    columns = {row[1] for row in conn.execute("pragma table_info(monitors)").fetchall()}
+    conn.close()
+
+    assert "msrp_cents" in columns
