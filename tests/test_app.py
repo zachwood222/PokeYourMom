@@ -76,14 +76,20 @@ def test_keyword_and_max_price_filter_block_event(tmp_path, monkeypatch):
     conn.close()
 
     result_keyword_miss = app_module.MonitorResult(
-        in_stock=True, price_cents=2500, title="Sports Card Bundle", status_text="in_stock"
+        in_stock=True,
+        price_cents=2500,
+        title="Sports Card Bundle",
+        status_text="in_stock",
+        keyword_matched=False,
     )
-    app_module.create_event_and_deliver(monitor, result_keyword_miss)
+    eligible_keyword_miss = app_module.alert_eligibility(monitor, result_keyword_miss)
+    app_module.create_event_and_deliver(monitor, result_keyword_miss, eligible_keyword_miss)
 
     result_price_too_high = app_module.MonitorResult(
         in_stock=True, price_cents=3500, title="Pokemon 151 Box", status_text="in_stock"
     )
-    app_module.create_event_and_deliver(monitor, result_price_too_high)
+    eligible_price_too_high = app_module.alert_eligibility(monitor, result_price_too_high)
+    app_module.create_event_and_deliver(monitor, result_price_too_high, eligible_price_too_high)
 
     conn = app_module.db()
     event_count = conn.execute("select count(*) as c from events").fetchone()["c"]

@@ -49,16 +49,6 @@ class MonitorResult:
     price_within_limit: bool | None = None
     within_msrp_delta: bool | None = None
 
-@dataclass
-class MonitorResult:
-    in_stock: bool
-    price_cents: int | None
-    title: str
-    status_text: str
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -472,6 +462,10 @@ def api_create_monitor():
         msrp_cents = body.get("msrp_cents")
         if msrp_cents is not None:
             msrp_cents = int(msrp_cents)
+        if retailer not in SUPPORTED_RETAILERS:
+            raise ValueError(f"Unsupported retailer '{retailer}'")
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise ValueError("product_url must be http(s)")
 
         enforce_plan_limits(1, poll_interval)
     except (KeyError, ValueError) as exc:
