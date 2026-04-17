@@ -6,68 +6,218 @@
   <title>Stock Sentinel</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
   <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    body { font-family: Inter, system-ui, Arial, sans-serif; margin: 0; background: radial-gradient(circle at top, #122238, #0d1117 45%); color: #e6edf3; }
-    .layout { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
-    .sidebar { border-right: 1px solid #30363d; background: rgba(13, 17, 23, 0.84); padding: 20px; }
-    .brand { margin: 0 0 4px; font-size: 22px; }
-    .subtitle { margin: 0 0 16px; color: #9fb0c1; font-size: 12px; }
-    .nav { display: grid; gap: 8px; }
-    .nav button { text-align: left; width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; cursor: pointer; }
-    .nav button.active, .nav button:hover { border-color: #58a6ff; background: #101a29; }
+    :root {
+      color-scheme: dark;
+      --bg: #090d14;
+      --surface: #10151f;
+      --surface-soft: #151b27;
+      --surface-border: #1d2634;
+      --text: #e9edf5;
+      --muted: #8d9bb0;
+      --accent: #5d7cff;
+      --accent-soft: #29385f;
+      --ok: #6ff2bc;
+    }
 
-    .content { padding: 24px; }
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      margin: 0;
+      background: radial-gradient(circle at top, #111a2a 0%, #090d14 38%);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      height: 62px;
+      border-bottom: 1px solid var(--surface-border);
+      background: linear-gradient(180deg, rgba(16, 21, 31, 0.98), rgba(11, 15, 24, 0.96));
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 18px;
+      backdrop-filter: blur(8px);
+    }
+
+    .topbar-left { display: flex; align-items: center; gap: 14px; }
+    .app-mark {
+      width: 22px;
+      height: 22px;
+      border-radius: 6px;
+      background: linear-gradient(140deg, #6d6cff, #3aa0ff);
+      box-shadow: 0 0 20px rgba(93, 124, 255, 0.45);
+      flex: 0 0 auto;
+    }
+
+    .top-nav { display: flex; gap: 8px; flex-wrap: wrap; }
+    .top-nav button {
+      width: auto;
+      border: 1px solid transparent;
+      background: transparent;
+      color: #c7d2e3;
+      font-size: 12px;
+      letter-spacing: 0.02em;
+      padding: 8px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    .top-nav button.active,
+    .top-nav button:hover {
+      background: linear-gradient(180deg, rgba(93, 124, 255, 0.22), rgba(93, 124, 255, 0.11));
+      border-color: #42557d;
+      color: #eef2ff;
+    }
+
+    .topbar-right { color: var(--muted); font-size: 12px; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      gap: 16px;
+      padding: 16px;
+    }
+
+    .sidebar { display: grid; gap: 12px; align-content: start; }
+
+    .card {
+      background: linear-gradient(180deg, rgba(19, 25, 36, 0.95), rgba(13, 17, 25, 0.95));
+      border: 1px solid var(--surface-border);
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
+    }
+
+    .header-card {
+      background: linear-gradient(180deg, #1f2b42 0%, #131a28 100%);
+      border: 1px solid #2a3856;
+    }
+
+    .section-title {
+      margin: 0 0 10px;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: #d4def1;
+    }
+
+    .hero-title { margin: 0; font-size: 24px; }
+    .subtitle, .small { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+
     .tab { display: none; }
     .tab.active { display: block; }
 
-    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-    .kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
-    .card { background: rgba(22, 27, 34, 0.92); border: 1px solid #30363d; border-radius: 12px; padding: 16px; }
-    .kpi-label { font-size: 12px; color: #9fb0c1; margin-bottom: 6px; }
-    .kpi-value { font-size: 24px; font-weight: 700; }
+    .content { min-width: 0; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .kpi-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 8px; }
+    .kpi-value { font-size: 22px; font-weight: 700; }
+    .status-value { color: var(--ok); font-size: 24px; font-weight: 700; letter-spacing: 0.05em; }
 
-    h1, h2, h3 { margin-top: 0; }
-    label { display: block; margin: 8px 0 4px; font-size: 13px; color: #9fb0c1; }
-    input, select, button { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; }
+    h1, h2, h3 { margin: 0 0 10px; }
+    h1 { font-size: 21px; }
+    h2 { font-size: 16px; color: #e5ecf8; }
+    h3 { font-size: 14px; color: #dce5f7; }
+
+    label { display: block; margin: 8px 0 4px; font-size: 12px; color: #9fb0c7; }
+    input, select, button {
+      width: 100%;
+      padding: 9px 10px;
+      border-radius: 8px;
+      border: 1px solid #233049;
+      background: var(--surface-soft);
+      color: var(--text);
+    }
     button { cursor: pointer; font-weight: 600; }
-    button:hover { border-color: #58a6ff; }
-    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .actions { display: flex; gap: 8px; }
+    button:hover { border-color: #4f689b; }
+
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .actions button { width: auto; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { padding: 8px; border-bottom: 1px solid #30363d; text-align: left; }
+    th, td { padding: 8px; border-bottom: 1px solid #222e44; text-align: left; }
+    thead th { color: #b1bfd5; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
 
-    .logs { height: 400px; overflow-y: auto; white-space: pre-wrap; background: #010409; border: 1px solid #30363d; border-radius: 8px; padding: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .logs {
+      height: 400px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      background: #0a0f17;
+      border: 1px solid #222e44;
+      border-radius: 8px;
+      padding: 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+
     .warn { color: #f7b955; font-size: 13px; }
-    .small { color: #9fb0c1; font-size: 12px; }
 
-    @media (max-width: 980px) {
+    @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
-      .sidebar { border-right: none; border-bottom: 1px solid #30363d; }
-      .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .grid { grid-template-columns: 1fr; }
+      .sidebar { order: 2; }
+      .content { order: 1; }
+      .topbar { height: auto; min-height: 62px; padding: 10px 14px; flex-wrap: wrap; gap: 8px; }
+    }
+
+    @media (max-width: 740px) {
+      .row, .grid, .kpi-grid { grid-template-columns: 1fr; }
+      .top-nav { width: 100%; overflow-x: auto; padding-bottom: 4px; }
     }
   </style>
 </head>
 <body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="app-mark"></div>
+      <nav class="top-nav">
+        <button class="active" data-tab="home" onclick="setTab('home')">Analytics</button>
+        <button data-tab="monitors" onclick="setTab('monitors')">Tasks</button>
+        <button data-tab="webhooks" onclick="setTab('webhooks')">Proxies</button>
+        <button data-tab="settings" onclick="setTab('settings')">Settings</button>
+        <button data-tab="logs" onclick="setTab('logs')">Automation</button>
+      </nav>
+    </div>
+    <div class="topbar-right" id="clock">--:--:--</div>
+  </header>
+
   <div class="layout">
     <aside class="sidebar">
-      <h2 class="brand">Stock Sentinel</h2>
-      <p class="subtitle">Operator Dashboard</p>
-      <nav class="nav">
-        <button class="active" data-tab="home" onclick="setTab('home')">Home</button>
-        <button data-tab="monitors" onclick="setTab('monitors')">Monitors</button>
-        <button data-tab="webhooks" onclick="setTab('webhooks')">Webhooks</button>
-        <button data-tab="settings" onclick="setTab('settings')">Settings</button>
-        <button data-tab="logs" onclick="setTab('logs')">Logs</button>
-      </nav>
+      <div class="card header-card">
+        <h2 class="hero-title">Stock Sentinel</h2>
+        <p class="subtitle">Operator Console</p>
+      </div>
+      <div class="card">
+        <h3 class="section-title">Up To Date</h3>
+        <div id="meta" class="small">Checking version info…</div>
+        <div class="actions" style="margin-top:10px;">
+          <button onclick="checkUpdates()">Check for Updates</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3 class="section-title">System Status</h3>
+        <div class="kpi-label">Task Engine</div>
+        <div id="runtime_running_badge" class="status-value">READY</div>
+        <div class="kpi-label" style="margin-top:10px;">Latest Check</div>
+        <div id="runtime_latest_check_badge" class="small">N/A</div>
+      </div>
+      <div class="card">
+        <h3 class="section-title">Quick Metrics</h3>
+        <div class="kpi-grid">
+          <div><div class="kpi-label">Monitors</div><div id="kpi_total_monitors_side" class="kpi-value">0</div></div>
+          <div><div class="kpi-label">Enabled</div><div id="kpi_enabled_monitors_side" class="kpi-value">0</div></div>
+          <div><div class="kpi-label">Events 24h</div><div id="kpi_events_24h_side" class="kpi-value">0</div></div>
+          <div><div class="kpi-label">Success</div><div id="kpi_success_rate_side" class="kpi-value">0%</div></div>
+        </div>
+      </div>
     </aside>
 
     <main class="content">
       <section id="tab-home" class="tab active">
-        <h1>Home</h1>
+        <h1>Analytics</h1>
         <p class="small">Live workspace health and throughput metrics.</p>
         <div class="kpi-grid">
           <div class="card"><div class="kpi-label">Monitors</div><div id="kpi_total_monitors" class="kpi-value">0</div></div>
@@ -75,26 +225,50 @@
           <div class="card"><div class="kpi-label">Events (24h)</div><div id="kpi_events_24h" class="kpi-value">0</div></div>
           <div class="card"><div class="kpi-label">Delivery Success</div><div id="kpi_success_rate" class="kpi-value">0%</div></div>
         </div>
-        <div class="card" style="margin-top:16px;">
-          <h3>Runtime</h3>
-          <div class="row">
-            <div>
-              <label>Loop State</label>
-              <input id="runtime_running" disabled />
+
+        <div class="workspace">
+          <div class="card">
+            <h3 class="section-title">Runtime Controls</h3>
+            <div class="row">
+              <div>
+                <label class="small">Loop State</label>
+                <input id="runtime_running" disabled />
+              </div>
+              <div>
+                <label class="small">Latest Check</label>
+                <input id="runtime_latest_check" disabled />
+              </div>
             </div>
-            <div>
-              <label>Latest Check</label>
-              <input id="runtime_latest_check" disabled />
+            <div class="actions" style="margin-top:10px;">
+              <button onclick="loadDashboardSummary()">Refresh Metrics</button>
+              <button onclick="toggleLoop()" id="loopBtn">Start Monitor Loop</button>
             </div>
           </div>
-          <div class="actions" style="margin-top:10px;">
-            <button onclick="loadDashboardSummary()">Refresh Metrics</button>
+          <div class="card">
+            <h3 class="section-title">Policy</h3>
+            <p class="warn">Stock monitoring + Discord alerts only. Auto-checkout is intentionally not implemented.</p>
+          </div>
+        </div>
+        <div class="grid" style="margin-top:16px;">
+          <div class="card">
+            <h3>Monitor Failure Trends</h3>
+            <table>
+              <thead><tr><th>Monitor</th><th>Failures (24h)</th><th>Failures (7d)</th></tr></thead>
+              <tbody id="ops_monitor_failure_trends"></tbody>
+            </table>
+          </div>
+          <div class="card">
+            <h3>Webhook Health Trends</h3>
+            <table>
+              <thead><tr><th>Webhook</th><th>Fail Streak</th><th>Last Code</th><th>Failures (24h)</th></tr></thead>
+              <tbody id="ops_webhook_health_trends"></tbody>
+            </table>
           </div>
         </div>
       </section>
 
       <section id="tab-monitors" class="tab">
-        <h1>Monitors</h1>
+        <h1>Task Controls</h1>
         <div class="card">
           <h2>Add Product Monitor</h2>
           <div class="row">
@@ -106,43 +280,61 @@
                 <option>bestbuy</option>
               </select>
             </div>
-            <div>
-              <label>Poll Interval (seconds)</label>
-              <input id="poll_interval" type="number" value="20" />
+            <label class="small">Product URL</label>
+            <input id="product_url" placeholder="https://www.walmart.com/ip/..." />
+            <div class="row" style="margin-top: 10px;">
+              <div>
+                <label class="small">Keyword Filter</label>
+                <input id="keyword" placeholder="pokemon" />
+              </div>
+              <div>
+                <label class="small">Max Price Cents</label>
+                <input id="max_price_cents" type="number" placeholder="4000" />
+              </div>
             </div>
-          </div>
-          <label>Product URL</label>
-          <input id="product_url" placeholder="https://www.walmart.com/ip/..." />
-          <div class="row">
-            <div>
-              <label>Keyword Filter (optional)</label>
-              <input id="keyword" placeholder="pokemon" />
-            </div>
-            <div>
-              <label>Max Price Cents (optional)</label>
-              <input id="max_price_cents" type="number" placeholder="4000" />
-            </div>
-          </div>
-          <div class="row">
-            <div>
-              <label>Original MSRP Cents (Pokemon only, optional)</label>
+            <div style="margin-top:10px;">
+              <label class="small">Original MSRP Cents (Pokemon only)</label>
               <input id="msrp_cents" type="number" placeholder="499" />
             </div>
+            <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
           </div>
-          <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
+
+          <div class="card">
+            <h2 class="section-title">Bulk Schedules</h2>
+            <div class="row">
+              <div>
+                <label class="small">Run At (UTC ISO)</label>
+                <input id="schedule_run_at" placeholder="2026-04-18T15:00:00+00:00" />
+              </div>
+              <div>
+                <label class="small">New Poll Interval</label>
+                <input id="schedule_poll" type="number" value="20" />
+              </div>
+            </div>
+            <button style="margin-top:10px;" onclick="createSchedule()">Create Schedule For Selected</button>
+
+            <div style="margin-top: 12px;">
+              <table>
+                <thead>
+                  <tr><th>ID</th><th>Monitor</th><th>Run At</th><th>Applied</th><th>Actions</th></tr>
+                </thead>
+                <tbody id="schedules"></tbody>
+              </table>
+            </div>
+          </div>
         </div>
 
-        <div class="card" style="margin-top:16px;">
-          <h2>Monitor List</h2>
+        <div class="card" style="margin-top:14px;">
+          <h2 class="section-title">Monitor List</h2>
           <table>
-            <thead><tr><th>ID</th><th>Retailer</th><th>URL</th><th>Last Checked</th><th>Last Alert State</th><th>Actions</th></tr></thead>
+            <thead><tr><th>ID</th><th>Select</th><th>Retailer</th><th>URL</th><th>Last Checked</th><th>Last Alert State</th><th>Actions</th></tr></thead>
             <tbody id="monitors"></tbody>
           </table>
         </div>
       </section>
 
       <section id="tab-webhooks" class="tab">
-        <h1>Webhooks</h1>
+        <h1>Webhook Routing</h1>
         <div class="card">
           <h2>Add Discord Webhook</h2>
           <label>Name</label>
@@ -154,10 +346,17 @@
             <button onclick="testFirstWebhook()">Test First Webhook</button>
           </div>
         </div>
+        <div class="card" style="margin-top:16px;">
+          <h2>Webhook List</h2>
+          <table>
+            <thead><tr><th>ID</th><th>Name</th><th>Prefs</th><th>Status</th><th>Actions</th></tr></thead>
+            <tbody id="webhooks"></tbody>
+          </table>
+        </div>
       </section>
 
       <section id="tab-settings" class="tab">
-        <h1>Settings</h1>
+        <h1>Miscellaneous Settings</h1>
         <div class="grid">
           <div class="card">
             <h2>Workspace</h2>
@@ -177,10 +376,30 @@
             <p class="warn">This app intentionally supports stock monitoring + Discord alerts only. Auto-checkout is not implemented.</p>
           </div>
         </div>
+        <div class="card" style="margin-top:16px;">
+          <h2>Schedules</h2>
+          <div class="row">
+            <div>
+              <label>Run At (ISO datetime)</label>
+              <input id="schedule_run_at" placeholder="2026-04-17T12:00:00+00:00" />
+            </div>
+            <div>
+              <label>New Poll Interval</label>
+              <input id="schedule_poll" type="number" value="30" />
+            </div>
+          </div>
+          <div class="actions" style="margin-top:10px;">
+            <button onclick="createSchedule()">Create for selected monitors</button>
+          </div>
+          <table style="margin-top:12px;">
+            <thead><tr><th>ID</th><th>Monitor</th><th>Run At</th><th>Applied</th><th>Actions</th></tr></thead>
+            <tbody id="schedules"></tbody>
+          </table>
+        </div>
       </section>
 
       <section id="tab-logs" class="tab">
-        <h1>Live Logs</h1>
+        <h1>Automation Logs</h1>
         <div id="logs" class="logs"></div>
       </section>
     </main>
@@ -189,25 +408,13 @@
   <script>
     const socket = io();
     let loopRunning = false;
-    const API_TOKEN_KEY = 'stock_sentinel_api_token';
-    const apiToken = window.localStorage.getItem(API_TOKEN_KEY) || 'dev-token';
-    const defaultApiHeaders = {
-      'Authorization': `Bearer ${apiToken}`,
-    };
-
-    async function apiFetch(url, options = {}) {
-      const headers = {
-        ...defaultApiHeaders,
-        ...(options.headers || {}),
-      };
-      return fetch(url, {...options, headers});
-    }
+    const toArray = (value, key) => Array.isArray(value) ? value : (value && Array.isArray(value[key]) ? value[key] : []);
 
     function setTab(tab) {
       document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
-      document.querySelectorAll('.nav button').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.top-nav button').forEach(el => el.classList.remove('active'));
       document.getElementById(`tab-${tab}`).classList.add('active');
-      document.querySelector(`.nav button[data-tab="${tab}"]`).classList.add('active');
+      document.querySelector(`.top-nav button[data-tab="${tab}"]`).classList.add('active');
     }
 
     socket.on('log', (d) => {
@@ -217,8 +424,10 @@
     });
 
     async function loadWorkspace() {
-      const data = await apiFetch('/api/workspace').then(r => r.json());
-      document.getElementById('plan').value = data.plan;
+      const data = await fetch('/api/workspace').then(r => r.json());
+      if (data.workspace) {
+        document.getElementById('plan').value = data.workspace.plan;
+      }
     }
 
     async function loadDashboardSummary() {
@@ -227,10 +436,46 @@
       document.getElementById('kpi_enabled_monitors').textContent = data.enabled_monitors;
       document.getElementById('kpi_events_24h').textContent = data.events_last_24h;
       document.getElementById('kpi_success_rate').textContent = `${Math.round(data.delivery_success_rate * 100)}%`;
+      document.getElementById('kpi_total_monitors_side').textContent = data.total_monitors;
+      document.getElementById('kpi_enabled_monitors_side').textContent = data.enabled_monitors;
+      document.getElementById('kpi_events_24h_side').textContent = data.events_last_24h;
+      document.getElementById('kpi_success_rate_side').textContent = `${Math.round(data.delivery_success_rate * 100)}%`;
       document.getElementById('runtime_running').value = data.running ? 'Running' : 'Stopped';
       document.getElementById('runtime_latest_check').value = data.latest_check_at || '-';
+      document.getElementById('runtime_running_badge').textContent = data.running ? 'CONNECTED' : 'READY';
+      document.getElementById('runtime_latest_check_badge').textContent = data.latest_check_at || 'N/A';
       loopRunning = !!data.running;
       document.getElementById('loopBtn').textContent = loopRunning ? 'Stop Monitor Loop' : 'Start Monitor Loop';
+      await loadOpsTrends();
+    }
+
+    async function loadOpsTrends() {
+      const monitorData = await fetch('/api/ops/monitor-failure-trends').then(r => r.json()).catch(() => ({trends: []}));
+      const webhookData = await fetch('/api/ops/webhook-health-trends').then(r => r.json()).catch(() => ({webhooks: []}));
+
+      const monitorRows = toArray(monitorData, 'trends');
+      const monitorBody = document.getElementById('ops_monitor_failure_trends');
+      monitorBody.innerHTML = '';
+      if (!monitorRows.length) {
+        monitorBody.innerHTML = '<tr><td colspan="3">No failures recorded.</td></tr>';
+      }
+      for (const row of monitorRows) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${row.monitor_id}</td><td>${row.failures_last_24h || 0}</td><td>${row.failures_last_7d || 0}</td>`;
+        monitorBody.appendChild(tr);
+      }
+
+      const webhookRows = toArray(webhookData, 'webhooks');
+      const webhookBody = document.getElementById('ops_webhook_health_trends');
+      webhookBody.innerHTML = '';
+      if (!webhookRows.length) {
+        webhookBody.innerHTML = '<tr><td colspan="4">No webhook health data yet.</td></tr>';
+      }
+      for (const row of webhookRows) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${row.webhook_id}</td><td>${row.fail_streak || 0}</td><td>${row.last_status_code || '-'}</td><td>${row.recent_failures_24h || 0}</td>`;
+        webhookBody.appendChild(tr);
+      }
     }
 
     async function savePlan() {
@@ -256,6 +501,15 @@
       const data = await res.json();
       alert(data.error || `Webhook added (id=${data.id})`);
       await loadWebhooks();
+    }
+
+    async function testFirstWebhook() {
+      const hooks = await fetch('/api/webhooks').then(r => r.json());
+      if (!hooks.length) {
+        alert('No webhooks configured yet.');
+        return;
+      }
+      await testWebhook(hooks[0].id);
     }
 
     async function addMonitor() {
@@ -364,6 +618,15 @@
       await loadWebhooks();
     }
 
+    async function testFirstWebhook() {
+      const hooks = await fetch('/api/webhooks').then(r => r.json()).catch(() => []);
+      if (!Array.isArray(hooks) || !hooks.length) {
+        alert('No webhooks available to test.');
+        return;
+      }
+      await testWebhook(hooks[0].id);
+    }
+
     function selectedMonitorIds() {
       return Array.from(document.querySelectorAll('.monitor-select:checked')).map(x => Number(x.value));
     }
@@ -439,11 +702,23 @@
       await loadDashboardSummary();
     }
 
+    function startClock() {
+      const el = document.getElementById('clock');
+      if (!el) return;
+      const paint = () => {
+        const now = new Date();
+        el.textContent = now.toLocaleTimeString();
+      };
+      paint();
+      setInterval(paint, 1000);
+    }
+
     loadWorkspace();
     loadMeta();
     loadWebhooks();
     loadMonitors();
     loadDashboardSummary();
+    startClock();
   </script>
 </body>
 </html>

@@ -1,6 +1,7 @@
 import importlib
 import sqlite3
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -266,3 +267,156 @@ def test_api_routes_allow_authenticated_requests_and_include_context(tmp_path, m
     assert resp.status_code == 200
     assert payload["workspace"]["id"] == 1
     assert payload["user"]["id"] == 1
+
+
+def test_monitor_failure_trends_returns_seeded_counts(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    now = datetime.now(timezone.utc)
+
+    conn = app_module.db()
+    cur = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/one', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor_id = cur.lastrowid
+    conn.execute(
+        """
+        insert into monitor_failures(monitor_id, workspace_id, error_text, failed_at)
+        values (?, 1, 'err-1', ?), (?, 1, 'err-2', ?), (?, 1, 'err-3', ?)
+        """,
+        (
+            monitor_id,
+            (now - timedelta(hours=2)).isoformat(),
+            monitor_id,
+            (now - timedelta(days=3)).isoformat(),
+            monitor_id,
+            (now - timedelta(days=8)).isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ops/monitor-failure-trends", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["trends"] == [
+        {"monitor_id": monitor_id, "failures_last_24h": 1, "failures_last_7d": 2}
+    ]
+
+
+def test_webhook_health_trends_scoped_to_workspace(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    now = datetime.now(timezone.utc)
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+
+    conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, fail_streak, last_status_code, created_at)
+        values (1, 'Main', 'https://discord.com/api/webhooks/main', 2, 500, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    webhook_id = conn.execute("select id from webhooks where name = 'Main'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/seed', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor_id = conn.execute("select id from monitors where product_url = 'https://example.com/seed'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+        values (?, 'in_stock', 'seed', 'https://example.com/seed', 'walmart', 1000, ?, 'seed-key-1')
+        """,
+        (monitor_id, app_module.utc_now()),
+    )
+    event_id = conn.execute("select id from events where dedupe_key = 'seed-key-1'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into deliveries(event_id, webhook_id, status, response_code, response_body, delivered_at)
+        values (?, ?, 'failed', 500, 'oops', ?), (?, ?, 'failed', 500, 'oops', ?)
+        """,
+        (
+            event_id,
+            webhook_id,
+            (now - timedelta(hours=4)).isoformat(),
+            event_id,
+            webhook_id,
+            (now - timedelta(days=9)).isoformat(),
+        ),
+    )
+
+    conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, fail_streak, last_status_code, created_at)
+        values (?, 'OtherHook', 'https://discord.com/api/webhooks/other', 5, 429, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ops/webhook-health-trends", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert len(payload["webhooks"]) == 1
+    assert payload["webhooks"][0]["webhook_id"] == webhook_id
+    assert payload["webhooks"][0]["fail_streak"] == 2
+    assert payload["webhooks"][0]["last_status_code"] == 500
+    assert payload["webhooks"][0]["recent_failures_24h"] == 1
+    assert payload["webhooks"][0]["recent_failures_7d"] == 1
+
+
+def test_parser_dispatch_uses_walmart_and_fallback(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    walmart_parser = app_module.get_parser_for_retailer("walmart")
+    fallback_parser = app_module.get_parser_for_retailer("target")
+
+    assert walmart_parser.name == "walmart"
+    assert fallback_parser.name == "default"
+
+
+def test_walmart_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    in_stock_html = """
+    <html>
+      <head><title>Walmart Item</title></head>
+      <body>
+        <script>{"availability":"InStock"}</script>
+        <p>$24.88</p>
+      </body>
+    </html>
+    """
+    out_stock_html = """
+    <html>
+      <head><title>Walmart Item</title></head>
+      <body>
+        <script>{"availability":"OutOfStock"}</script>
+        <p>$24.88</p>
+      </body>
+    </html>
+    """
+
+    in_stock = app_module.evaluate_page(in_stock_html, retailer="walmart")
+    out_stock = app_module.evaluate_page(out_stock_html, retailer="walmart")
+
+    assert in_stock.in_stock is True
+    assert in_stock.price_cents == 2488
+    assert out_stock.in_stock is False
+    assert out_stock.price_cents == 2488
