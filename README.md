@@ -26,10 +26,20 @@ Then open `http://localhost:5000`.
 
 ## API quick start
 
+- API authentication is required for all `/api/*` routes.
+- Set `API_AUTH_TOKEN` (defaults to `dev-token`) and send either:
+  - `Authorization: Bearer <token>`, or
+  - `X-API-Token: <token>`
 - `POST /api/webhooks` to add Discord webhook.
 - `POST /api/monitors` to add product monitor.
 - `POST /api/start` to begin background checks.
 - `POST /api/monitors/:id/check` to run an immediate check.
+
+Example:
+
+```bash
+curl -H "Authorization: Bearer dev-token" http://localhost:5000/api/workspace
+```
 
 ## Notes
 
