@@ -91,6 +91,22 @@
             <button onclick="loadDashboardSummary()">Refresh Metrics</button>
           </div>
         </div>
+        <div class="grid" style="margin-top:16px;">
+          <div class="card">
+            <h3>Monitor Failure Trends</h3>
+            <table>
+              <thead><tr><th>Monitor</th><th>Failures (24h)</th><th>Failures (7d)</th></tr></thead>
+              <tbody id="ops_monitor_failure_trends"></tbody>
+            </table>
+          </div>
+          <div class="card">
+            <h3>Webhook Health Trends</h3>
+            <table>
+              <thead><tr><th>Webhook</th><th>Fail Streak</th><th>Last Code</th><th>Failures (24h)</th></tr></thead>
+              <tbody id="ops_webhook_health_trends"></tbody>
+            </table>
+          </div>
+        </div>
       </section>
 
       <section id="tab-monitors" class="tab">
@@ -154,6 +170,13 @@
             <button onclick="testFirstWebhook()">Test First Webhook</button>
           </div>
         </div>
+        <div class="card" style="margin-top:16px;">
+          <h2>Webhook List</h2>
+          <table>
+            <thead><tr><th>ID</th><th>Name</th><th>Prefs</th><th>Status</th><th>Actions</th></tr></thead>
+            <tbody id="webhooks"></tbody>
+          </table>
+        </div>
       </section>
 
       <section id="tab-settings" class="tab">
@@ -177,6 +200,26 @@
             <p class="warn">This app intentionally supports stock monitoring + Discord alerts only. Auto-checkout is not implemented.</p>
           </div>
         </div>
+        <div class="card" style="margin-top:16px;">
+          <h2>Schedules</h2>
+          <div class="row">
+            <div>
+              <label>Run At (ISO datetime)</label>
+              <input id="schedule_run_at" placeholder="2026-04-17T12:00:00+00:00" />
+            </div>
+            <div>
+              <label>New Poll Interval</label>
+              <input id="schedule_poll" type="number" value="30" />
+            </div>
+          </div>
+          <div class="actions" style="margin-top:10px;">
+            <button onclick="createSchedule()">Create for selected monitors</button>
+          </div>
+          <table style="margin-top:12px;">
+            <thead><tr><th>ID</th><th>Monitor</th><th>Run At</th><th>Applied</th><th>Actions</th></tr></thead>
+            <tbody id="schedules"></tbody>
+          </table>
+        </div>
       </section>
 
       <section id="tab-logs" class="tab">
@@ -189,6 +232,7 @@
   <script>
     const socket = io();
     let loopRunning = false;
+    const toArray = (value, key) => Array.isArray(value) ? value : (value && Array.isArray(value[key]) ? value[key] : []);
 
     function setTab(tab) {
       document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
@@ -205,7 +249,9 @@
 
     async function loadWorkspace() {
       const data = await fetch('/api/workspace').then(r => r.json());
-      document.getElementById('plan').value = data.plan;
+      if (data.workspace) {
+        document.getElementById('plan').value = data.workspace.plan;
+      }
     }
 
     async function loadDashboardSummary() {
@@ -218,6 +264,36 @@
       document.getElementById('runtime_latest_check').value = data.latest_check_at || '-';
       loopRunning = !!data.running;
       document.getElementById('loopBtn').textContent = loopRunning ? 'Stop Monitor Loop' : 'Start Monitor Loop';
+      await loadOpsTrends();
+    }
+
+    async function loadOpsTrends() {
+      const monitorData = await fetch('/api/ops/monitor-failure-trends').then(r => r.json()).catch(() => ({trends: []}));
+      const webhookData = await fetch('/api/ops/webhook-health-trends').then(r => r.json()).catch(() => ({webhooks: []}));
+
+      const monitorRows = toArray(monitorData, 'trends');
+      const monitorBody = document.getElementById('ops_monitor_failure_trends');
+      monitorBody.innerHTML = '';
+      if (!monitorRows.length) {
+        monitorBody.innerHTML = '<tr><td colspan="3">No failures recorded.</td></tr>';
+      }
+      for (const row of monitorRows) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${row.monitor_id}</td><td>${row.failures_last_24h || 0}</td><td>${row.failures_last_7d || 0}</td>`;
+        monitorBody.appendChild(tr);
+      }
+
+      const webhookRows = toArray(webhookData, 'webhooks');
+      const webhookBody = document.getElementById('ops_webhook_health_trends');
+      webhookBody.innerHTML = '';
+      if (!webhookRows.length) {
+        webhookBody.innerHTML = '<tr><td colspan="4">No webhook health data yet.</td></tr>';
+      }
+      for (const row of webhookRows) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${row.webhook_id}</td><td>${row.fail_streak || 0}</td><td>${row.last_status_code || '-'}</td><td>${row.recent_failures_24h || 0}</td>`;
+        webhookBody.appendChild(tr);
+      }
     }
 
     async function savePlan() {
@@ -349,6 +425,15 @@
     async function deleteWebhook(id) {
       await fetch(`/api/webhooks/${id}`, {method: 'DELETE'});
       await loadWebhooks();
+    }
+
+    async function testFirstWebhook() {
+      const hooks = await fetch('/api/webhooks').then(r => r.json()).catch(() => []);
+      if (!Array.isArray(hooks) || !hooks.length) {
+        alert('No webhooks available to test.');
+        return;
+      }
+      await testWebhook(hooks[0].id);
     }
 
     function selectedMonitorIds() {
