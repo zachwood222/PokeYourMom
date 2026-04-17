@@ -33,7 +33,13 @@ PLAN_LIMITS = {
     "pro": {"max_monitors": 100, "min_poll_seconds": 10},
     "team": {"max_monitors": 500, "min_poll_seconds": 5},
 }
-SUPPORTED_RETAILERS = {"walmart", "target", "bestbuy"}
+SUPPORTED_RETAILERS = {"walmart", "target", "bestbuy", "pokemoncenter"}
+RETAILER_ALIASES = {
+    "pokemon-center": "pokemoncenter",
+    "pokemon_center": "pokemoncenter",
+    "pokemon center": "pokemoncenter",
+    "pokemoncenter": "pokemoncenter",
+}
 
 DEFAULT_WORKSPACE = {
     "name": "My Workspace",
@@ -347,10 +353,13 @@ def get_workspace_from_auth() -> sqlite3.Row:
 
 
 def _token_from_request() -> str | None:
+    api_token = (request.headers.get("X-API-Token") or "").strip()
+    if api_token:
+        return api_token
     auth_header = (request.headers.get("Authorization") or "").strip()
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
-    return (request.headers.get("X-API-Token") or "").strip() or None
+    return None
 
 
 def _set_auth_context(user: sqlite3.Row | dict[str, Any], workspace: sqlite3.Row) -> None:
@@ -388,6 +397,28 @@ def add_correlation_id_header(response):
     return response
 
 
+def user_is_workspace_owner(user_id: int, workspace_id: int) -> bool:
+    conn = db()
+    row = conn.execute(
+        """
+        select 1 from workspace_members
+        where user_id = ? and workspace_id = ? and role = 'owner'
+        limit 1
+        """,
+        (user_id, workspace_id),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def ensure_workspace_owner() -> tuple[dict[str, str], int] | None:
+    user = getattr(g, "current_user", None)
+    workspace_id = current_workspace_id()
+    if not user or not user_is_workspace_owner(int(user["id"]), workspace_id):
+        return jsonify({"error": "Workspace owner access required"}), 403
+    return None
+
+
 def enforce_plan_limits(workspace_id: int, poll_interval_seconds: int) -> None:
     workspace = get_workspace(workspace_id)
     limits = PLAN_LIMITS[workspace["plan"]]
@@ -419,10 +450,18 @@ def extract_price_cents(text: str) -> int | None:
     return min(values) if values else None
 
 
-def evaluate_page(html: str, keyword: str | None = None) -> MonitorResult:
+def canonical_retailer(retailer: str) -> str:
+    value = retailer.strip().lower()
+    return RETAILER_ALIASES.get(value, value)
+
+
+def evaluate_page(
+    html: str, keyword: str | None = None, retailer: str | None = None
+) -> MonitorResult:
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
     title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "Product"
     text = re.sub(r"<[^>]+>", " ", html).lower()
+    normalized_retailer = canonical_retailer(retailer) if retailer else None
 
     out_markers = [
         "out of stock",
@@ -439,6 +478,18 @@ def evaluate_page(html: str, keyword: str | None = None) -> MonitorResult:
         "pickup",
         "ship it",
     ]
+    if normalized_retailer == "pokemoncenter":
+        out_markers.extend(
+            [
+                "notify me when available",
+                "currently unavailable",
+            ]
+        )
+        in_markers.extend(
+            [
+                "add to bag",
+            ]
+        )
 
     has_out = any(m in text for m in out_markers)
     has_in = any(m in text for m in in_markers)
@@ -466,7 +517,7 @@ def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
     r = requests.get(monitor["product_url"], headers=headers, timeout=15)
     r.raise_for_status()
     keyword = (monitor["keyword"] or "").strip() or None
-    return evaluate_page(r.text, keyword=keyword)
+    return evaluate_page(r.text, keyword=keyword, retailer=monitor["retailer"])
 
 
 def alert_eligibility(monitor: sqlite3.Row, result: MonitorResult) -> bool:
@@ -805,7 +856,7 @@ def api_meta_check_update():
 @require_auth
 def api_workspace():
     row = get_workspace(current_workspace_id())
-    return jsonify({"workspace": dict(row), "user": dict(getattr(g, "current_user", {}))})
+    return jsonify({"workspace": dict(row), "user": dict(g.current_user)})
 
 
 @app.post("/api/workspace/plan")
@@ -941,8 +992,7 @@ def api_ops_metrics():
 def api_create_monitor():
     body = request.json or {}
     try:
-        workspace = get_workspace_from_auth()
-        retailer = body["retailer"].strip().lower()
+        retailer = canonical_retailer(body["retailer"])
         url = body["product_url"].strip()
         poll_interval = int(body.get("poll_interval_seconds", 20))
         keyword = (body.get("keyword") or "").strip() or None
@@ -989,10 +1039,6 @@ def api_update_monitor(monitor_id: int):
     enabled = body.get("enabled")
     if enabled is None:
         return jsonify({"error": "enabled is required"}), 400
-    try:
-        workspace = get_workspace_from_auth()
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
     conn = db()
     conn.execute(
         "update monitors set enabled = ? where id = ? and workspace_id = ?",
@@ -1068,7 +1114,9 @@ def api_events():
 @app.post("/api/webhooks")
 @require_auth
 def api_add_webhook():
-    workspace_id = get_workspace_id_for_request()
+    owner_error = ensure_workspace_owner()
+    if owner_error:
+        return owner_error
     body = request.json or {}
     name = (body.get("name") or "Discord").strip()
     url = (body.get("webhook_url") or "").strip()
@@ -1078,10 +1126,6 @@ def api_add_webhook():
     if not url.startswith("https://discord.com/api/webhooks/"):
         return jsonify({"error": "Invalid Discord webhook URL"}), 400
 
-    try:
-        workspace = get_workspace_from_auth()
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
     conn = db()
     cur = conn.execute(
         """
@@ -1099,7 +1143,9 @@ def api_add_webhook():
 @app.get("/api/webhooks")
 @require_auth
 def api_list_webhooks():
-    workspace_id = get_workspace_id_for_request()
+    owner_error = ensure_workspace_owner()
+    if owner_error:
+        return owner_error
     conn = db()
     rows = conn.execute(
         "select * from webhooks where workspace_id = ? order by id desc",
@@ -1112,7 +1158,9 @@ def api_list_webhooks():
 @app.post("/api/webhooks/<int:webhook_id>/test")
 @require_auth
 def api_test_webhook(webhook_id: int):
-    workspace_id = get_workspace_id_for_request()
+    owner_error = ensure_workspace_owner()
+    if owner_error:
+        return owner_error
     conn = db()
     hook = conn.execute(
         "select * from webhooks where id = ? and workspace_id = ?",
@@ -1154,7 +1202,9 @@ def api_test_webhook(webhook_id: int):
 @app.patch("/api/webhooks/<int:webhook_id>")
 @require_auth
 def api_update_webhook(webhook_id: int):
-    workspace_id = get_workspace_id_for_request()
+    owner_error = ensure_workspace_owner()
+    if owner_error:
+        return owner_error
     body = request.json or {}
     fields: list[tuple[str, Any]] = []
     if "enabled" in body:
@@ -1167,10 +1217,6 @@ def api_update_webhook(webhook_id: int):
         fields.append(("notify_restock_only", int(bool(body["notify_restock_only"]))))
     if not fields:
         return jsonify({"error": "No mutable fields provided"}), 400
-    try:
-        workspace = get_workspace_from_auth()
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
     conn = db()
     for key, value in fields:
         conn.execute(
@@ -1191,14 +1237,18 @@ def api_update_webhook(webhook_id: int):
 @app.delete("/api/webhooks/<int:webhook_id>")
 @require_auth
 def api_delete_webhook(webhook_id: int):
-    workspace_id = get_workspace_id_for_request()
+    owner_error = ensure_workspace_owner()
+    if owner_error:
+        return owner_error
     conn = db()
-    conn.execute(
+    cur = conn.execute(
         "delete from webhooks where id = ? and workspace_id = ?",
         (webhook_id, current_workspace_id()),
     )
     conn.commit()
     conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Webhook not found"}), 404
     return jsonify({"ok": True})
 
 

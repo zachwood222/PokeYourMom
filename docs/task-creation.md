@@ -4,7 +4,8 @@ A **task** maps to a monitor row in the `monitors` table.
 
 ## Required fields
 
-- `retailer`: one of `walmart`, `target`, `bestbuy`
+- `retailer`: one of `walmart`, `target`, `bestbuy`, `pokemoncenter`
+  - aliases accepted for Pokemon Center: `pokemon-center`, `pokemon_center`, `pokemon center`
 - `product_url`: must start with `http://` or `https://`
 - `poll_interval_seconds`: integer > 0 and must satisfy plan minimum
 
