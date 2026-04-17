@@ -751,9 +751,8 @@ def api_list_monitors():
     workspace_id = get_workspace_id_for_request()
     conn = db()
     rows = conn.execute(
-        "select * from monitors where workspace_id = ? order by id desc", (workspace_id,)
         "select * from monitors where workspace_id = ? order by id desc",
-        (current_workspace_id(),),
+        (workspace_id,),
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
@@ -769,14 +768,6 @@ def api_dashboard_summary():
     ).fetchone()["c"]
     enabled_monitors = conn.execute(
         "select count(*) as c from monitors where workspace_id = ? and enabled = 1", (workspace_id,)
-    workspace_id = current_workspace_id()
-    total_monitors = conn.execute(
-        "select count(*) as c from monitors where workspace_id = ?",
-        (workspace_id,),
-    ).fetchone()["c"]
-    enabled_monitors = conn.execute(
-        "select count(*) as c from monitors where enabled = 1 and workspace_id = ?",
-        (workspace_id,),
     ).fetchone()["c"]
     checks_last_24h = conn.execute(
         """
@@ -785,8 +776,6 @@ def api_dashboard_summary():
           and last_checked_at is not null
           and datetime(last_checked_at) >= datetime('now', '-1 day')
         """,
-        """
-        ,
         (workspace_id,),
     ).fetchone()["c"]
     latest_check = conn.execute(
@@ -797,7 +786,6 @@ def api_dashboard_summary():
         """
         select count(*) as c from events e
         join monitors m on m.id = e.monitor_id
-        where m.workspace_id = ? and datetime(event_time) >= datetime('now', '-1 day')
         where m.workspace_id = ?
           and datetime(e.event_time) >= datetime('now', '-1 day')
         """,
@@ -807,7 +795,6 @@ def api_dashboard_summary():
         """
         select count(*) as c from events e
         join monitors m on m.id = e.monitor_id
-        where m.workspace_id = ? and datetime(event_time) >= datetime('now', '-7 day')
         where m.workspace_id = ?
           and datetime(e.event_time) >= datetime('now', '-7 day')
         """,
