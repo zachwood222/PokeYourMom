@@ -35,6 +35,7 @@ DEFAULT_WORKSPACE = {
     "name": "My Workspace",
     "plan": DEFAULT_PLAN if DEFAULT_PLAN in PLAN_LIMITS else "basic",
 }
+DEFAULT_WORKSPACE_ID = 1
 
 running = False
 monitor_thread: threading.Thread | None = None
@@ -187,6 +188,19 @@ def get_workspace(workspace_id: int = 1) -> sqlite3.Row:
     if not row:
         raise ValueError("Workspace not found")
     return row
+
+
+def current_workspace_id() -> int:
+    return DEFAULT_WORKSPACE_ID
+
+
+def get_monitor_for_workspace(
+    conn: sqlite3.Connection, monitor_id: int, workspace_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (monitor_id, workspace_id),
+    ).fetchone()
 
 
 def enforce_plan_limits(workspace_id: int, poll_interval_seconds: int) -> None:
@@ -530,7 +544,7 @@ def api_meta_check_update():
 
 @app.get("/api/workspace")
 def api_workspace():
-    row = get_workspace(1)
+    row = get_workspace(current_workspace_id())
     return jsonify(dict(row))
 
 
@@ -540,7 +554,7 @@ def api_update_plan():
     if plan not in PLAN_LIMITS:
         return jsonify({"error": "Invalid plan"}), 400
     conn = db()
-    conn.execute("update workspaces set plan = ? where id = 1", (plan,))
+    conn.execute("update workspaces set plan = ? where id = ?", (plan, current_workspace_id()))
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "plan": plan})
@@ -548,8 +562,12 @@ def api_update_plan():
 
 @app.get("/api/monitors")
 def api_list_monitors():
+    workspace_id = current_workspace_id()
     conn = db()
-    rows = conn.execute("select * from monitors order by id desc").fetchall()
+    rows = conn.execute(
+        "select * from monitors where workspace_id = ? order by id desc",
+        (workspace_id,),
+    ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
@@ -622,7 +640,8 @@ def api_create_monitor():
         if not (url.startswith("http://") or url.startswith("https://")):
             raise ValueError("product_url must start with http:// or https://")
 
-        enforce_plan_limits(1, poll_interval)
+        workspace_id = current_workspace_id()
+        enforce_plan_limits(workspace_id, poll_interval)
     except (KeyError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -630,9 +649,9 @@ def api_create_monitor():
     cur = conn.execute(
         """
         insert into monitors(workspace_id, retailer, product_url, keyword, max_price_cents, msrp_cents, poll_interval_seconds, created_at)
-        values (1, ?, ?, ?, ?, ?, ?, ?)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (retailer, url, keyword, max_price_cents, msrp_cents, poll_interval, utc_now()),
+        (workspace_id, retailer, url, keyword, max_price_cents, msrp_cents, poll_interval, utc_now()),
     )
     conn.commit()
     monitor_id = cur.lastrowid
@@ -647,20 +666,31 @@ def api_update_monitor(monitor_id: int):
     enabled = body.get("enabled")
     if enabled is None:
         return jsonify({"error": "enabled is required"}), 400
+    workspace_id = current_workspace_id()
     conn = db()
-    conn.execute("update monitors set enabled = ? where id = ?", (int(bool(enabled)), monitor_id))
-    conn.commit()
-    row = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
-    conn.close()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     if not row:
+        conn.close()
         return jsonify({"error": "Monitor not found"}), 404
+    conn.execute(
+        "update monitors set enabled = ? where id = ? and workspace_id = ?",
+        (int(bool(enabled)), monitor_id, workspace_id),
+    )
+    conn.commit()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    conn.close()
     return jsonify(dict(row))
 
 
 @app.delete("/api/monitors/<int:monitor_id>")
 def api_delete_monitor(monitor_id: int):
+    workspace_id = current_workspace_id()
     conn = db()
-    conn.execute("delete from monitors where id = ?", (monitor_id,))
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+    conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -668,8 +698,9 @@ def api_delete_monitor(monitor_id: int):
 
 @app.post("/api/monitors/<int:monitor_id>/check")
 def api_check_monitor(monitor_id: int):
+    workspace_id = current_workspace_id()
     conn = db()
-    row = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
     if not row:
         return jsonify({"error": "Monitor not found"}), 404

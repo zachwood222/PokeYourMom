@@ -161,3 +161,75 @@ def test_init_db_migrates_existing_monitors_table_with_msrp_column(tmp_path, mon
     conn.close()
 
     assert "msrp_cents" in columns
+
+
+def test_list_monitors_only_returns_current_workspace(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other Workspace', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace_id = conn.execute(
+        "select id from workspaces where name = 'Other Workspace' order by id desc limit 1"
+    ).fetchone()["id"]
+    conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/w1', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'target', 'https://example.com/w2', 20, ?)
+        """,
+        (other_workspace_id, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/monitors")
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert len(payload) == 1
+    assert payload[0]["workspace_id"] == 1
+
+
+def test_cross_tenant_update_delete_and_check_return_not_found(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other Workspace', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace_id = conn.execute(
+        "select id from workspaces where name = 'Other Workspace' order by id desc limit 1"
+    ).fetchone()["id"]
+    cur = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'target', 'https://example.com/not-mine', 20, ?)
+        """,
+        (other_workspace_id, app_module.utc_now()),
+    )
+    other_monitor_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    update_resp = client.patch(f"/api/monitors/{other_monitor_id}", json={"enabled": False})
+    delete_resp = client.delete(f"/api/monitors/{other_monitor_id}")
+    check_resp = client.post(f"/api/monitors/{other_monitor_id}/check")
+
+    assert update_resp.status_code == 404
+    assert update_resp.get_json()["error"] == "Monitor not found"
+    assert delete_resp.status_code == 404
+    assert delete_resp.get_json()["error"] == "Monitor not found"
+    assert check_resp.status_code == 404
+    assert check_resp.get_json()["error"] == "Monitor not found"
