@@ -514,11 +514,9 @@ def api_create_monitor():
             msrp_cents = int(msrp_cents)
 
         if retailer not in SUPPORTED_RETAILERS:
-            raise ValueError(f"Unsupported retailer '{retailer}'")
+            raise ValueError(f"Unsupported retailer: {retailer}")
         if not (url.startswith("http://") or url.startswith("https://")):
             raise ValueError("product_url must start with http:// or https://")
-        if poll_interval <= 0:
-            raise ValueError("poll_interval_seconds must be > 0")
 
         enforce_plan_limits(1, poll_interval)
     except (KeyError, ValueError) as exc:
