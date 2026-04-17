@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -44,10 +45,18 @@ class MonitorResult:
     title: str
     status_text: str
 
+@dataclass
+class MonitorResult:
+    in_stock: bool
+    price_cents: int | None
+    title: str
+    status_text: str
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 def log(message: str) -> None:
     entry = f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] {message}"
@@ -224,11 +233,6 @@ def dedupe_key(monitor: sqlite3.Row, result: MonitorResult) -> str:
 def create_event_and_deliver(monitor: sqlite3.Row, result: MonitorResult) -> None:
     if not result.in_stock:
         return
-    if monitor["keyword"] and monitor["keyword"].lower() not in result.title.lower():
-        return
-    if monitor["max_price_cents"] is not None and result.price_cents is not None:
-        if result.price_cents > monitor["max_price_cents"]:
-            return
 
     key = dedupe_key(monitor, result)
     conn = db()
@@ -365,9 +369,6 @@ def monitor_loop() -> None:
     log("⏹️ Monitor loop stopped")
 
 
-init_db()
-
-
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -409,11 +410,7 @@ def api_create_monitor():
     body = request.json or {}
     try:
         retailer = body["retailer"].strip().lower()
-        if retailer not in SUPPORTED_RETAILERS:
-            raise ValueError(f"Unsupported retailer: {retailer}")
         url = body["product_url"].strip()
-        if not url.startswith(("https://", "http://")):
-            raise ValueError("product_url must start with http:// or https://")
         poll_interval = int(body.get("poll_interval_seconds", 20))
         keyword = (body.get("keyword") or "").strip() or None
         max_price_cents = body.get("max_price_cents")
@@ -553,5 +550,6 @@ def api_stop():
 
 
 if __name__ == "__main__":
+    init_db()
     log("⚠️ Legal/ethical note: this project provides stock monitoring + alerts only. Auto-checkout is intentionally not implemented.")
     socketio.run(app, host="0.0.0.0", port=5000)

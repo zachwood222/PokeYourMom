@@ -24,12 +24,6 @@ python app.py
 
 Then open `http://localhost:5000`.
 
-## Run tests
-
-```bash
-pytest -q
-```
-
 ## API quick start
 
 - `POST /api/webhooks` to add Discord webhook.
