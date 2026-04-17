@@ -537,6 +537,63 @@ def cents_to_dollars(cents: int | None) -> str:
     return f"${cents / 100:.2f}"
 
 
+def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return dict(row)
+
+
+def should_send_to_webhook(monitor: sqlite3.Row, hook: sqlite3.Row, eligible: bool) -> bool:
+    if not hook["enabled"]:
+        return False
+    if eligible and not hook["notify_success"]:
+        return False
+    if not eligible and not hook["notify_failures"]:
+        return False
+    if hook["notify_restock_only"] and monitor["last_in_stock"]:
+        return False
+    return True
+
+
+def update_webhook_health(
+    conn: sqlite3.Connection,
+    webhook_id: int,
+    status: str,
+    status_code: int | None = None,
+    error_text: str | None = None,
+    tested: bool = False,
+) -> None:
+    now_iso = utc_now()
+    tested_at = now_iso if tested else None
+    conn.execute(
+        """
+        update webhooks
+        set last_tested_at = coalesce(?, last_tested_at),
+            last_test_status = coalesce(?, last_test_status),
+            last_delivery_status = ?,
+            last_delivery_at = ?,
+            fail_streak = case when ? = 'failed' then fail_streak + 1 else 0 end,
+            last_error = ?,
+            last_status_code = ?
+        where id = ?
+        """,
+        (
+            tested_at,
+            status if tested else None,
+            status,
+            now_iso,
+            status,
+            (error_text or "")[:500] if error_text else None,
+            status_code,
+            webhook_id,
+        ),
+    )
+
+
+def create_monitor_error_events(monitor: sqlite3.Row, error_text: str) -> None:
+    log(f"⚠️ Monitor {monitor['id']} error event: {error_text[:200]}")
+
+
 def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
     try:
         result = fetch_monitor(monitor)
@@ -796,6 +853,7 @@ def api_dashboard_summary():
 def api_create_monitor():
     body = request.json or {}
     try:
+        workspace = get_workspace_from_auth()
         retailer = body["retailer"].strip().lower()
         url = body["product_url"].strip()
         poll_interval = int(body.get("poll_interval_seconds", 20))
@@ -843,6 +901,10 @@ def api_update_monitor(monitor_id: int):
     enabled = body.get("enabled")
     if enabled is None:
         return jsonify({"error": "enabled is required"}), 400
+    try:
+        workspace = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     conn = db()
     conn.execute(
         "update monitors set enabled = ? where id = ? and workspace_id = ?",
@@ -920,6 +982,10 @@ def api_add_webhook():
     if not url.startswith("https://discord.com/api/webhooks/"):
         return jsonify({"error": "Invalid Discord webhook URL"}), 400
 
+    try:
+        workspace = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     conn = db()
     cur = conn.execute(
         """
@@ -1005,6 +1071,10 @@ def api_update_webhook(webhook_id: int):
         fields.append(("notify_restock_only", int(bool(body["notify_restock_only"]))))
     if not fields:
         return jsonify({"error": "No mutable fields provided"}), 400
+    try:
+        workspace = get_workspace_from_auth()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     conn = db()
     for key, value in fields:
         conn.execute(
