@@ -20,6 +20,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 POLL_LOOP_SECONDS = int(os.getenv("POLL_LOOP_SECONDS", "15"))
 DEFAULT_PLAN = os.getenv("DEFAULT_PLAN", "basic")
+POKEMON_MSRP_BUFFER_CENTS = int(os.getenv("POKEMON_MSRP_BUFFER_CENTS", "1000"))
 
 PLAN_LIMITS = {
     "basic": {"max_monitors": 20, "min_poll_seconds": 20},
@@ -45,6 +46,7 @@ class MonitorResult:
     status_text: str
     keyword_matched: bool | None = None
     price_within_limit: bool | None = None
+    within_msrp_delta: bool | None = None
 
 
 def utc_now() -> str:
@@ -133,6 +135,10 @@ def init_db() -> None:
             (DEFAULT_WORKSPACE["name"], DEFAULT_WORKSPACE["plan"], utc_now()),
         )
         log("✅ Initialized default workspace")
+    conn.commit()
+    monitor_columns = {r["name"] for r in conn.execute("pragma table_info(monitors)").fetchall()}
+    if "msrp_cents" not in monitor_columns:
+        conn.execute("alter table monitors add column msrp_cents integer")
     conn.commit()
     conn.close()
 
@@ -241,7 +247,19 @@ def alert_eligibility(monitor: sqlite3.Row, result: MonitorResult) -> bool:
         result.price_within_limit = result.price_cents is not None and result.price_cents <= max_price_cents
         price_ok = bool(result.price_within_limit)
 
-    return keyword_ok and price_ok
+    keyword = (monitor["keyword"] or "").strip().lower()
+    msrp_cents = monitor["msrp_cents"]
+    if "pokemon" in keyword and msrp_cents is not None:
+        result.within_msrp_delta = (
+            result.price_cents is not None
+            and result.price_cents <= (msrp_cents + POKEMON_MSRP_BUFFER_CENTS)
+        )
+        msrp_ok = bool(result.within_msrp_delta)
+    else:
+        result.within_msrp_delta = None
+        msrp_ok = True
+
+    return keyword_ok and price_ok and msrp_ok
 
 
 def dedupe_key(monitor: sqlite3.Row, result: MonitorResult) -> str:
@@ -368,6 +386,7 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
         "price_cents": result.price_cents,
         "keyword_matched": result.keyword_matched,
         "price_within_limit": result.price_within_limit,
+        "within_msrp_delta": result.within_msrp_delta,
         "title": result.title,
     }
 
@@ -441,6 +460,9 @@ def api_create_monitor():
         max_price_cents = body.get("max_price_cents")
         if max_price_cents is not None:
             max_price_cents = int(max_price_cents)
+        msrp_cents = body.get("msrp_cents")
+        if msrp_cents is not None:
+            msrp_cents = int(msrp_cents)
 
         enforce_plan_limits(1, poll_interval)
     except (KeyError, ValueError) as exc:
@@ -449,10 +471,10 @@ def api_create_monitor():
     conn = db()
     cur = conn.execute(
         """
-        insert into monitors(workspace_id, retailer, product_url, keyword, max_price_cents, poll_interval_seconds, created_at)
-        values (1, ?, ?, ?, ?, ?, ?)
+        insert into monitors(workspace_id, retailer, product_url, keyword, max_price_cents, msrp_cents, poll_interval_seconds, created_at)
+        values (1, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (retailer, url, keyword, max_price_cents, poll_interval, utc_now()),
+        (retailer, url, keyword, max_price_cents, msrp_cents, poll_interval, utc_now()),
     )
     conn.commit()
     monitor_id = cur.lastrowid
