@@ -225,4 +225,162 @@ def test_api_routes_allow_authenticated_requests_and_include_context(tmp_path, m
 
     assert resp.status_code == 200
     assert payload["workspace"]["id"] == 1
-    assert payload["user"]["id"] == "local-dev"
+    assert payload["user"]["email"] == "owner@local.test"
+
+
+def test_events_are_workspace_scoped_no_cross_tenant_leakage(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    now_iso = app_module.utc_now()
+    conn.execute("insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)", (now_iso,))
+    other_workspace_id = conn.execute(
+        "select id from workspaces where name = 'Other' order by id desc limit 1"
+    ).fetchone()["id"]
+    conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'target', 'https://example.com/owned', 20, ?)
+        """,
+        (now_iso,),
+    )
+    own_monitor_id = conn.execute("select id from monitors where workspace_id = 1").fetchone()["id"]
+    conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'walmart', 'https://example.com/other', 20, ?)
+        """,
+        (other_workspace_id, now_iso),
+    )
+    other_monitor_id = conn.execute(
+        "select id from monitors where workspace_id = ?",
+        (other_workspace_id,),
+    ).fetchone()["id"]
+    conn.execute(
+        """
+        insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+        values (?, 'in_stock', 'owned event', 'https://example.com/owned', 'target', 1999, ?, 'owned-key')
+        """,
+        (own_monitor_id, now_iso),
+    )
+    conn.execute(
+        """
+        insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+        values (?, 'in_stock', 'other event', 'https://example.com/other', 'walmart', 2999, ?, 'other-key')
+        """,
+        (other_monitor_id, now_iso),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/events", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert len(payload) == 1
+    assert payload[0]["title"] == "owned event"
+
+
+def test_structured_log_formatter_shape_and_socket_payload(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    emitted = []
+
+    monkeypatch.setattr(app_module.socketio, "emit", lambda event, payload: emitted.append((event, payload)))
+
+    entry = app_module.format_log_entry(
+        level="INFO",
+        message="hello",
+        workspace_id=123,
+        monitor_id=456,
+        correlation_id="corr-1",
+    )
+
+    assert set(entry.keys()) == {
+        "timestamp",
+        "level",
+        "message",
+        "workspace_id",
+        "monitor_id",
+        "correlation_id",
+    }
+    assert entry["level"] == "info"
+    assert entry["workspace_id"] == 123
+    assert entry["monitor_id"] == 456
+    assert entry["correlation_id"] == "corr-1"
+
+    app_module.log("test message", workspace_id=123, monitor_id=456, correlation_id="corr-1")
+    assert emitted
+    event_name, payload = emitted[-1]
+    assert event_name == "log"
+    assert payload["message"] == "test message"
+    assert payload["workspace_id"] == 123
+    assert payload["monitor_id"] == 456
+    assert payload["correlation_id"] == "corr-1"
+
+
+def test_correlation_id_header_present_and_consistent(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    emitted = []
+
+    monkeypatch.setattr(app_module.socketio, "emit", lambda event, payload: emitted.append((event, payload)))
+    correlation_id = "corr-test-123"
+    resp = client.get("/api/workspace", headers={**_auth_headers(), "X-Correlation-ID": correlation_id})
+
+    assert resp.status_code == 200
+    assert resp.headers["X-Correlation-ID"] == correlation_id
+
+    with app_module.app.test_request_context("/api/workspace"):
+        app_module.g.correlation_id = correlation_id
+        app_module.log("inside request")
+    assert emitted[-1][1]["correlation_id"] == correlation_id
+
+
+def test_ops_metrics_endpoint_schema_and_non_negative_values(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    now_iso = app_module.utc_now()
+    conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, last_checked_at, failure_streak, created_at)
+        values (1, 'target', 'https://example.com/1', 20, ?, 1, ?)
+        """,
+        (now_iso, now_iso),
+    )
+    monitor_id = conn.execute("select id from monitors order by id desc limit 1").fetchone()["id"]
+    conn.execute(
+        """
+        insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+        values (?, 'in_stock', 'event', 'https://example.com/1', 'target', 1499, ?, 'metrics-event-key')
+        """,
+        (monitor_id, now_iso),
+    )
+    event_id = conn.execute("select id from events where dedupe_key = 'metrics-event-key'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into deliveries(event_id, webhook_id, status, delivered_at)
+        values (?, 1, 'sent', ?), (?, 1, 'failed', ?)
+        """,
+        (event_id, now_iso, event_id, now_iso),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ops/metrics", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    expected_keys = {
+        "checks_total",
+        "checks_failed_total",
+        "alerts_created_total",
+        "webhook_sent_total",
+        "webhook_failed_total",
+    }
+    assert set(payload.keys()) == expected_keys
+    for key in expected_keys:
+        assert isinstance(payload[key], int)
+        assert payload[key] >= 0

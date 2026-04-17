@@ -11,9 +11,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Any
+from uuid import uuid4
 
 import requests
-from flask import Flask, g, jsonify, render_template, request
+from flask import Flask, g, has_request_context, jsonify, render_template, request
 from flask_socketio import SocketIO
 
 app = Flask(__name__)
@@ -66,10 +67,47 @@ class MonitorResult:
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def log(message: str) -> None:
-    entry = f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] {message}"
-    print(entry)
-    socketio.emit("log", {"message": entry})
+
+def format_log_entry(
+    level: str,
+    message: str,
+    workspace_id: int | None = None,
+    monitor_id: int | None = None,
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    inferred_workspace_id = workspace_id
+    inferred_correlation_id = correlation_id
+    if inferred_workspace_id is None and has_request_context():
+        inferred_workspace_id = getattr(g, "workspace_id", None)
+    if inferred_correlation_id is None and has_request_context():
+        inferred_correlation_id = getattr(g, "correlation_id", None)
+    return {
+        "timestamp": utc_now(),
+        "level": level.lower(),
+        "message": message,
+        "workspace_id": inferred_workspace_id,
+        "monitor_id": monitor_id,
+        "correlation_id": inferred_correlation_id,
+    }
+
+
+def log(
+    message: str,
+    *,
+    level: str = "info",
+    workspace_id: int | None = None,
+    monitor_id: int | None = None,
+    correlation_id: str | None = None,
+) -> None:
+    entry = format_log_entry(
+        level=level,
+        message=message,
+        workspace_id=workspace_id,
+        monitor_id=monitor_id,
+        correlation_id=correlation_id,
+    )
+    print(json.dumps(entry, sort_keys=True))
+    socketio.emit("log", entry)
 
 
 def db() -> sqlite3.Connection:
@@ -275,14 +313,10 @@ def resolve_user_from_request() -> sqlite3.Row | None:
 def require_auth(view_func):
     @wraps(view_func)
     def wrapped(*args, **kwargs):
-        user = resolve_user_from_request()
-        if not user:
+        user = getattr(g, "current_user", None)
+        workspace_id = getattr(g, "workspace_id", None)
+        if not user or workspace_id is None:
             return jsonify({"error": "Unauthorized"}), 401
-        workspace = get_workspace_for_user(user["id"])
-        if not workspace:
-            return jsonify({"error": "No workspace membership found"}), 403
-        g.current_user = user
-        g.workspace_id = workspace["id"]
         return view_func(*args, **kwargs)
 
     return wrapped
@@ -308,6 +342,10 @@ def get_workspace_id_for_request() -> int:
     return int(get_workspace_for_request()["id"])
 
 
+def get_workspace_from_auth() -> sqlite3.Row:
+    return get_workspace(current_workspace_id())
+
+
 def _token_from_request() -> str | None:
     auth_header = (request.headers.get("Authorization") or "").strip()
     if auth_header.lower().startswith("bearer "):
@@ -315,16 +353,39 @@ def _token_from_request() -> str | None:
     return (request.headers.get("X-API-Token") or "").strip() or None
 
 
+def _set_auth_context(user: sqlite3.Row | dict[str, Any], workspace: sqlite3.Row) -> None:
+    g.current_user = dict(user)
+    g.workspace_id = int(workspace["id"])
+    g.current_workspace = workspace
+
+
 @app.before_request
 def require_api_auth() -> tuple[dict[str, str], int] | None:
+    incoming_correlation_id = (request.headers.get("X-Correlation-ID") or "").strip()
+    g.correlation_id = incoming_correlation_id or str(uuid4())
     if not request.path.startswith("/api/"):
         return None
+    user = resolve_user_from_request()
+    if user:
+        workspace = get_workspace_for_user(user["id"])
+        if not workspace:
+            return jsonify({"error": "No workspace membership found"}), 403
+        _set_auth_context(user, workspace)
+        return None
+
     token = _token_from_request()
-    if not token or token != API_AUTH_TOKEN:
-        return jsonify({"error": "Unauthorized"}), 401
-    g.current_user = dict(DEFAULT_USER)
-    g.current_workspace = get_workspace(1)
-    return None
+    if token and token == API_AUTH_TOKEN:
+        _set_auth_context(DEFAULT_USER, get_workspace(1))
+        return None
+    return jsonify({"error": "Unauthorized"}), 401
+
+
+@app.after_request
+def add_correlation_id_header(response):
+    correlation_id = getattr(g, "correlation_id", None)
+    if correlation_id:
+        response.headers["X-Correlation-ID"] = correlation_id
+    return response
 
 
 def enforce_plan_limits(workspace_id: int, poll_interval_seconds: int) -> None:
@@ -528,7 +589,12 @@ def create_event_and_deliver(
 
     conn.commit()
     conn.close()
-    log(f"🚨 In-stock event emitted for monitor {monitor['id']} ({monitor['retailer']})")
+    log(
+        f"In-stock event emitted for monitor {monitor['id']} ({monitor['retailer']})",
+        level="warning",
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+    )
 
 
 def cents_to_dollars(cents: int | None) -> str:
@@ -591,7 +657,12 @@ def update_webhook_health(
 
 
 def create_monitor_error_events(monitor: sqlite3.Row, error_text: str) -> None:
-    log(f"⚠️ Monitor {monitor['id']} error event: {error_text[:200]}")
+    log(
+        f"Monitor {monitor['id']} error event: {error_text[:200]}",
+        level="warning",
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+    )
 
 
 def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
@@ -610,7 +681,12 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
         conn.commit()
         conn.close()
         create_monitor_error_events(monitor, str(exc))
-        log(f"⚠️ Monitor {monitor['id']} fetch failed: {exc}")
+        log(
+            f"Monitor {monitor['id']} fetch failed: {exc}",
+            level="error",
+            workspace_id=monitor["workspace_id"],
+            monitor_id=monitor["id"],
+        )
         return {"ok": False, "error": str(exc)}
 
     eligible = alert_eligibility(monitor, result)
@@ -630,7 +706,9 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
     create_event_and_deliver(monitor, result, eligible)
 
     log(
-        f"✅ Checked monitor {monitor['id']} | {monitor['retailer']} | {result.status_text} | {cents_to_dollars(result.price_cents)}"
+        f"Checked monitor {monitor['id']} | {monitor['retailer']} | {result.status_text} | {cents_to_dollars(result.price_cents)}",
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
     )
     return {
         "ok": True,
@@ -661,12 +739,12 @@ def apply_due_schedules(conn: sqlite3.Connection) -> None:
         )
         conn.execute("update monitor_schedules set applied_at = ? where id = ?", (now_iso, row["id"]))
         log(
-            f"🗓️ Applied schedule {row['id']} for monitor {row['monitor_id']} (poll={row['new_poll_interval_seconds']}s)"
+            f"Applied schedule {row['id']} for monitor {row['monitor_id']} (poll={row['new_poll_interval_seconds']}s)"
         )
 
 
 def monitor_loop() -> None:
-    log("▶️ Monitor loop started")
+    log("Monitor loop started")
     while running:
         with lock:
             conn = db()
@@ -685,7 +763,7 @@ def monitor_loop() -> None:
                 check_monitor_once(m)
 
         time.sleep(POLL_LOOP_SECONDS)
-    log("⏹️ Monitor loop stopped")
+    log("Monitor loop stopped")
 
 
 @app.route("/")
@@ -727,7 +805,7 @@ def api_meta_check_update():
 @require_auth
 def api_workspace():
     row = get_workspace(current_workspace_id())
-    return jsonify(dict(row))
+    return jsonify({"workspace": dict(row), "user": dict(getattr(g, "current_user", {}))})
 
 
 @app.post("/api/workspace/plan")
@@ -833,6 +911,29 @@ def api_dashboard_summary():
             "running": running,
         }
     )
+
+
+@app.get("/api/ops/metrics")
+@require_auth
+def api_ops_metrics():
+    conn = db()
+    metrics = {
+        "checks_total": conn.execute(
+            "select count(*) as c from monitors where last_checked_at is not null"
+        ).fetchone()["c"],
+        "checks_failed_total": conn.execute(
+            "select count(*) as c from monitors where failure_streak > 0"
+        ).fetchone()["c"],
+        "alerts_created_total": conn.execute("select count(*) as c from events").fetchone()["c"],
+        "webhook_sent_total": conn.execute(
+            "select count(*) as c from deliveries where status = 'sent'"
+        ).fetchone()["c"],
+        "webhook_failed_total": conn.execute(
+            "select count(*) as c from deliveries where status = 'failed'"
+        ).fetchone()["c"],
+    }
+    conn.close()
+    return jsonify(metrics)
 
 
 @app.post("/api/monitors")
@@ -958,7 +1059,7 @@ def api_events():
         order by e.id desc limit 100
         """
         ,
-        (current_workspace_id(),),
+        (workspace_id,),
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
@@ -1205,5 +1306,8 @@ def api_stop():
 
 if __name__ == "__main__":
     init_db()
-    log("⚠️ Legal/ethical note: this project provides stock monitoring + alerts only. Auto-checkout is intentionally not implemented.")
+    log(
+        "Legal/ethical note: this project provides stock monitoring + alerts only. Auto-checkout is intentionally not implemented.",
+        level="warning",
+    )
     socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
