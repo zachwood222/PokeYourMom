@@ -877,4 +877,4 @@ def api_stop():
 if __name__ == "__main__":
     init_db()
     log("⚠️ Legal/ethical note: this project provides stock monitoring + alerts only. Auto-checkout is intentionally not implemented.")
-    socketio.run(app, host="0.0.0.0", port=5000)
+    socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
