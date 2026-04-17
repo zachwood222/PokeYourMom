@@ -512,6 +512,10 @@ def api_create_monitor():
         msrp_cents = body.get("msrp_cents")
         if msrp_cents is not None:
             msrp_cents = int(msrp_cents)
+        if retailer not in SUPPORTED_RETAILERS:
+            raise ValueError(f"Unsupported retailer '{retailer}'")
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise ValueError("product_url must be http(s)")
 
         if retailer not in SUPPORTED_RETAILERS:
             raise ValueError(f"Unsupported retailer: {retailer}")
