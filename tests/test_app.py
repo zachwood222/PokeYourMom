@@ -76,7 +76,11 @@ def test_keyword_and_max_price_filter_block_event(tmp_path, monkeypatch):
     conn.close()
 
     result_keyword_miss = app_module.MonitorResult(
-        in_stock=True, price_cents=2500, title="Sports Card Bundle", status_text="in_stock"
+        in_stock=True,
+        price_cents=2500,
+        title="Sports Card Bundle",
+        status_text="in_stock",
+        keyword_matched=False,
     )
     app_module.create_event_and_deliver(monitor, result_keyword_miss)
 
@@ -91,3 +95,18 @@ def test_keyword_and_max_price_filter_block_event(tmp_path, monkeypatch):
 
     assert event_count == 0
     assert posted_payloads == []
+
+
+def test_dashboard_summary_endpoint(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/dashboard/summary")
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["total_monitors"] == 0
+    assert payload["enabled_monitors"] == 0
+    assert payload["events_last_24h"] == 0
+    assert payload["events_last_7d"] == 0
+    assert payload["delivery_success_rate"] == 0.0

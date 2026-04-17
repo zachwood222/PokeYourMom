@@ -49,16 +49,6 @@ class MonitorResult:
     price_within_limit: bool | None = None
     within_msrp_delta: bool | None = None
 
-@dataclass
-class MonitorResult:
-    in_stock: bool
-    price_cents: int | None
-    title: str
-    status_text: str
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -277,7 +267,13 @@ def dedupe_key(monitor: sqlite3.Row, result: MonitorResult) -> str:
     return f"{monitor['id']}:{result.in_stock}:{bucket}:{minute}"
 
 
-def create_event_and_deliver(monitor: sqlite3.Row, result: MonitorResult, eligible: bool) -> None:
+def create_event_and_deliver(
+    monitor: sqlite3.Row,
+    result: MonitorResult,
+    eligible: bool | None = None,
+) -> None:
+    if eligible is None:
+        eligible = alert_eligibility(monitor, result)
     if not eligible:
         return
 
@@ -458,6 +454,50 @@ def api_list_monitors():
     return jsonify([dict(r) for r in rows])
 
 
+@app.get("/api/dashboard/summary")
+def api_dashboard_summary():
+    conn = db()
+    total_monitors = conn.execute("select count(*) as c from monitors").fetchone()["c"]
+    enabled_monitors = conn.execute(
+        "select count(*) as c from monitors where enabled = 1"
+    ).fetchone()["c"]
+    checks_last_24h = conn.execute(
+        """
+        select count(*) as c from monitors
+        where last_checked_at is not null
+          and datetime(last_checked_at) >= datetime('now', '-1 day')
+        """
+    ).fetchone()["c"]
+    latest_check = conn.execute(
+        "select max(last_checked_at) as latest_check from monitors"
+    ).fetchone()["latest_check"]
+    events_24h = conn.execute(
+        "select count(*) as c from events where datetime(event_time) >= datetime('now', '-1 day')"
+    ).fetchone()["c"]
+    events_7d = conn.execute(
+        "select count(*) as c from events where datetime(event_time) >= datetime('now', '-7 day')"
+    ).fetchone()["c"]
+    deliveries_total = conn.execute("select count(*) as c from deliveries").fetchone()["c"]
+    deliveries_sent = conn.execute(
+        "select count(*) as c from deliveries where status = 'sent'"
+    ).fetchone()["c"]
+    conn.close()
+
+    success_rate = 0.0 if deliveries_total == 0 else (deliveries_sent / deliveries_total)
+    return jsonify(
+        {
+            "total_monitors": total_monitors,
+            "enabled_monitors": enabled_monitors,
+            "checks_last_24h": checks_last_24h,
+            "latest_check_at": latest_check,
+            "events_last_24h": events_24h,
+            "events_last_7d": events_7d,
+            "delivery_success_rate": round(success_rate, 4),
+            "running": running,
+        }
+    )
+
+
 @app.post("/api/monitors")
 def api_create_monitor():
     body = request.json or {}
@@ -472,6 +512,13 @@ def api_create_monitor():
         msrp_cents = body.get("msrp_cents")
         if msrp_cents is not None:
             msrp_cents = int(msrp_cents)
+
+        if retailer not in SUPPORTED_RETAILERS:
+            raise ValueError(f"Unsupported retailer '{retailer}'")
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise ValueError("product_url must start with http:// or https://")
+        if poll_interval <= 0:
+            raise ValueError("poll_interval_seconds must be > 0")
 
         enforce_plan_limits(1, poll_interval)
     except (KeyError, ValueError) as exc:
