@@ -23,6 +23,9 @@
     .actions { display: flex; gap: 8px; }
     .actions button { width: auto; }
     .warn { color: #f7b955; font-size: 13px; }
+    .muted { color: #9fb0c1; font-size: 12px; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid #30363d; font-size:12px; }
+    .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
   </style>
 </head>
 <body>
@@ -51,11 +54,31 @@
         <input id="webhook_name" value="Main Discord" />
         <label>Webhook URL</label>
         <input id="webhook_url" placeholder="https://discord.com/api/webhooks/..." />
+        <div class="row3" style="margin-top:10px;">
+          <label><input id="notify_success" type="checkbox" checked /> Notify success</label>
+          <label><input id="notify_failures" type="checkbox" /> Notify failures</label>
+          <label><input id="notify_restock_only" type="checkbox" checked /> Restock only</label>
+        </div>
         <div class="actions" style="margin-top:10px;">
           <button onclick="addWebhook()">Add Webhook</button>
-          <button onclick="testFirstWebhook()">Test First Webhook</button>
         </div>
       </div>
+    </div>
+
+    <div class="card" style="margin-top:16px;">
+      <h2>Settings Metadata</h2>
+      <div id="meta" class="muted">Loading metadata...</div>
+      <div class="actions" style="margin-top:10px;">
+        <button onclick="checkUpdates()">Check for Updates</button>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px;">
+      <h2>Webhooks</h2>
+      <table>
+        <thead><tr><th>ID</th><th>Name</th><th>Prefs</th><th>Health</th><th>Actions</th></tr></thead>
+        <tbody id="webhooks"></tbody>
+      </table>
     </div>
 
     <div class="card" style="margin-top:16px;">
@@ -98,8 +121,27 @@
     <div class="card" style="margin-top:16px;">
       <h2>Monitors</h2>
       <table>
-        <thead><tr><th>ID</th><th>Retailer</th><th>URL</th><th>Last Checked</th><th>Last Alert State</th><th>Actions</th></tr></thead>
+        <thead><tr><th>ID</th><th>Pick</th><th>Retailer</th><th>URL</th><th>Last Checked</th><th>Last Alert State</th><th>Actions</th></tr></thead>
         <tbody id="monitors"></tbody>
+      </table>
+    </div>
+
+    <div class="card" style="margin-top:16px;">
+      <h2>Schedule Poll Changes</h2>
+      <div class="row">
+        <div>
+          <label>Run At (ISO UTC)</label>
+          <input id="schedule_run_at" placeholder="2026-04-17T20:30:00+00:00" />
+        </div>
+        <div>
+          <label>New Poll Interval Seconds</label>
+          <input id="schedule_poll" type="number" value="15" />
+        </div>
+      </div>
+      <button style="margin-top:10px;" onclick="createSchedule()">Create Schedule For Selected Monitors</button>
+      <table style="margin-top:10px;">
+        <thead><tr><th>ID</th><th>Monitor</th><th>Run At</th><th>Applied</th><th>Actions</th></tr></thead>
+        <tbody id="schedules"></tbody>
       </table>
     </div>
 
@@ -137,23 +179,16 @@
       const payload = {
         name: document.getElementById('webhook_name').value,
         webhook_url: document.getElementById('webhook_url').value,
+        notify_success: document.getElementById('notify_success').checked,
+        notify_failures: document.getElementById('notify_failures').checked,
+        notify_restock_only: document.getElementById('notify_restock_only').checked,
       };
       const res = await fetch('/api/webhooks', {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
       });
       const data = await res.json();
       alert(data.error || `Webhook added (id=${data.id})`);
-    }
-
-    async function testFirstWebhook() {
-      const hooks = await fetch('/api/webhooks').then(r => r.json());
-      if (!hooks.length) {
-        alert('Add a webhook first.');
-        return;
-      }
-      const res = await fetch(`/api/webhooks/${hooks[0].id}/test`, {method: 'POST'});
-      const data = await res.json();
-      alert(JSON.stringify(data));
+      await loadWebhooks();
     }
 
     async function addMonitor() {
@@ -184,6 +219,7 @@
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td>${r.id}</td>
+          <td><input type="checkbox" class="monitor-select" value="${r.id}" /></td>
           <td>${r.retailer}</td>
           <td><a href="${r.product_url}" target="_blank">link</a></td>
           <td>${r.last_checked_at || '-'}</td>
@@ -196,6 +232,113 @@
         `;
         tbody.appendChild(tr);
       }
+      await loadSchedules();
+    }
+
+    async function loadMeta() {
+      const m = await fetch('/api/meta').then(r => r.json());
+      document.getElementById('meta').innerHTML = `
+        <span class="pill">v${m.app_version}</span>
+        <span class="pill">${m.release_channel}</span>
+        <span class="pill">py ${m.python_version}</span>
+      `;
+    }
+
+    async function checkUpdates() {
+      const data = await fetch('/api/meta/check-update').then(r => r.json());
+      alert(`Current ${data.current_version} | Latest ${data.latest_version} | Update available: ${data.update_available}`);
+    }
+
+    function prefsLabel(h) {
+      const items = [];
+      if (h.notify_success) items.push('success');
+      if (h.notify_failures) items.push('failures');
+      if (h.notify_restock_only) items.push('restock-only');
+      return items.join(', ') || 'none';
+    }
+
+    async function loadWebhooks() {
+      const hooks = await fetch('/api/webhooks').then(r => r.json());
+      const tbody = document.getElementById('webhooks');
+      tbody.innerHTML = '';
+      for (const h of hooks) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${h.id}</td>
+          <td>${h.name}<div class="muted">${h.webhook_url || ''}</div></td>
+          <td>${prefsLabel(h)}</td>
+          <td>${h.last_delivery_status || '-'}<div class="muted">fail streak: ${h.fail_streak || 0}</div></td>
+          <td class="actions">
+            <button onclick="testWebhook(${h.id})">Test</button>
+            <button onclick="toggleWebhook(${h.id}, ${h.enabled ? 0 : 1})">${h.enabled ? 'Disable' : 'Enable'}</button>
+            <button onclick="deleteWebhook(${h.id})">Delete</button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function testWebhook(id) {
+      const data = await fetch(`/api/webhooks/${id}/test`, {method: 'POST'}).then(r => r.json());
+      alert(JSON.stringify(data));
+      await loadWebhooks();
+    }
+
+    async function toggleWebhook(id, enabled) {
+      await fetch(`/api/webhooks/${id}`, {
+        method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled})
+      });
+      await loadWebhooks();
+    }
+
+    async function deleteWebhook(id) {
+      await fetch(`/api/webhooks/${id}`, {method: 'DELETE'});
+      await loadWebhooks();
+    }
+
+    function selectedMonitorIds() {
+      return Array.from(document.querySelectorAll('.monitor-select:checked')).map(x => Number(x.value));
+    }
+
+    async function createSchedule() {
+      const monitor_ids = selectedMonitorIds();
+      if (!monitor_ids.length) {
+        alert('Select at least one monitor.');
+        return;
+      }
+      const payload = {
+        monitor_ids,
+        run_at: document.getElementById('schedule_run_at').value,
+        new_poll_interval_seconds: Number(document.getElementById('schedule_poll').value),
+      };
+      const res = await fetch('/api/schedules', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      alert(data.error || `Created ${data.created?.length || 0} schedule(s)`);
+      await loadSchedules();
+    }
+
+    async function loadSchedules() {
+      const rows = await fetch('/api/schedules').then(r => r.json());
+      const tbody = document.getElementById('schedules');
+      tbody.innerHTML = '';
+      for (const s of rows) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${s.id}</td>
+          <td>${s.monitor_id} (${s.retailer})</td>
+          <td>${s.run_at}</td>
+          <td>${s.applied_at || '-'}</td>
+          <td class="actions">${s.applied_at ? '' : `<button onclick="deleteSchedule(${s.id})">Delete</button>`}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function deleteSchedule(id) {
+      await fetch(`/api/schedules/${id}`, {method: 'DELETE'});
+      await loadSchedules();
     }
 
     async function checkMonitor(id) {
@@ -225,6 +368,8 @@
     }
 
     loadWorkspace();
+    loadMeta();
+    loadWebhooks();
     loadMonitors();
   </script>
 </body>
