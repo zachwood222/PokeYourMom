@@ -180,22 +180,34 @@ def detect_stock(page_text, retailer):
         "notify me",
         "coming soon",
         "check stores",
+        "temporarily out of stock",
     }
 
-    for phrase in out_phrases:
-        if phrase in lowered:
-            return False
-
-    add_to_cart_signals = [
+    add_to_cart_signals = {
         "add to cart",
         "buy now",
+        "ship it",
         "pickup",
-    ]
+        "same day delivery",
+    }
 
     if retailer.lower() == "walmart":
-        add_to_cart_signals.append("add to cart button")
+        add_to_cart_signals.update(
+            {
+                "add to cart button",
+                "how do you want your item",
+            }
+        )
 
-    return any(signal in lowered for signal in add_to_cart_signals)
+    has_positive = any(signal in lowered for signal in add_to_cart_signals)
+    has_negative = any(phrase in lowered for phrase in out_phrases)
+
+    # Many retail pages include "out of stock" in recommendation carousels while the
+    # actual PDP is available. Prefer positive buying signals when present.
+    if has_positive:
+        return True
+
+    return not has_negative and has_positive
 
 
 def add_to_cart_button_clickable(driver_obj):
@@ -204,6 +216,9 @@ def add_to_cart_button_clickable(driver_obj):
         "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add to cart')]",
         "//button[contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'add to cart')]",
         "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'buy now')]",
+        "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'ship it')]",
+        "//button[contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), 'ship it')]",
+        "//button[contains(@id, 'add-on-atc')]",
     ]
 
     for xpath in button_xpaths:
