@@ -32,7 +32,13 @@ PLAN_LIMITS = {
     "pro": {"max_monitors": 100, "min_poll_seconds": 10},
     "team": {"max_monitors": 500, "min_poll_seconds": 5},
 }
-SUPPORTED_RETAILERS = {"walmart", "target", "bestbuy"}
+SUPPORTED_RETAILERS = {"walmart", "target", "bestbuy", "pokemoncenter"}
+RETAILER_ALIASES = {
+    "pokemon-center": "pokemoncenter",
+    "pokemon_center": "pokemoncenter",
+    "pokemon center": "pokemoncenter",
+    "pokemoncenter": "pokemoncenter",
+}
 
 DEFAULT_WORKSPACE = {
     "name": "My Workspace",
@@ -387,10 +393,18 @@ def extract_price_cents(text: str) -> int | None:
     return min(values) if values else None
 
 
-def evaluate_page(html: str, keyword: str | None = None) -> MonitorResult:
+def canonical_retailer(retailer: str) -> str:
+    value = retailer.strip().lower()
+    return RETAILER_ALIASES.get(value, value)
+
+
+def evaluate_page(
+    html: str, keyword: str | None = None, retailer: str | None = None
+) -> MonitorResult:
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
     title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "Product"
     text = re.sub(r"<[^>]+>", " ", html).lower()
+    normalized_retailer = canonical_retailer(retailer) if retailer else None
 
     out_markers = [
         "out of stock",
@@ -407,6 +421,18 @@ def evaluate_page(html: str, keyword: str | None = None) -> MonitorResult:
         "pickup",
         "ship it",
     ]
+    if normalized_retailer == "pokemoncenter":
+        out_markers.extend(
+            [
+                "notify me when available",
+                "currently unavailable",
+            ]
+        )
+        in_markers.extend(
+            [
+                "add to bag",
+            ]
+        )
 
     has_out = any(m in text for m in out_markers)
     has_in = any(m in text for m in in_markers)
@@ -434,7 +460,7 @@ def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
     r = requests.get(monitor["product_url"], headers=headers, timeout=15)
     r.raise_for_status()
     keyword = (monitor["keyword"] or "").strip() or None
-    return evaluate_page(r.text, keyword=keyword)
+    return evaluate_page(r.text, keyword=keyword, retailer=monitor["retailer"])
 
 
 def alert_eligibility(monitor: sqlite3.Row, result: MonitorResult) -> bool:
@@ -756,7 +782,7 @@ def api_meta_check_update():
 @require_auth
 def api_workspace():
     row = get_workspace(current_workspace_id())
-    return jsonify(dict(row))
+    return jsonify({"workspace": dict(row), "user": dict(g.current_user)})
 
 
 @app.post("/api/workspace/plan")
@@ -869,8 +895,7 @@ def api_dashboard_summary():
 def api_create_monitor():
     body = request.json or {}
     try:
-        workspace = get_workspace_from_auth()
-        retailer = body["retailer"].strip().lower()
+        retailer = canonical_retailer(body["retailer"])
         url = body["product_url"].strip()
         poll_interval = int(body.get("poll_interval_seconds", 20))
         keyword = (body.get("keyword") or "").strip() or None
@@ -917,10 +942,6 @@ def api_update_monitor(monitor_id: int):
     enabled = body.get("enabled")
     if enabled is None:
         return jsonify({"error": "enabled is required"}), 400
-    try:
-        workspace = get_workspace_from_auth()
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
     conn = db()
     conn.execute(
         "update monitors set enabled = ? where id = ? and workspace_id = ?",
@@ -1008,10 +1029,6 @@ def api_add_webhook():
     if not url.startswith("https://discord.com/api/webhooks/"):
         return jsonify({"error": "Invalid Discord webhook URL"}), 400
 
-    try:
-        workspace = get_workspace_from_auth()
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
     conn = db()
     cur = conn.execute(
         """
@@ -1103,10 +1120,6 @@ def api_update_webhook(webhook_id: int):
         fields.append(("notify_restock_only", int(bool(body["notify_restock_only"]))))
     if not fields:
         return jsonify({"error": "No mutable fields provided"}), 400
-    try:
-        workspace = get_workspace_from_auth()
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
     conn = db()
     for key, value in fields:
         conn.execute(
