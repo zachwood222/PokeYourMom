@@ -86,13 +86,19 @@
           <input id="max_price_cents" type="number" placeholder="4000" />
         </div>
       </div>
+      <div class="row">
+        <div>
+          <label>Original MSRP Cents (Pokemon only, optional)</label>
+          <input id="msrp_cents" type="number" placeholder="499" />
+        </div>
+      </div>
       <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
     </div>
 
     <div class="card" style="margin-top:16px;">
       <h2>Monitors</h2>
       <table>
-        <thead><tr><th>ID</th><th>Retailer</th><th>URL</th><th>Last Checked</th><th>Last State</th><th>Actions</th></tr></thead>
+        <thead><tr><th>ID</th><th>Retailer</th><th>URL</th><th>Last Checked</th><th>Last Alert State</th><th>Actions</th></tr></thead>
         <tbody id="monitors"></tbody>
       </table>
     </div>
@@ -152,12 +158,14 @@
 
     async function addMonitor() {
       const maxPrice = document.getElementById('max_price_cents').value;
+      const msrp = document.getElementById('msrp_cents').value;
       const payload = {
         retailer: document.getElementById('retailer').value,
         product_url: document.getElementById('product_url').value,
         poll_interval_seconds: Number(document.getElementById('poll_interval').value),
         keyword: document.getElementById('keyword').value || null,
         max_price_cents: maxPrice ? Number(maxPrice) : null,
+        msrp_cents: msrp ? Number(msrp) : null,
       };
 
       const res = await fetch('/api/monitors', {
