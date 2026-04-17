@@ -11,12 +11,27 @@ if str(ROOT) not in sys.path:
 def _load_app(tmp_path, monkeypatch):
     db_path = tmp_path / "test.db"
     monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "test-token")
 
     import app as app_module
 
     reloaded = importlib.reload(app_module)
     reloaded.init_db()
     return reloaded
+
+
+def _auth_headers():
+    return {"Authorization": "Bearer test-token"}
+
+
+def test_protected_endpoint_requires_auth(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/monitors")
+
+    assert resp.status_code == 401
+    assert "Unauthorized" in resp.get_json()["error"]
 
 
 def test_create_monitor_validates_retailer(tmp_path, monkeypatch):
@@ -26,6 +41,7 @@ def test_create_monitor_validates_retailer(tmp_path, monkeypatch):
     resp = client.post(
         "/api/monitors",
         json={"retailer": "amazon", "product_url": "https://example.com", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
     )
 
     assert resp.status_code == 400
@@ -39,10 +55,37 @@ def test_create_monitor_requires_http_url(tmp_path, monkeypatch):
     resp = client.post(
         "/api/monitors",
         json={"retailer": "walmart", "product_url": "ftp://example.com", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
     )
 
     assert resp.status_code == 400
     assert "product_url" in resp.get_json()["error"]
+
+
+def test_authenticated_user_only_sees_own_workspace_data(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'target', 'https://example.com/hidden', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/monitors", headers=_auth_headers())
+
+    assert resp.status_code == 200
+    assert resp.get_json() == []
 
 
 def test_keyword_and_max_price_filter_block_event(tmp_path, monkeypatch):
