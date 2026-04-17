@@ -314,11 +314,18 @@ def get_workspace_id_for_request() -> int:
     return int(get_workspace_for_request()["id"])
 
 
+def get_workspace_from_auth() -> sqlite3.Row:
+    return get_workspace(current_workspace_id())
+
+
 def _token_from_request() -> str | None:
+    api_token = (request.headers.get("X-API-Token") or "").strip()
+    if api_token:
+        return api_token
     auth_header = (request.headers.get("Authorization") or "").strip()
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
-    return (request.headers.get("X-API-Token") or "").strip() or None
+    return None
 
 
 @app.before_request
@@ -330,6 +337,28 @@ def require_api_auth() -> tuple[dict[str, str], int] | None:
         return jsonify({"error": "Unauthorized"}), 401
     g.current_user = dict(DEFAULT_USER)
     g.current_workspace = get_workspace(1)
+    return None
+
+
+def user_is_workspace_owner(user_id: int, workspace_id: int) -> bool:
+    conn = db()
+    row = conn.execute(
+        """
+        select 1 from workspace_members
+        where user_id = ? and workspace_id = ? and role = 'owner'
+        limit 1
+        """,
+        (user_id, workspace_id),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def ensure_workspace_owner() -> tuple[dict[str, str], int] | None:
+    user = getattr(g, "current_user", None)
+    workspace_id = current_workspace_id()
+    if not user or not user_is_workspace_owner(int(user["id"]), workspace_id):
+        return jsonify({"error": "Workspace owner access required"}), 403
     return None
 
 
@@ -988,7 +1017,9 @@ def api_events():
 @app.post("/api/webhooks")
 @require_auth
 def api_add_webhook():
-    workspace_id = get_workspace_id_for_request()
+    owner_error = ensure_workspace_owner()
+    if owner_error:
+        return owner_error
     body = request.json or {}
     name = (body.get("name") or "Discord").strip()
     url = (body.get("webhook_url") or "").strip()
@@ -1015,7 +1046,9 @@ def api_add_webhook():
 @app.get("/api/webhooks")
 @require_auth
 def api_list_webhooks():
-    workspace_id = get_workspace_id_for_request()
+    owner_error = ensure_workspace_owner()
+    if owner_error:
+        return owner_error
     conn = db()
     rows = conn.execute(
         "select * from webhooks where workspace_id = ? order by id desc",
@@ -1028,7 +1061,9 @@ def api_list_webhooks():
 @app.post("/api/webhooks/<int:webhook_id>/test")
 @require_auth
 def api_test_webhook(webhook_id: int):
-    workspace_id = get_workspace_id_for_request()
+    owner_error = ensure_workspace_owner()
+    if owner_error:
+        return owner_error
     conn = db()
     hook = conn.execute(
         "select * from webhooks where id = ? and workspace_id = ?",
@@ -1070,7 +1105,9 @@ def api_test_webhook(webhook_id: int):
 @app.patch("/api/webhooks/<int:webhook_id>")
 @require_auth
 def api_update_webhook(webhook_id: int):
-    workspace_id = get_workspace_id_for_request()
+    owner_error = ensure_workspace_owner()
+    if owner_error:
+        return owner_error
     body = request.json or {}
     fields: list[tuple[str, Any]] = []
     if "enabled" in body:
@@ -1103,14 +1140,18 @@ def api_update_webhook(webhook_id: int):
 @app.delete("/api/webhooks/<int:webhook_id>")
 @require_auth
 def api_delete_webhook(webhook_id: int):
-    workspace_id = get_workspace_id_for_request()
+    owner_error = ensure_workspace_owner()
+    if owner_error:
+        return owner_error
     conn = db()
-    conn.execute(
+    cur = conn.execute(
         "delete from webhooks where id = ? and workspace_id = ?",
         (webhook_id, current_workspace_id()),
     )
     conn.commit()
     conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Webhook not found"}), 404
     return jsonify({"ok": True})
 
 

@@ -21,8 +21,8 @@ def _load_app(tmp_path, monkeypatch):
     return reloaded
 
 
-def _auth_headers():
-    return {"Authorization": "Bearer test-token"}
+def _auth_headers(token="test-token"):
+    return {"Authorization": f"Bearer {token}", "X-API-Token": "api-token"}
 
 
 def test_protected_endpoint_requires_auth(tmp_path, monkeypatch):
