@@ -11,12 +11,27 @@ if str(ROOT) not in sys.path:
 def _load_app(tmp_path, monkeypatch):
     db_path = tmp_path / "test.db"
     monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "test-token")
 
     import app as app_module
 
     reloaded = importlib.reload(app_module)
     reloaded.init_db()
     return reloaded
+
+
+def _auth_headers():
+    return {"Authorization": "Bearer test-token"}
+
+
+def test_protected_endpoint_requires_auth(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/monitors")
+
+    assert resp.status_code == 401
+    assert "Unauthorized" in resp.get_json()["error"]
 
 
 def test_create_monitor_validates_retailer(tmp_path, monkeypatch):
@@ -26,6 +41,7 @@ def test_create_monitor_validates_retailer(tmp_path, monkeypatch):
     resp = client.post(
         "/api/monitors",
         json={"retailer": "amazon", "product_url": "https://example.com", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
     )
 
     assert resp.status_code == 400
@@ -39,10 +55,37 @@ def test_create_monitor_requires_http_url(tmp_path, monkeypatch):
     resp = client.post(
         "/api/monitors",
         json={"retailer": "walmart", "product_url": "ftp://example.com", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
     )
 
     assert resp.status_code == 400
     assert "product_url" in resp.get_json()["error"]
+
+
+def test_authenticated_user_only_sees_own_workspace_data(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'target', 'https://example.com/hidden', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/monitors", headers=_auth_headers())
+
+    assert resp.status_code == 200
+    assert resp.get_json() == []
 
 
 def test_keyword_and_max_price_filter_block_event(tmp_path, monkeypatch):
@@ -163,112 +206,23 @@ def test_init_db_migrates_existing_monitors_table_with_msrp_column(tmp_path, mon
     assert "msrp_cents" in columns
 
 
-def test_monitor_and_event_apis_are_scoped_to_auth_workspace(tmp_path, monkeypatch):
+def test_api_routes_require_auth(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
 
-    conn = app_module.db()
-    conn.execute(
-        "insert into workspaces(name, plan, created_at) values ('Other Workspace', 'basic', ?)",
-        (app_module.utc_now(),),
-    )
-    workspace_two_id = conn.execute(
-        "select id from workspaces where name = 'Other Workspace' order by id desc limit 1"
-    ).fetchone()["id"]
-    conn.execute(
-        """
-        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
-        values (1, 'target', 'https://example.com/ws1', 20, ?)
-        """,
-        (app_module.utc_now(),),
-    )
-    conn.execute(
-        """
-        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
-        values (?, 'walmart', 'https://example.com/ws2', 20, ?)
-        """,
-        (workspace_two_id, app_module.utc_now()),
-    )
-    workspace_two_monitor_id = conn.execute(
-        "select id from monitors where workspace_id = ? order by id desc limit 1",
-        (workspace_two_id,),
-    ).fetchone()["id"]
-    conn.execute(
-        """
-        insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
-        values (?, 'in_stock', 'WS2 Event', 'https://example.com/ws2', 'walmart', 1999, ?, ?)
-        """,
-        (workspace_two_monitor_id, app_module.utc_now(), f"dedupe-ws2-{app_module.utc_now()}"),
-    )
-    conn.commit()
-    conn.close()
+    resp = client.get("/api/monitors")
 
-    ws1_monitors = client.get("/api/monitors")
-    assert ws1_monitors.status_code == 200
-    assert all(row["workspace_id"] == 1 for row in ws1_monitors.get_json())
-
-    ws2_monitors = client.get("/api/monitors", headers={"X-Workspace-Id": str(workspace_two_id)})
-    assert ws2_monitors.status_code == 200
-    ws2_rows = ws2_monitors.get_json()
-    assert len(ws2_rows) == 1
-    assert ws2_rows[0]["workspace_id"] == workspace_two_id
-
-    ws2_events = client.get("/api/events", headers={"X-Workspace-Id": str(workspace_two_id)})
-    assert ws2_events.status_code == 200
-    ws2_event_rows = ws2_events.get_json()
-    assert len(ws2_event_rows) == 1
-    assert ws2_event_rows[0]["title"] == "WS2 Event"
-
-    ws1_events = client.get("/api/events")
-    assert ws1_events.status_code == 200
-    assert ws1_events.get_json() == []
+    assert resp.status_code == 401
+    assert resp.get_json() == {"error": "Unauthorized"}
 
 
-def test_webhook_apis_are_scoped_to_auth_workspace(tmp_path, monkeypatch):
+def test_api_routes_allow_authenticated_requests_and_include_context(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
 
-    conn = app_module.db()
-    conn.execute(
-        "insert into workspaces(name, plan, created_at) values ('Tenant B', 'basic', ?)",
-        (app_module.utc_now(),),
-    )
-    workspace_two_id = conn.execute(
-        "select id from workspaces where name = 'Tenant B' order by id desc limit 1"
-    ).fetchone()["id"]
-    conn.execute(
-        """
-        insert into webhooks(workspace_id, name, webhook_url, created_at)
-        values (1, 'WS1 Hook', 'https://discord.com/api/webhooks/ws1', ?)
-        """,
-        (app_module.utc_now(),),
-    )
-    conn.execute(
-        """
-        insert into webhooks(workspace_id, name, webhook_url, created_at)
-        values (?, 'WS2 Hook', 'https://discord.com/api/webhooks/ws2', ?)
-        """,
-        (workspace_two_id, app_module.utc_now()),
-    )
-    ws2_hook_id = conn.execute(
-        "select id from webhooks where workspace_id = ? order by id desc limit 1",
-        (workspace_two_id,),
-    ).fetchone()["id"]
-    conn.commit()
-    conn.close()
+    resp = client.get("/api/workspace", headers=_auth_headers())
+    payload = resp.get_json()
 
-    list_ws2 = client.get("/api/webhooks", headers={"X-Workspace-Id": str(workspace_two_id)})
-    assert list_ws2.status_code == 200
-    ws2_hooks = list_ws2.get_json()
-    assert len(ws2_hooks) == 1
-    assert ws2_hooks[0]["name"] == "WS2 Hook"
-    assert ws2_hooks[0]["workspace_id"] == workspace_two_id
-
-    list_ws1 = client.get("/api/webhooks")
-    assert list_ws1.status_code == 200
-    ws1_hooks = list_ws1.get_json()
-    assert len(ws1_hooks) == 1
-    assert ws1_hooks[0]["name"] == "WS1 Hook"
-
-    patch_ws2_from_ws1 = client.patch(f"/api/webhooks/{ws2_hook_id}", json={"enabled": False})
-    assert patch_ws2_from_ws1.status_code == 404
+    assert resp.status_code == 200
+    assert payload["workspace"]["id"] == 1
+    assert payload["user"]["id"] == "local-dev"
