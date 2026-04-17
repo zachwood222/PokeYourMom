@@ -3,15 +3,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Any
 
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, g, jsonify, render_template, request
 from flask_socketio import SocketIO
 
 app = Flask(__name__)
@@ -35,6 +37,9 @@ DEFAULT_WORKSPACE = {
     "name": "My Workspace",
     "plan": DEFAULT_PLAN if DEFAULT_PLAN in PLAN_LIMITS else "basic",
 }
+DEFAULT_USER_EMAIL = os.getenv("DEFAULT_USER_EMAIL", "owner@local.test")
+DEFAULT_USER_NAME = os.getenv("DEFAULT_USER_NAME", "Workspace Owner")
+DEFAULT_BEARER_TOKEN = os.getenv("DEFAULT_BEARER_TOKEN", "dev-token")
 
 running = False
 monitor_thread: threading.Thread | None = None
@@ -81,6 +86,25 @@ def init_db() -> None:
             name text not null,
             plan text not null,
             created_at text not null
+        );
+
+        create table if not exists users (
+            id integer primary key autoincrement,
+            email text not null unique,
+            name text not null,
+            bearer_token text not null unique,
+            created_at text not null
+        );
+
+        create table if not exists workspace_members (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            user_id integer not null,
+            role text not null default 'member',
+            created_at text not null,
+            unique(workspace_id, user_id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(user_id) references users(id)
         );
 
         create table if not exists monitors (
@@ -162,6 +186,31 @@ def init_db() -> None:
             (DEFAULT_WORKSPACE["name"], DEFAULT_WORKSPACE["plan"], utc_now()),
         )
         log("✅ Initialized default workspace")
+    workspace = conn.execute("select id from workspaces order by id asc limit 1").fetchone()
+    user = conn.execute("select id from users where email = ?", (DEFAULT_USER_EMAIL,)).fetchone()
+    if not user:
+        token = DEFAULT_BEARER_TOKEN or secrets.token_urlsafe(24)
+        cur = conn.execute(
+            "insert into users(email, name, bearer_token, created_at) values (?, ?, ?, ?)",
+            (DEFAULT_USER_EMAIL, DEFAULT_USER_NAME, token, utc_now()),
+        )
+        user_id = cur.lastrowid
+        log(f"✅ Initialized default user {DEFAULT_USER_EMAIL}")
+    else:
+        user_id = user["id"]
+    member = conn.execute(
+        "select id from workspace_members where workspace_id = ? and user_id = ?",
+        (workspace["id"], user_id),
+    ).fetchone()
+    if not member:
+        conn.execute(
+            """
+            insert into workspace_members(workspace_id, user_id, role, created_at)
+            values (?, ?, 'owner', ?)
+            """,
+            (workspace["id"], user_id, utc_now()),
+        )
+        log("✅ Linked default user to default workspace")
     conn.commit()
     ensure_column(conn, "monitors", "msrp_cents", "integer")
     ensure_column(conn, "monitors", "failure_streak", "integer not null default 0")
@@ -180,7 +229,59 @@ def init_db() -> None:
     conn.close()
 
 
-def get_workspace(workspace_id: int = 1) -> sqlite3.Row:
+def current_workspace_id() -> int:
+    workspace_id = getattr(g, "workspace_id", None)
+    if workspace_id is None:
+        raise RuntimeError("Missing workspace context")
+    return workspace_id
+
+
+def get_workspace_for_user(user_id: int) -> sqlite3.Row | None:
+    conn = db()
+    row = conn.execute(
+        """
+        select w.* from workspace_members wm
+        join workspaces w on w.id = wm.workspace_id
+        where wm.user_id = ?
+        order by w.id asc
+        limit 1
+        """,
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def resolve_user_from_request() -> sqlite3.Row | None:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header.removeprefix("Bearer ").strip()
+    if not token:
+        return None
+    conn = db()
+    user = conn.execute("select * from users where bearer_token = ?", (token,)).fetchone()
+    conn.close()
+    return user
+
+
+def require_auth(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        user = resolve_user_from_request()
+        if not user:
+            return jsonify({"error": "Unauthorized"}), 401
+        workspace = get_workspace_for_user(user["id"])
+        if not workspace:
+            return jsonify({"error": "No workspace membership found"}), 403
+        g.current_user = user
+        g.workspace_id = workspace["id"]
+        return view_func(*args, **kwargs)
+
+    return wrapped
+
+
+def get_workspace(workspace_id: int) -> sqlite3.Row:
     conn = db()
     row = conn.execute("select * from workspaces where id = ?", (workspace_id,)).fetchone()
     conn.close()
@@ -529,57 +630,99 @@ def api_meta_check_update():
 
 
 @app.get("/api/workspace")
+@require_auth
 def api_workspace():
-    row = get_workspace(1)
+    row = get_workspace(current_workspace_id())
     return jsonify(dict(row))
 
 
 @app.post("/api/workspace/plan")
+@require_auth
 def api_update_plan():
     plan = (request.json or {}).get("plan", "basic")
     if plan not in PLAN_LIMITS:
         return jsonify({"error": "Invalid plan"}), 400
     conn = db()
-    conn.execute("update workspaces set plan = ? where id = 1", (plan,))
+    conn.execute("update workspaces set plan = ? where id = ?", (plan, current_workspace_id()))
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "plan": plan})
 
 
 @app.get("/api/monitors")
+@require_auth
 def api_list_monitors():
     conn = db()
-    rows = conn.execute("select * from monitors order by id desc").fetchall()
+    rows = conn.execute(
+        "select * from monitors where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
 
 @app.get("/api/dashboard/summary")
+@require_auth
 def api_dashboard_summary():
     conn = db()
-    total_monitors = conn.execute("select count(*) as c from monitors").fetchone()["c"]
+    workspace_id = current_workspace_id()
+    total_monitors = conn.execute(
+        "select count(*) as c from monitors where workspace_id = ?",
+        (workspace_id,),
+    ).fetchone()["c"]
     enabled_monitors = conn.execute(
-        "select count(*) as c from monitors where enabled = 1"
+        "select count(*) as c from monitors where enabled = 1 and workspace_id = ?",
+        (workspace_id,),
     ).fetchone()["c"]
     checks_last_24h = conn.execute(
         """
         select count(*) as c from monitors
-        where last_checked_at is not null
+        where workspace_id = ?
+          and last_checked_at is not null
           and datetime(last_checked_at) >= datetime('now', '-1 day')
         """
+        ,
+        (workspace_id,),
     ).fetchone()["c"]
     latest_check = conn.execute(
-        "select max(last_checked_at) as latest_check from monitors"
+        "select max(last_checked_at) as latest_check from monitors where workspace_id = ?",
+        (workspace_id,),
     ).fetchone()["latest_check"]
     events_24h = conn.execute(
-        "select count(*) as c from events where datetime(event_time) >= datetime('now', '-1 day')"
+        """
+        select count(*) as c from events e
+        join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ?
+          and datetime(e.event_time) >= datetime('now', '-1 day')
+        """,
+        (workspace_id,),
     ).fetchone()["c"]
     events_7d = conn.execute(
-        "select count(*) as c from events where datetime(event_time) >= datetime('now', '-7 day')"
+        """
+        select count(*) as c from events e
+        join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ?
+          and datetime(e.event_time) >= datetime('now', '-7 day')
+        """,
+        (workspace_id,),
     ).fetchone()["c"]
-    deliveries_total = conn.execute("select count(*) as c from deliveries").fetchone()["c"]
+    deliveries_total = conn.execute(
+        """
+        select count(*) as c from deliveries d
+        join events e on e.id = d.event_id
+        join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ?
+        """,
+        (workspace_id,),
+    ).fetchone()["c"]
     deliveries_sent = conn.execute(
-        "select count(*) as c from deliveries where status = 'sent'"
+        """
+        select count(*) as c from deliveries d
+        join events e on e.id = d.event_id
+        join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ? and d.status = 'sent'
+        """,
+        (workspace_id,),
     ).fetchone()["c"]
     conn.close()
 
@@ -599,6 +742,7 @@ def api_dashboard_summary():
 
 
 @app.post("/api/monitors")
+@require_auth
 def api_create_monitor():
     body = request.json or {}
     try:
@@ -622,7 +766,7 @@ def api_create_monitor():
         if not (url.startswith("http://") or url.startswith("https://")):
             raise ValueError("product_url must start with http:// or https://")
 
-        enforce_plan_limits(1, poll_interval)
+        enforce_plan_limits(current_workspace_id(), poll_interval)
     except (KeyError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -630,9 +774,9 @@ def api_create_monitor():
     cur = conn.execute(
         """
         insert into monitors(workspace_id, retailer, product_url, keyword, max_price_cents, msrp_cents, poll_interval_seconds, created_at)
-        values (1, ?, ?, ?, ?, ?, ?, ?)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (retailer, url, keyword, max_price_cents, msrp_cents, poll_interval, utc_now()),
+        (current_workspace_id(), retailer, url, keyword, max_price_cents, msrp_cents, poll_interval, utc_now()),
     )
     conn.commit()
     monitor_id = cur.lastrowid
@@ -642,15 +786,22 @@ def api_create_monitor():
 
 
 @app.patch("/api/monitors/<int:monitor_id>")
+@require_auth
 def api_update_monitor(monitor_id: int):
     body = request.json or {}
     enabled = body.get("enabled")
     if enabled is None:
         return jsonify({"error": "enabled is required"}), 400
     conn = db()
-    conn.execute("update monitors set enabled = ? where id = ?", (int(bool(enabled)), monitor_id))
+    conn.execute(
+        "update monitors set enabled = ? where id = ? and workspace_id = ?",
+        (int(bool(enabled)), monitor_id, current_workspace_id()),
+    )
     conn.commit()
-    row = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
+    row = conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (monitor_id, current_workspace_id()),
+    ).fetchone()
     conn.close()
     if not row:
         return jsonify({"error": "Monitor not found"}), 404
@@ -658,18 +809,26 @@ def api_update_monitor(monitor_id: int):
 
 
 @app.delete("/api/monitors/<int:monitor_id>")
+@require_auth
 def api_delete_monitor(monitor_id: int):
     conn = db()
-    conn.execute("delete from monitors where id = ?", (monitor_id,))
+    conn.execute(
+        "delete from monitors where id = ? and workspace_id = ?",
+        (monitor_id, current_workspace_id()),
+    )
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
 
 
 @app.post("/api/monitors/<int:monitor_id>/check")
+@require_auth
 def api_check_monitor(monitor_id: int):
     conn = db()
-    row = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
+    row = conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (monitor_id, current_workspace_id()),
+    ).fetchone()
     conn.close()
     if not row:
         return jsonify({"error": "Monitor not found"}), 404
@@ -677,20 +836,25 @@ def api_check_monitor(monitor_id: int):
 
 
 @app.get("/api/events")
+@require_auth
 def api_events():
     conn = db()
     rows = conn.execute(
         """
         select e.*, m.retailer as monitor_retailer from events e
         join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ?
         order by e.id desc limit 100
         """
+        ,
+        (current_workspace_id(),),
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
 
 @app.post("/api/webhooks")
+@require_auth
 def api_add_webhook():
     body = request.json or {}
     name = (body.get("name") or "Discord").strip()
@@ -705,9 +869,9 @@ def api_add_webhook():
     cur = conn.execute(
         """
         insert into webhooks(workspace_id, name, webhook_url, notify_success, notify_failures, notify_restock_only, created_at)
-        values (1, ?, ?, ?, ?, ?, ?)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (name, url, notify_success, notify_failures, notify_restock_only, utc_now()),
+        (current_workspace_id(), name, url, notify_success, notify_failures, notify_restock_only, utc_now()),
     )
     conn.commit()
     row = conn.execute("select * from webhooks where id = ?", (cur.lastrowid,)).fetchone()
@@ -716,17 +880,25 @@ def api_add_webhook():
 
 
 @app.get("/api/webhooks")
+@require_auth
 def api_list_webhooks():
     conn = db()
-    rows = conn.execute("select * from webhooks order by id desc").fetchall()
+    rows = conn.execute(
+        "select * from webhooks where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
     conn.close()
     return jsonify([serialize_webhook(r) for r in rows])
 
 
 @app.post("/api/webhooks/<int:webhook_id>/test")
+@require_auth
 def api_test_webhook(webhook_id: int):
     conn = db()
-    hook = conn.execute("select * from webhooks where id = ?", (webhook_id,)).fetchone()
+    hook = conn.execute(
+        "select * from webhooks where id = ? and workspace_id = ?",
+        (webhook_id, current_workspace_id()),
+    ).fetchone()
     conn.close()
     if not hook:
         return jsonify({"error": "Webhook not found"}), 404
@@ -761,6 +933,7 @@ def api_test_webhook(webhook_id: int):
 
 
 @app.patch("/api/webhooks/<int:webhook_id>")
+@require_auth
 def api_update_webhook(webhook_id: int):
     body = request.json or {}
     fields: list[tuple[str, Any]] = []
@@ -776,9 +949,15 @@ def api_update_webhook(webhook_id: int):
         return jsonify({"error": "No mutable fields provided"}), 400
     conn = db()
     for key, value in fields:
-        conn.execute(f"update webhooks set {key} = ? where id = ?", (value, webhook_id))
+        conn.execute(
+            f"update webhooks set {key} = ? where id = ? and workspace_id = ?",
+            (value, webhook_id, current_workspace_id()),
+        )
     conn.commit()
-    row = conn.execute("select * from webhooks where id = ?", (webhook_id,)).fetchone()
+    row = conn.execute(
+        "select * from webhooks where id = ? and workspace_id = ?",
+        (webhook_id, current_workspace_id()),
+    ).fetchone()
     conn.close()
     if not row:
         return jsonify({"error": "Webhook not found"}), 404
@@ -786,15 +965,20 @@ def api_update_webhook(webhook_id: int):
 
 
 @app.delete("/api/webhooks/<int:webhook_id>")
+@require_auth
 def api_delete_webhook(webhook_id: int):
     conn = db()
-    conn.execute("delete from webhooks where id = ?", (webhook_id,))
+    conn.execute(
+        "delete from webhooks where id = ? and workspace_id = ?",
+        (webhook_id, current_workspace_id()),
+    )
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
 
 
 @app.get("/api/schedules")
+@require_auth
 def api_list_schedules():
     conn = db()
     rows = conn.execute(
@@ -802,14 +986,18 @@ def api_list_schedules():
         select s.*, m.retailer, m.product_url
         from monitor_schedules s
         join monitors m on m.id = s.monitor_id
+        where m.workspace_id = ?
         order by s.id desc
         """
+        ,
+        (current_workspace_id(),),
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
 
 @app.post("/api/schedules")
+@require_auth
 def api_create_schedule():
     body = request.json or {}
     monitor_ids = body.get("monitor_ids") or []
@@ -830,7 +1018,10 @@ def api_create_schedule():
     conn = db()
     created = []
     for monitor_id in monitor_ids:
-        row = conn.execute("select * from monitors where id = ?", (int(monitor_id),)).fetchone()
+        row = conn.execute(
+            "select * from monitors where id = ? and workspace_id = ?",
+            (int(monitor_id), current_workspace_id()),
+        ).fetchone()
         if not row:
             continue
         cur = conn.execute(
@@ -848,15 +1039,25 @@ def api_create_schedule():
 
 
 @app.delete("/api/schedules/<int:schedule_id>")
+@require_auth
 def api_delete_schedule(schedule_id: int):
     conn = db()
-    conn.execute("delete from monitor_schedules where id = ? and applied_at is null", (schedule_id,))
+    conn.execute(
+        """
+        delete from monitor_schedules
+        where id = ?
+          and applied_at is null
+          and monitor_id in (select id from monitors where workspace_id = ?)
+        """,
+        (schedule_id, current_workspace_id()),
+    )
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
 
 
 @app.post("/api/start")
+@require_auth
 def api_start():
     global running, monitor_thread
     if running:
@@ -868,6 +1069,7 @@ def api_start():
 
 
 @app.post("/api/stop")
+@require_auth
 def api_stop():
     global running
     running = False
