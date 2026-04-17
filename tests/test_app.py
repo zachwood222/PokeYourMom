@@ -12,6 +12,7 @@ def _load_app(tmp_path, monkeypatch):
     db_path = tmp_path / "test.db"
     monkeypatch.setenv("DB_PATH", str(db_path))
     monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "test-token")
+    monkeypatch.setenv("API_AUTH_TOKEN", "api-token")
 
     import app as app_module
 
@@ -20,8 +21,8 @@ def _load_app(tmp_path, monkeypatch):
     return reloaded
 
 
-def _auth_headers():
-    return {"Authorization": "Bearer test-token"}
+def _auth_headers(token="test-token"):
+    return {"Authorization": f"Bearer {token}", "X-API-Token": "api-token"}
 
 
 def test_protected_endpoint_requires_auth(tmp_path, monkeypatch):
@@ -224,5 +225,107 @@ def test_api_routes_allow_authenticated_requests_and_include_context(tmp_path, m
     payload = resp.get_json()
 
     assert resp.status_code == 200
-    assert payload["workspace"]["id"] == 1
-    assert payload["user"]["id"] == "local-dev"
+    assert payload["id"] == 1
+    assert payload["name"] == "My Workspace"
+
+
+def test_webhook_routes_require_owner_role(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    cur = conn.execute(
+        "insert into users(email, name, bearer_token, created_at) values (?, ?, ?, ?)",
+        ("member@example.com", "Member User", "member-token", app_module.utc_now()),
+    )
+    member_id = cur.lastrowid
+    conn.execute(
+        """
+        insert into workspace_members(workspace_id, user_id, role, created_at)
+        values (1, ?, 'member', ?)
+        """,
+        (member_id, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    list_resp = client.get("/api/webhooks", headers=_auth_headers("member-token"))
+    create_resp = client.post(
+        "/api/webhooks",
+        json={"name": "Discord", "webhook_url": "https://discord.com/api/webhooks/test"},
+        headers=_auth_headers("member-token"),
+    )
+
+    assert list_resp.status_code == 403
+    assert create_resp.status_code == 403
+    assert list_resp.get_json()["error"] == "Workspace owner access required"
+
+
+def test_webhook_cross_tenant_access_is_blocked(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace_id = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, created_at)
+        values (?, 'Other Hook', 'https://discord.com/api/webhooks/other', ?)
+        """,
+        (other_workspace_id, app_module.utc_now()),
+    )
+    other_webhook_id = conn.execute("select id from webhooks where workspace_id = ?", (other_workspace_id,)).fetchone()[
+        "id"
+    ]
+    conn.commit()
+    conn.close()
+
+    test_resp = client.post(f"/api/webhooks/{other_webhook_id}/test", headers=_auth_headers())
+    patch_resp = client.patch(f"/api/webhooks/{other_webhook_id}", json={"enabled": False}, headers=_auth_headers())
+    delete_resp = client.delete(f"/api/webhooks/{other_webhook_id}", headers=_auth_headers())
+
+    assert test_resp.status_code == 404
+    assert patch_resp.status_code == 404
+    assert delete_resp.status_code == 404
+
+    conn = app_module.db()
+    still_exists = conn.execute("select id from webhooks where id = ?", (other_webhook_id,)).fetchone()
+    conn.close()
+    assert still_exists is not None
+
+
+def test_webhook_owner_can_manage_webhook_routes(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    class DummyResponse:
+        status_code = 204
+        text = ""
+
+    monkeypatch.setattr(app_module.requests, "post", lambda *args, **kwargs: DummyResponse())
+
+    create_resp = client.post(
+        "/api/webhooks",
+        json={"name": "Main", "webhook_url": "https://discord.com/api/webhooks/test"},
+        headers=_auth_headers(),
+    )
+    webhook_id = create_resp.get_json()["id"]
+
+    list_resp = client.get("/api/webhooks", headers=_auth_headers())
+    test_resp = client.post(f"/api/webhooks/{webhook_id}/test", headers=_auth_headers())
+    patch_resp = client.patch(
+        f"/api/webhooks/{webhook_id}",
+        json={"enabled": False, "notify_failures": True},
+        headers=_auth_headers(),
+    )
+    delete_resp = client.delete(f"/api/webhooks/{webhook_id}", headers=_auth_headers())
+
+    assert create_resp.status_code == 201
+    assert list_resp.status_code == 200
+    assert test_resp.status_code == 200
+    assert patch_resp.status_code == 200
+    assert delete_resp.status_code == 200
