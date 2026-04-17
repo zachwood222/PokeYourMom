@@ -12,6 +12,7 @@ def _load_app(tmp_path, monkeypatch):
     db_path = tmp_path / "test.db"
     monkeypatch.setenv("DB_PATH", str(db_path))
     monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "test-token")
+    monkeypatch.setenv("API_AUTH_TOKEN", "test-token")
 
     import app as app_module
 
@@ -60,6 +61,25 @@ def test_create_monitor_requires_http_url(tmp_path, monkeypatch):
 
     assert resp.status_code == 400
     assert "product_url" in resp.get_json()["error"]
+
+
+def test_create_monitor_accepts_pokemon_center_alias(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "pokemon-center",
+            "product_url": "https://www.pokemoncenter.com/product/123",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    payload = resp.get_json()
+
+    assert resp.status_code == 201
+    assert payload["retailer"] == "pokemoncenter"
 
 
 def test_authenticated_user_only_sees_own_workspace_data(tmp_path, monkeypatch):
@@ -167,6 +187,26 @@ def test_evaluate_page_sets_keyword_and_price_fields(tmp_path, monkeypatch):
     assert result.status_text == "in_stock"
 
 
+def test_evaluate_page_handles_pokemon_center_markers(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    html = """
+    <html>
+      <head><title>Pokemon Center Box</title></head>
+      <body>
+        <button>Notify Me When Available</button>
+        <p>$39.99</p>
+      </body>
+    </html>
+    """
+    result = app_module.evaluate_page(html, keyword="pokemon", retailer="pokemon-center")
+
+    assert result.in_stock is False
+    assert result.keyword_matched is True
+    assert result.price_cents == 3999
+    assert result.status_text == "out_or_unknown"
+
+
 def test_init_db_migrates_existing_monitors_table_with_msrp_column(tmp_path, monkeypatch):
     db_path = tmp_path / "legacy.db"
     monkeypatch.setenv("DB_PATH", str(db_path))
@@ -225,4 +265,4 @@ def test_api_routes_allow_authenticated_requests_and_include_context(tmp_path, m
 
     assert resp.status_code == 200
     assert payload["workspace"]["id"] == 1
-    assert payload["user"]["id"] == "local-dev"
+    assert payload["user"]["id"] == 1
