@@ -225,20 +225,28 @@
           <div class="card"><div class="kpi-label">Events (24h)</div><div id="kpi_events_24h" class="kpi-value">0</div></div>
           <div class="card"><div class="kpi-label">Delivery Success</div><div id="kpi_success_rate" class="kpi-value">0%</div></div>
         </div>
-        <div class="card" style="margin-top:16px;">
-          <h3>Runtime</h3>
-          <div class="row">
-            <div>
-              <label>Loop State</label>
-              <input id="runtime_running" disabled />
+
+        <div class="workspace">
+          <div class="card">
+            <h3 class="section-title">Runtime Controls</h3>
+            <div class="row">
+              <div>
+                <label class="small">Loop State</label>
+                <input id="runtime_running" disabled />
+              </div>
+              <div>
+                <label class="small">Latest Check</label>
+                <input id="runtime_latest_check" disabled />
+              </div>
             </div>
-            <div>
-              <label>Latest Check</label>
-              <input id="runtime_latest_check" disabled />
+            <div class="actions" style="margin-top:10px;">
+              <button onclick="loadDashboardSummary()">Refresh Metrics</button>
+              <button onclick="toggleLoop()" id="loopBtn">Start Monitor Loop</button>
             </div>
           </div>
-          <div class="actions" style="margin-top:10px;">
-            <button onclick="loadDashboardSummary()">Refresh Metrics</button>
+          <div class="card">
+            <h3 class="section-title">Policy</h3>
+            <p class="warn">Stock monitoring + Discord alerts only. Auto-checkout is intentionally not implemented.</p>
           </div>
         </div>
         <div class="grid" style="margin-top:16px;">
@@ -272,36 +280,54 @@
                 <option>bestbuy</option>
               </select>
             </div>
-            <div>
-              <label>Poll Interval (seconds)</label>
-              <input id="poll_interval" type="number" value="20" />
+            <label class="small">Product URL</label>
+            <input id="product_url" placeholder="https://www.walmart.com/ip/..." />
+            <div class="row" style="margin-top: 10px;">
+              <div>
+                <label class="small">Keyword Filter</label>
+                <input id="keyword" placeholder="pokemon" />
+              </div>
+              <div>
+                <label class="small">Max Price Cents</label>
+                <input id="max_price_cents" type="number" placeholder="4000" />
+              </div>
             </div>
-          </div>
-          <label>Product URL</label>
-          <input id="product_url" placeholder="https://www.walmart.com/ip/..." />
-          <div class="row">
-            <div>
-              <label>Keyword Filter (optional)</label>
-              <input id="keyword" placeholder="pokemon" />
-            </div>
-            <div>
-              <label>Max Price Cents (optional)</label>
-              <input id="max_price_cents" type="number" placeholder="4000" />
-            </div>
-          </div>
-          <div class="row">
-            <div>
-              <label>Original MSRP Cents (Pokemon only, optional)</label>
+            <div style="margin-top:10px;">
+              <label class="small">Original MSRP Cents (Pokemon only)</label>
               <input id="msrp_cents" type="number" placeholder="499" />
             </div>
+            <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
           </div>
-          <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
+
+          <div class="card">
+            <h2 class="section-title">Bulk Schedules</h2>
+            <div class="row">
+              <div>
+                <label class="small">Run At (UTC ISO)</label>
+                <input id="schedule_run_at" placeholder="2026-04-18T15:00:00+00:00" />
+              </div>
+              <div>
+                <label class="small">New Poll Interval</label>
+                <input id="schedule_poll" type="number" value="20" />
+              </div>
+            </div>
+            <button style="margin-top:10px;" onclick="createSchedule()">Create Schedule For Selected</button>
+
+            <div style="margin-top: 12px;">
+              <table>
+                <thead>
+                  <tr><th>ID</th><th>Monitor</th><th>Run At</th><th>Applied</th><th>Actions</th></tr>
+                </thead>
+                <tbody id="schedules"></tbody>
+              </table>
+            </div>
+          </div>
         </div>
 
-        <div class="card" style="margin-top:16px;">
-          <h2>Monitor List</h2>
+        <div class="card" style="margin-top:14px;">
+          <h2 class="section-title">Monitor List</h2>
           <table>
-            <thead><tr><th>ID</th><th>Retailer</th><th>URL</th><th>Last Checked</th><th>Last Alert State</th><th>Actions</th></tr></thead>
+            <thead><tr><th>ID</th><th>Select</th><th>Retailer</th><th>URL</th><th>Last Checked</th><th>Last Alert State</th><th>Actions</th></tr></thead>
             <tbody id="monitors"></tbody>
           </table>
         </div>
@@ -475,6 +501,15 @@
       const data = await res.json();
       alert(data.error || `Webhook added (id=${data.id})`);
       await loadWebhooks();
+    }
+
+    async function testFirstWebhook() {
+      const hooks = await fetch('/api/webhooks').then(r => r.json());
+      if (!hooks.length) {
+        alert('No webhooks configured yet.');
+        return;
+      }
+      await testWebhook(hooks[0].id);
     }
 
     async function addMonitor() {
