@@ -712,7 +712,7 @@ def api_add_webhook():
     conn.commit()
     row = conn.execute("select * from webhooks where id = ?", (cur.lastrowid,)).fetchone()
     conn.close()
-    return jsonify(dict(row)), 201
+    return jsonify(serialize_webhook(row)), 201
 
 
 @app.get("/api/webhooks")
@@ -720,7 +720,7 @@ def api_list_webhooks():
     conn = db()
     rows = conn.execute("select * from webhooks order by id desc").fetchall()
     conn.close()
-    return jsonify([dict(r) for r in rows])
+    return jsonify([serialize_webhook(r) for r in rows])
 
 
 @app.post("/api/webhooks/<int:webhook_id>/test")
