@@ -1,4 +1,5 @@
 import importlib
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -86,7 +87,11 @@ def test_keyword_and_max_price_filter_block_event(tmp_path, monkeypatch):
     app_module.create_event_and_deliver(monitor, result_keyword_miss, eligible_keyword_miss)
 
     result_price_too_high = app_module.MonitorResult(
-        in_stock=True, price_cents=3500, title="Pokemon 151 Box", status_text="in_stock"
+        in_stock=True,
+        price_cents=3500,
+        title="Pokemon 151 Box",
+        status_text="in_stock",
+        keyword_matched=True,
     )
     eligible_price_too_high = app_module.alert_eligibility(monitor, result_price_too_high)
     app_module.create_event_and_deliver(monitor, result_price_too_high, eligible_price_too_high)
@@ -99,118 +104,60 @@ def test_keyword_and_max_price_filter_block_event(tmp_path, monkeypatch):
     assert posted_payloads == []
 
 
-def test_webhook_test_endpoint_returns_diagnostics_and_updates_health(tmp_path, monkeypatch):
+def test_evaluate_page_sets_keyword_and_price_fields(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
-    client = app_module.app.test_client()
 
-    created = client.post(
-        "/api/webhooks",
-        json={
-            "name": "Ops",
-            "webhook_url": "https://discord.com/api/webhooks/test",
-            "notify_success": True,
-            "notify_failures": True,
-            "notify_restock_only": False,
-        },
-    )
-    assert created.status_code == 201
-    hook_id = created.get_json()["id"]
+    html = """
+    <html>
+      <head><title>Pokemon 151 Booster Bundle</title></head>
+      <body>
+        <button>Add to Cart</button>
+        <p>Now only $29.99</p>
+      </body>
+    </html>
+    """
+    result = app_module.evaluate_page(html, keyword="pokemon")
 
-    class DummyResponse:
-        status_code = 204
-        text = "ok"
-
-    monkeypatch.setattr(app_module.requests, "post", lambda *args, **kwargs: DummyResponse())
-    tested = client.post(f"/api/webhooks/{hook_id}/test")
-    payload = tested.get_json()
-    assert tested.status_code == 200
-    assert payload["ok"] is True
-    assert payload["status_code"] == 204
-    assert "latency_ms" in payload
-
-    listed = client.get("/api/webhooks").get_json()
-    found = next(w for w in listed if w["id"] == hook_id)
-    assert found["last_test_status"] == "sent"
-    assert "webhook_url" not in found
-    assert found["masked_webhook_url"]
-
-    updated = client.patch(
-        f"/api/webhooks/{hook_id}",
-        json={"notify_success": False, "notify_failures": True, "notify_restock_only": False},
-    )
-    assert updated.status_code == 200
-    payload = updated.get_json()
-    assert payload["notify_success"] == 0
-    assert payload["notify_failures"] == 1
-    assert payload["notify_restock_only"] == 0
+    assert result.in_stock is True
+    assert result.keyword_matched is True
+    assert result.price_cents == 2999
+    assert result.status_text == "in_stock"
 
 
-def test_meta_and_schedule_creation(tmp_path, monkeypatch):
-    app_module = _load_app(tmp_path, monkeypatch)
-    client = app_module.app.test_client()
+def test_init_db_migrates_existing_monitors_table_with_msrp_column(tmp_path, monkeypatch):
+    db_path = tmp_path / "legacy.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
 
-    meta = client.get("/api/meta")
-    assert meta.status_code == 200
-    assert "app_version" in meta.get_json()
-
-    created_monitor = client.post(
-        "/api/monitors",
-        json={"retailer": "walmart", "product_url": "https://example.com/p", "poll_interval_seconds": 20},
-    )
-    monitor_id = created_monitor.get_json()["id"]
-    schedule = client.post(
-        "/api/schedules",
-        json={
-            "monitor_ids": [monitor_id],
-            "new_poll_interval_seconds": 35,
-            "run_at": "2000-01-01T00:00:00+00:00",
-        },
-    )
-    assert schedule.status_code == 200
-    created = schedule.get_json()["created"]
-    assert len(created) == 1
-
-    conn = app_module.db()
-    app_module.apply_due_schedules(conn)
-    conn.commit()
-    updated = conn.execute("select poll_interval_seconds from monitors where id = ?", (monitor_id,)).fetchone()
-    conn.close()
-    assert updated["poll_interval_seconds"] == 35
-
-
-def test_monitor_loop_persists_scheduled_changes(tmp_path, monkeypatch):
-    app_module = _load_app(tmp_path, monkeypatch)
-    conn = app_module.db()
+    conn = sqlite3.connect(db_path)
     conn.execute(
         """
-        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, enabled, created_at, last_checked_at)
-        values (1, 'walmart', 'https://example.com/p', 20, 1, ?, ?)
-        """,
-        (app_module.utc_now(), app_module.utc_now()),
-    )
-    monitor_id = conn.execute("select id from monitors order by id desc limit 1").fetchone()["id"]
-    conn.execute(
+        create table monitors (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            retailer text not null,
+            product_url text not null,
+            keyword text,
+            max_price_cents integer,
+            poll_interval_seconds integer not null,
+            enabled integer not null default 1,
+            last_checked_at text,
+            last_in_stock integer,
+            last_price_cents integer,
+            created_at text not null
+        )
         """
-        insert into monitor_schedules(monitor_id, new_poll_interval_seconds, run_at, created_at)
-        values (?, 45, '2000-01-01T00:00:00+00:00', ?)
-        """,
-        (monitor_id, app_module.utc_now()),
     )
     conn.commit()
     conn.close()
 
-    monkeypatch.setattr(app_module, "check_monitor_once", lambda _m: {"ok": True})
+    import app as app_module
 
-    def fake_sleep(_seconds):
-        app_module.running = False
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
 
-    monkeypatch.setattr(app_module.time, "sleep", fake_sleep)
-    app_module.running = True
-    app_module.monitor_loop()
-
-    conn = app_module.db()
-    updated = conn.execute("select poll_interval_seconds from monitors where id = ?", (monitor_id,)).fetchone()
-    schedule = conn.execute("select applied_at from monitor_schedules where monitor_id = ?", (monitor_id,)).fetchone()
+    conn = sqlite3.connect(db_path)
+    columns = {row[1] for row in conn.execute("pragma table_info(monitors)").fetchall()}
     conn.close()
-    assert updated["poll_interval_seconds"] == 45
-    assert schedule["applied_at"] is not None
+
+    assert "msrp_cents" in columns

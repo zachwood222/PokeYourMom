@@ -7,153 +7,195 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
   <style>
     :root { color-scheme: dark; }
-    body { font-family: Inter, system-ui, Arial, sans-serif; margin: 0; background: #0d1117; color: #e6edf3; }
-    .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 16px; }
-    h1, h2 { margin-top: 0; }
+    * { box-sizing: border-box; }
+    body { font-family: Inter, system-ui, Arial, sans-serif; margin: 0; background: radial-gradient(circle at top, #122238, #0d1117 45%); color: #e6edf3; }
+    .layout { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
+    .sidebar { border-right: 1px solid #30363d; background: rgba(13, 17, 23, 0.84); padding: 20px; }
+    .brand { margin: 0 0 4px; font-size: 22px; }
+    .subtitle { margin: 0 0 16px; color: #9fb0c1; font-size: 12px; }
+    .nav { display: grid; gap: 8px; }
+    .nav button { text-align: left; width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; cursor: pointer; }
+    .nav button.active, .nav button:hover { border-color: #58a6ff; background: #101a29; }
+
+    .content { padding: 24px; }
+    .tab { display: none; }
+    .tab.active { display: block; }
+
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+    .card { background: rgba(22, 27, 34, 0.92); border: 1px solid #30363d; border-radius: 12px; padding: 16px; }
+    .kpi-label { font-size: 12px; color: #9fb0c1; margin-bottom: 6px; }
+    .kpi-value { font-size: 24px; font-weight: 700; }
+
+    h1, h2, h3 { margin-top: 0; }
     label { display: block; margin: 8px 0 4px; font-size: 13px; color: #9fb0c1; }
     input, select, button { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; }
     button { cursor: pointer; font-weight: 600; }
     button:hover { border-color: #58a6ff; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .logs { height: 260px; overflow-y: auto; white-space: pre-wrap; background: #010409; border: 1px solid #30363d; border-radius: 8px; padding: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { padding: 8px; border-bottom: 1px solid #30363d; text-align: left; }
     .actions { display: flex; gap: 8px; }
     .actions button { width: auto; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px; border-bottom: 1px solid #30363d; text-align: left; }
+
+    .logs { height: 400px; overflow-y: auto; white-space: pre-wrap; background: #010409; border: 1px solid #30363d; border-radius: 8px; padding: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
     .warn { color: #f7b955; font-size: 13px; }
-    .muted { color: #9fb0c1; font-size: 12px; }
-    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid #30363d; font-size:12px; }
-    .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    .small { color: #9fb0c1; font-size: 12px; }
+
+    @media (max-width: 980px) {
+      .layout { grid-template-columns: 1fr; }
+      .sidebar { border-right: none; border-bottom: 1px solid #30363d; }
+      .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>Stock Sentinel</h1>
-    <p class="warn">This app intentionally supports stock monitoring + Discord alerts only. Auto-checkout is not implemented.</p>
+  <div class="layout">
+    <aside class="sidebar">
+      <h2 class="brand">Stock Sentinel</h2>
+      <p class="subtitle">Operator Dashboard</p>
+      <nav class="nav">
+        <button class="active" data-tab="home" onclick="setTab('home')">Home</button>
+        <button data-tab="monitors" onclick="setTab('monitors')">Monitors</button>
+        <button data-tab="webhooks" onclick="setTab('webhooks')">Webhooks</button>
+        <button data-tab="settings" onclick="setTab('settings')">Settings</button>
+        <button data-tab="logs" onclick="setTab('logs')">Logs</button>
+      </nav>
+    </aside>
 
-    <div class="grid">
-      <div class="card">
-        <h2>Workspace</h2>
-        <label>Subscription Plan</label>
-        <select id="plan">
-          <option value="basic">basic</option>
-          <option value="pro">pro</option>
-          <option value="team">team</option>
-        </select>
-        <div class="actions" style="margin-top:10px;">
-          <button onclick="savePlan()">Save Plan</button>
-          <button onclick="toggleLoop()" id="loopBtn">Start Monitor Loop</button>
+    <main class="content">
+      <section id="tab-home" class="tab active">
+        <h1>Home</h1>
+        <p class="small">Live workspace health and throughput metrics.</p>
+        <div class="kpi-grid">
+          <div class="card"><div class="kpi-label">Monitors</div><div id="kpi_total_monitors" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Enabled</div><div id="kpi_enabled_monitors" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Events (24h)</div><div id="kpi_events_24h" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Delivery Success</div><div id="kpi_success_rate" class="kpi-value">0%</div></div>
         </div>
-      </div>
+        <div class="card" style="margin-top:16px;">
+          <h3>Runtime</h3>
+          <div class="row">
+            <div>
+              <label>Loop State</label>
+              <input id="runtime_running" disabled />
+            </div>
+            <div>
+              <label>Latest Check</label>
+              <input id="runtime_latest_check" disabled />
+            </div>
+          </div>
+          <div class="actions" style="margin-top:10px;">
+            <button onclick="loadDashboardSummary()">Refresh Metrics</button>
+          </div>
+        </div>
+      </section>
 
-      <div class="card">
-        <h2>Add Discord Webhook</h2>
-        <label>Name</label>
-        <input id="webhook_name" value="Main Discord" />
-        <label>Webhook URL</label>
-        <input id="webhook_url" placeholder="https://discord.com/api/webhooks/..." />
-        <div class="row3" style="margin-top:10px;">
-          <label><input id="notify_success" type="checkbox" checked /> Notify success</label>
-          <label><input id="notify_failures" type="checkbox" /> Notify failures</label>
-          <label><input id="notify_restock_only" type="checkbox" checked /> Restock only</label>
+      <section id="tab-monitors" class="tab">
+        <h1>Monitors</h1>
+        <div class="card">
+          <h2>Add Product Monitor</h2>
+          <div class="row">
+            <div>
+              <label>Retailer</label>
+              <select id="retailer">
+                <option>walmart</option>
+                <option>target</option>
+                <option>bestbuy</option>
+              </select>
+            </div>
+            <div>
+              <label>Poll Interval (seconds)</label>
+              <input id="poll_interval" type="number" value="20" />
+            </div>
+          </div>
+          <label>Product URL</label>
+          <input id="product_url" placeholder="https://www.walmart.com/ip/..." />
+          <div class="row">
+            <div>
+              <label>Keyword Filter (optional)</label>
+              <input id="keyword" placeholder="pokemon" />
+            </div>
+            <div>
+              <label>Max Price Cents (optional)</label>
+              <input id="max_price_cents" type="number" placeholder="4000" />
+            </div>
+          </div>
+          <div class="row">
+            <div>
+              <label>Original MSRP Cents (Pokemon only, optional)</label>
+              <input id="msrp_cents" type="number" placeholder="499" />
+            </div>
+          </div>
+          <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
         </div>
-        <div class="actions" style="margin-top:10px;">
-          <button onclick="addWebhook()">Add Webhook</button>
-        </div>
-      </div>
-    </div>
 
-    <div class="card" style="margin-top:16px;">
-      <h2>Settings Metadata</h2>
-      <div id="meta" class="muted">Loading metadata...</div>
-      <div class="actions" style="margin-top:10px;">
-        <button onclick="checkUpdates()">Check for Updates</button>
-      </div>
-    </div>
+        <div class="card" style="margin-top:16px;">
+          <h2>Monitor List</h2>
+          <table>
+            <thead><tr><th>ID</th><th>Retailer</th><th>URL</th><th>Last Checked</th><th>Last Alert State</th><th>Actions</th></tr></thead>
+            <tbody id="monitors"></tbody>
+          </table>
+        </div>
+      </section>
 
-    <div class="card" style="margin-top:16px;">
-      <h2>Webhooks</h2>
-      <table>
-        <thead><tr><th>ID</th><th>Name</th><th>Prefs</th><th>Health</th><th>Actions</th></tr></thead>
-        <tbody id="webhooks"></tbody>
-      </table>
-    </div>
+      <section id="tab-webhooks" class="tab">
+        <h1>Webhooks</h1>
+        <div class="card">
+          <h2>Add Discord Webhook</h2>
+          <label>Name</label>
+          <input id="webhook_name" value="Main Discord" />
+          <label>Webhook URL</label>
+          <input id="webhook_url" placeholder="https://discord.com/api/webhooks/..." />
+          <div class="actions" style="margin-top:10px;">
+            <button onclick="addWebhook()">Add Webhook</button>
+            <button onclick="testFirstWebhook()">Test First Webhook</button>
+          </div>
+        </div>
+      </section>
 
-    <div class="card" style="margin-top:16px;">
-      <h2>Add Product Monitor</h2>
-      <div class="row">
-        <div>
-          <label>Retailer</label>
-          <select id="retailer">
-            <option>walmart</option>
-            <option>target</option>
-            <option>bestbuy</option>
-          </select>
+      <section id="tab-settings" class="tab">
+        <h1>Settings</h1>
+        <div class="grid">
+          <div class="card">
+            <h2>Workspace</h2>
+            <label>Subscription Plan</label>
+            <select id="plan">
+              <option value="basic">basic</option>
+              <option value="pro">pro</option>
+              <option value="team">team</option>
+            </select>
+            <div class="actions" style="margin-top:10px;">
+              <button onclick="savePlan()">Save Plan</button>
+              <button onclick="toggleLoop()" id="loopBtn">Start Monitor Loop</button>
+            </div>
+          </div>
+          <div class="card">
+            <h2>Policy</h2>
+            <p class="warn">This app intentionally supports stock monitoring + Discord alerts only. Auto-checkout is not implemented.</p>
+          </div>
         </div>
-        <div>
-          <label>Poll Interval (seconds)</label>
-          <input id="poll_interval" type="number" value="20" />
-        </div>
-      </div>
-      <label>Product URL</label>
-      <input id="product_url" placeholder="https://www.walmart.com/ip/..." />
-      <div class="row">
-        <div>
-          <label>Keyword Filter (optional)</label>
-          <input id="keyword" placeholder="pokemon" />
-        </div>
-        <div>
-          <label>Max Price Cents (optional)</label>
-          <input id="max_price_cents" type="number" placeholder="4000" />
-        </div>
-      </div>
-      <div class="row">
-        <div>
-          <label>Original MSRP Cents (Pokemon only, optional)</label>
-          <input id="msrp_cents" type="number" placeholder="499" />
-        </div>
-      </div>
-      <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
-    </div>
+      </section>
 
-    <div class="card" style="margin-top:16px;">
-      <h2>Monitors</h2>
-      <table>
-        <thead><tr><th>ID</th><th>Pick</th><th>Retailer</th><th>URL</th><th>Last Checked</th><th>Last Alert State</th><th>Actions</th></tr></thead>
-        <tbody id="monitors"></tbody>
-      </table>
-    </div>
-
-    <div class="card" style="margin-top:16px;">
-      <h2>Schedule Poll Changes</h2>
-      <div class="row">
-        <div>
-          <label>Run At (ISO UTC)</label>
-          <input id="schedule_run_at" placeholder="2026-04-17T20:30:00+00:00" />
-        </div>
-        <div>
-          <label>New Poll Interval Seconds</label>
-          <input id="schedule_poll" type="number" value="15" />
-        </div>
-      </div>
-      <button style="margin-top:10px;" onclick="createSchedule()">Create Schedule For Selected Monitors</button>
-      <table style="margin-top:10px;">
-        <thead><tr><th>ID</th><th>Monitor</th><th>Run At</th><th>Applied</th><th>Actions</th></tr></thead>
-        <tbody id="schedules"></tbody>
-      </table>
-    </div>
-
-    <div class="card" style="margin-top:16px;">
-      <h2>Live Logs</h2>
-      <div id="logs" class="logs"></div>
-    </div>
+      <section id="tab-logs" class="tab">
+        <h1>Live Logs</h1>
+        <div id="logs" class="logs"></div>
+      </section>
+    </main>
   </div>
 
   <script>
     const socket = io();
     let loopRunning = false;
+
+    function setTab(tab) {
+      document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.nav button').forEach(el => el.classList.remove('active'));
+      document.getElementById(`tab-${tab}`).classList.add('active');
+      document.querySelector(`.nav button[data-tab="${tab}"]`).classList.add('active');
+    }
 
     socket.on('log', (d) => {
       const logs = document.getElementById('logs');
@@ -164,6 +206,18 @@
     async function loadWorkspace() {
       const data = await fetch('/api/workspace').then(r => r.json());
       document.getElementById('plan').value = data.plan;
+    }
+
+    async function loadDashboardSummary() {
+      const data = await fetch('/api/dashboard/summary').then(r => r.json());
+      document.getElementById('kpi_total_monitors').textContent = data.total_monitors;
+      document.getElementById('kpi_enabled_monitors').textContent = data.enabled_monitors;
+      document.getElementById('kpi_events_24h').textContent = data.events_last_24h;
+      document.getElementById('kpi_success_rate').textContent = `${Math.round(data.delivery_success_rate * 100)}%`;
+      document.getElementById('runtime_running').value = data.running ? 'Running' : 'Stopped';
+      document.getElementById('runtime_latest_check').value = data.latest_check_at || '-';
+      loopRunning = !!data.running;
+      document.getElementById('loopBtn').textContent = loopRunning ? 'Stop Monitor Loop' : 'Start Monitor Loop';
     }
 
     async function savePlan() {
@@ -209,6 +263,7 @@
       const data = await res.json();
       alert(data.error || `Monitor added (id=${data.id})`);
       await loadMonitors();
+      await loadDashboardSummary();
     }
 
     async function loadMonitors() {
@@ -265,17 +320,12 @@
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td>${h.id}</td>
-          <td>${h.name}<div class="muted">${h.masked_webhook_url || ''}</div></td>
-          <td>
-            <label><input type="checkbox" id="w_success_${h.id}" ${h.notify_success ? 'checked' : ''}/>success</label>
-            <label><input type="checkbox" id="w_fail_${h.id}" ${h.notify_failures ? 'checked' : ''}/>failures</label>
-            <label><input type="checkbox" id="w_restock_${h.id}" ${h.notify_restock_only ? 'checked' : ''}/>restock-only</label>
-          </td>
+          <td>${h.name}<div class="muted">${h.webhook_url || ''}</div></td>
+          <td>${prefsLabel(h)}</td>
           <td>${h.last_delivery_status || '-'}<div class="muted">fail streak: ${h.fail_streak || 0}</div></td>
           <td class="actions">
             <button onclick="testWebhook(${h.id})">Test</button>
             <button onclick="toggleWebhook(${h.id}, ${h.enabled ? 0 : 1})">${h.enabled ? 'Disable' : 'Enable'}</button>
-            <button onclick="saveWebhookPrefs(${h.id})">Save Prefs</button>
             <button onclick="deleteWebhook(${h.id})">Delete</button>
           </td>
         `;
@@ -298,20 +348,6 @@
 
     async function deleteWebhook(id) {
       await fetch(`/api/webhooks/${id}`, {method: 'DELETE'});
-      await loadWebhooks();
-    }
-
-    async function saveWebhookPrefs(id) {
-      const payload = {
-        notify_success: document.getElementById(`w_success_${id}`).checked,
-        notify_failures: document.getElementById(`w_fail_${id}`).checked,
-        notify_restock_only: document.getElementById(`w_restock_${id}`).checked,
-      };
-      const res = await fetch(`/api/webhooks/${id}`, {
-        method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
-      });
-      const data = await res.json();
-      alert(data.error || `Webhook ${id} preferences saved`);
       await loadWebhooks();
     }
 
@@ -365,6 +401,7 @@
       const data = await res.json();
       alert(JSON.stringify(data));
       await loadMonitors();
+      await loadDashboardSummary();
     }
 
     async function toggleMonitor(id, enabled) {
@@ -372,11 +409,13 @@
         method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled})
       });
       await loadMonitors();
+      await loadDashboardSummary();
     }
 
     async function deleteMonitor(id) {
       await fetch(`/api/monitors/${id}`, {method: 'DELETE'});
       await loadMonitors();
+      await loadDashboardSummary();
     }
 
     async function toggleLoop() {
@@ -384,12 +423,14 @@
       await fetch(endpoint, {method: 'POST'});
       loopRunning = !loopRunning;
       document.getElementById('loopBtn').textContent = loopRunning ? 'Stop Monitor Loop' : 'Start Monitor Loop';
+      await loadDashboardSummary();
     }
 
     loadWorkspace();
     loadMeta();
     loadWebhooks();
     loadMonitors();
+    loadDashboardSummary();
   </script>
 </body>
 </html>

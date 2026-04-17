@@ -45,3 +45,10 @@ This project is a scaffold for a subscription monitoring SaaS and should be expa
 - Max price filters are now enforced before creating in-stock events and sending Discord webhooks.
 - Pokemon monitors can enforce MSRP protection by setting `msrp_cents`; alerts only fire when current price is within `$10` of MSRP (configurable with `POKEMON_MSRP_BUFFER_CENTS`).
 - `last_in_stock` now reflects "eligible for alert" state (in stock + filters pass), not raw page stock marker detection.
+
+## Documentation
+
+- Architecture and runbooks: `docs/overview.md`
+- Task creation: `docs/task-creation.md`
+- Error glossary: `docs/errors-and-statuses.md`
+- Retailer playbooks: `docs/retailer-playbooks/`

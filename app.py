@@ -72,22 +72,6 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -
         conn.execute(f"alter table {table} add column {column} {ddl}")
 
 
-def mask_webhook_url(url: str) -> str:
-    if not url:
-        return ""
-    if len(url) <= 14:
-        return "••••"
-    return f"{url[:10]}…{url[-4:]}"
-
-
-def serialize_webhook(row: sqlite3.Row, include_secret: bool = False) -> dict[str, Any]:
-    payload = dict(row)
-    payload["masked_webhook_url"] = mask_webhook_url(row["webhook_url"])
-    if not include_secret:
-        payload.pop("webhook_url", None)
-    return payload
-
-
 def init_db() -> None:
     conn = db()
     conn.executescript(
@@ -321,125 +305,13 @@ def dedupe_key(monitor: sqlite3.Row, result: MonitorResult) -> str:
     return f"{monitor['id']}:{result.in_stock}:{bucket}:{minute}"
 
 
-def update_webhook_health(
-    conn: sqlite3.Connection,
-    webhook_id: int,
-    *,
-    status: str,
-    status_code: int | None = None,
-    error_text: str = "",
-    tested: bool = False,
+def create_event_and_deliver(
+    monitor: sqlite3.Row,
+    result: MonitorResult,
+    eligible: bool | None = None,
 ) -> None:
-    if status == "sent":
-        conn.execute(
-            """
-            update webhooks
-            set last_delivery_status = ?, last_delivery_at = ?, fail_streak = 0, last_error = ?, last_status_code = ?
-            where id = ?
-            """,
-            (status, utc_now(), "", status_code, webhook_id),
-        )
-    else:
-        conn.execute(
-            """
-            update webhooks
-            set last_delivery_status = ?, last_delivery_at = ?, fail_streak = fail_streak + 1, last_error = ?, last_status_code = ?
-            where id = ?
-            """,
-            (status, utc_now(), (error_text or "")[:500], status_code, webhook_id),
-        )
-    if tested:
-        conn.execute(
-            "update webhooks set last_tested_at = ?, last_test_status = ? where id = ?",
-            (utc_now(), status, webhook_id),
-        )
-
-
-def should_send_to_webhook(monitor: sqlite3.Row, hook: sqlite3.Row, eligible: bool) -> bool:
-    if not eligible or not hook["notify_success"]:
-        return False
-    if not hook["notify_restock_only"]:
-        return True
-    return monitor["last_in_stock"] in (None, 0)
-
-
-def create_monitor_error_events(monitor: sqlite3.Row, error_message: str) -> None:
-    conn = db()
-    monitor_db = conn.execute("select * from monitors where id = ?", (monitor["id"],)).fetchone()
-    if not monitor_db:
-        conn.close()
-        return
-    if monitor_db["failure_streak"] < 3:
-        conn.close()
-        return
-
-    hooks = conn.execute(
-        "select * from webhooks where workspace_id = ? and enabled = 1 and notify_failures = 1",
-        (monitor_db["workspace_id"],),
-    ).fetchall()
-    if not hooks:
-        conn.close()
-        return
-
-    dedupe = f"{monitor_db['id']}:error:{monitor_db['failure_streak']}"
-    existing = conn.execute("select id from events where dedupe_key = ?", (dedupe,)).fetchone()
-    if existing:
-        conn.close()
-        return
-
-    cur = conn.execute(
-        """
-        insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
-        values (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            monitor_db["id"],
-            "monitor_error",
-            f"Monitor failing: {monitor_db['retailer']}",
-            monitor_db["product_url"],
-            monitor_db["retailer"],
-            None,
-            utc_now(),
-            dedupe,
-        ),
-    )
-    event_id = cur.lastrowid
-    payload = {
-        "username": "Stock Sentinel",
-        "content": f"⚠️ Monitor {monitor_db['id']} failure streak: {monitor_db['failure_streak']}",
-        "embeds": [
-            {
-                "title": "Monitor fetch failures detected",
-                "description": (error_message or "unknown error")[:300],
-                "url": monitor_db["product_url"],
-                "color": 15105570,
-            }
-        ],
-    }
-    for hook in hooks:
-        status, code, body = "queued", None, ""
-        try:
-            resp = requests.post(hook["webhook_url"], json=payload, timeout=8)
-            code = resp.status_code
-            body = (resp.text or "")[:1000]
-            status = "sent" if 200 <= resp.status_code < 300 else "failed"
-        except Exception as exc:  # noqa: BLE001
-            status = "failed"
-            body = str(exc)
-        conn.execute(
-            """
-            insert into deliveries(event_id, webhook_id, status, response_code, response_body, delivered_at)
-            values (?, ?, ?, ?, ?, ?)
-            """,
-            (event_id, hook["id"], status, code, body, utc_now()),
-        )
-        update_webhook_health(conn, hook["id"], status=status, status_code=code, error_text=body)
-
-    conn.commit()
-    conn.close()
-
-
-def create_event_and_deliver(monitor: sqlite3.Row, result: MonitorResult, eligible: bool) -> None:
+    if eligible is None:
+        eligible = alert_eligibility(monitor, result)
     if not eligible:
         return
 
@@ -604,7 +476,6 @@ def monitor_loop() -> None:
         with lock:
             conn = db()
             apply_due_schedules(conn)
-            conn.commit()
             monitors = conn.execute("select * from monitors where enabled = 1").fetchall()
             conn.close()
 
@@ -683,6 +554,50 @@ def api_list_monitors():
     return jsonify([dict(r) for r in rows])
 
 
+@app.get("/api/dashboard/summary")
+def api_dashboard_summary():
+    conn = db()
+    total_monitors = conn.execute("select count(*) as c from monitors").fetchone()["c"]
+    enabled_monitors = conn.execute(
+        "select count(*) as c from monitors where enabled = 1"
+    ).fetchone()["c"]
+    checks_last_24h = conn.execute(
+        """
+        select count(*) as c from monitors
+        where last_checked_at is not null
+          and datetime(last_checked_at) >= datetime('now', '-1 day')
+        """
+    ).fetchone()["c"]
+    latest_check = conn.execute(
+        "select max(last_checked_at) as latest_check from monitors"
+    ).fetchone()["latest_check"]
+    events_24h = conn.execute(
+        "select count(*) as c from events where datetime(event_time) >= datetime('now', '-1 day')"
+    ).fetchone()["c"]
+    events_7d = conn.execute(
+        "select count(*) as c from events where datetime(event_time) >= datetime('now', '-7 day')"
+    ).fetchone()["c"]
+    deliveries_total = conn.execute("select count(*) as c from deliveries").fetchone()["c"]
+    deliveries_sent = conn.execute(
+        "select count(*) as c from deliveries where status = 'sent'"
+    ).fetchone()["c"]
+    conn.close()
+
+    success_rate = 0.0 if deliveries_total == 0 else (deliveries_sent / deliveries_total)
+    return jsonify(
+        {
+            "total_monitors": total_monitors,
+            "enabled_monitors": enabled_monitors,
+            "checks_last_24h": checks_last_24h,
+            "latest_check_at": latest_check,
+            "events_last_24h": events_24h,
+            "events_last_7d": events_7d,
+            "delivery_success_rate": round(success_rate, 4),
+            "running": running,
+        }
+    )
+
+
 @app.post("/api/monitors")
 def api_create_monitor():
     body = request.json or {}
@@ -701,6 +616,11 @@ def api_create_monitor():
             raise ValueError(f"Unsupported retailer '{retailer}'")
         if not (url.startswith("http://") or url.startswith("https://")):
             raise ValueError("product_url must be http(s)")
+
+        if retailer not in SUPPORTED_RETAILERS:
+            raise ValueError(f"Unsupported retailer: {retailer}")
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise ValueError("product_url must start with http:// or https://")
 
         enforce_plan_limits(1, poll_interval)
     except (KeyError, ValueError) as exc:
@@ -862,7 +782,7 @@ def api_update_webhook(webhook_id: int):
     conn.close()
     if not row:
         return jsonify({"error": "Webhook not found"}), 404
-    return jsonify(serialize_webhook(row))
+    return jsonify(dict(row))
 
 
 @app.delete("/api/webhooks/<int:webhook_id>")
