@@ -431,7 +431,7 @@
     }
 
     async function loadDashboardSummary() {
-      const data = await fetch('/api/dashboard/summary').then(r => r.json());
+      const data = await apiFetch('/api/dashboard/summary').then(r => r.json());
       document.getElementById('kpi_total_monitors').textContent = data.total_monitors;
       document.getElementById('kpi_enabled_monitors').textContent = data.enabled_monitors;
       document.getElementById('kpi_events_24h').textContent = data.events_last_24h;
@@ -480,7 +480,7 @@
 
     async function savePlan() {
       const plan = document.getElementById('plan').value;
-      const res = await fetch('/api/workspace/plan', {
+      const res = await apiFetch('/api/workspace/plan', {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({plan})
       });
       const data = await res.json();
@@ -495,7 +495,7 @@
         notify_failures: document.getElementById('notify_failures').checked,
         notify_restock_only: document.getElementById('notify_restock_only').checked,
       };
-      const res = await fetch('/api/webhooks', {
+      const res = await apiFetch('/api/webhooks', {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
       });
       const data = await res.json();
@@ -524,7 +524,7 @@
         msrp_cents: msrp ? Number(msrp) : null,
       };
 
-      const res = await fetch('/api/monitors', {
+      const res = await apiFetch('/api/monitors', {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
       });
       const data = await res.json();
@@ -534,7 +534,7 @@
     }
 
     async function loadMonitors() {
-      const rows = await fetch('/api/monitors').then(r => r.json());
+      const rows = await apiFetch('/api/monitors').then(r => r.json());
       const tbody = document.getElementById('monitors');
       tbody.innerHTML = '';
       for (const r of rows) {
@@ -558,7 +558,7 @@
     }
 
     async function loadMeta() {
-      const m = await fetch('/api/meta').then(r => r.json());
+      const m = await apiFetch('/api/meta').then(r => r.json());
       document.getElementById('meta').innerHTML = `
         <span class="pill">v${m.app_version}</span>
         <span class="pill">${m.release_channel}</span>
@@ -567,7 +567,7 @@
     }
 
     async function checkUpdates() {
-      const data = await fetch('/api/meta/check-update').then(r => r.json());
+      const data = await apiFetch('/api/meta/check-update').then(r => r.json());
       alert(`Current ${data.current_version} | Latest ${data.latest_version} | Update available: ${data.update_available}`);
     }
 
@@ -580,7 +580,7 @@
     }
 
     async function loadWebhooks() {
-      const hooks = await fetch('/api/webhooks').then(r => r.json());
+      const hooks = await apiFetch('/api/webhooks').then(r => r.json());
       const tbody = document.getElementById('webhooks');
       tbody.innerHTML = '';
       for (const h of hooks) {
@@ -601,20 +601,20 @@
     }
 
     async function testWebhook(id) {
-      const data = await fetch(`/api/webhooks/${id}/test`, {method: 'POST'}).then(r => r.json());
+      const data = await apiFetch(`/api/webhooks/${id}/test`, {method: 'POST'}).then(r => r.json());
       alert(JSON.stringify(data));
       await loadWebhooks();
     }
 
     async function toggleWebhook(id, enabled) {
-      await fetch(`/api/webhooks/${id}`, {
+      await apiFetch(`/api/webhooks/${id}`, {
         method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled})
       });
       await loadWebhooks();
     }
 
     async function deleteWebhook(id) {
-      await fetch(`/api/webhooks/${id}`, {method: 'DELETE'});
+      await apiFetch(`/api/webhooks/${id}`, {method: 'DELETE'});
       await loadWebhooks();
     }
 
@@ -642,7 +642,7 @@
         run_at: document.getElementById('schedule_run_at').value,
         new_poll_interval_seconds: Number(document.getElementById('schedule_poll').value),
       };
-      const res = await fetch('/api/schedules', {
+      const res = await apiFetch('/api/schedules', {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
       });
       const data = await res.json();
@@ -651,7 +651,7 @@
     }
 
     async function loadSchedules() {
-      const rows = await fetch('/api/schedules').then(r => r.json());
+      const rows = await apiFetch('/api/schedules').then(r => r.json());
       const tbody = document.getElementById('schedules');
       tbody.innerHTML = '';
       for (const s of rows) {
@@ -668,12 +668,12 @@
     }
 
     async function deleteSchedule(id) {
-      await fetch(`/api/schedules/${id}`, {method: 'DELETE'});
+      await apiFetch(`/api/schedules/${id}`, {method: 'DELETE'});
       await loadSchedules();
     }
 
     async function checkMonitor(id) {
-      const res = await fetch(`/api/monitors/${id}/check`, {method: 'POST'});
+      const res = await apiFetch(`/api/monitors/${id}/check`, {method: 'POST'});
       const data = await res.json();
       alert(JSON.stringify(data));
       await loadMonitors();
@@ -681,7 +681,7 @@
     }
 
     async function toggleMonitor(id, enabled) {
-      await fetch(`/api/monitors/${id}`, {
+      await apiFetch(`/api/monitors/${id}`, {
         method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled})
       });
       await loadMonitors();
@@ -689,14 +689,14 @@
     }
 
     async function deleteMonitor(id) {
-      await fetch(`/api/monitors/${id}`, {method: 'DELETE'});
+      await apiFetch(`/api/monitors/${id}`, {method: 'DELETE'});
       await loadMonitors();
       await loadDashboardSummary();
     }
 
     async function toggleLoop() {
       const endpoint = loopRunning ? '/api/stop' : '/api/start';
-      await fetch(endpoint, {method: 'POST'});
+      await apiFetch(endpoint, {method: 'POST'});
       loopRunning = !loopRunning;
       document.getElementById('loopBtn').textContent = loopRunning ? 'Stop Monitor Loop' : 'Start Monitor Loop';
       await loadDashboardSummary();
