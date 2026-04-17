@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 import requests
@@ -69,6 +69,12 @@ class MonitorResult:
     keyword_matched: bool | None = None
     price_within_limit: bool | None = None
     within_msrp_delta: bool | None = None
+
+
+@dataclass(frozen=True)
+class RetailerParser:
+    name: str
+    parse: Callable[[str, str | None], MonitorResult]
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -227,6 +233,16 @@ def init_db() -> None:
             applied_at text,
             created_at text not null,
             foreign key(monitor_id) references monitors(id)
+        );
+
+        create table if not exists monitor_failures (
+            id integer primary key autoincrement,
+            monitor_id integer not null,
+            workspace_id integer not null,
+            error_text text,
+            failed_at text not null,
+            foreign key(monitor_id) references monitors(id),
+            foreign key(workspace_id) references workspaces(id)
         );
         """
     )
@@ -455,13 +471,15 @@ def canonical_retailer(retailer: str) -> str:
     return RETAILER_ALIASES.get(value, value)
 
 
-def evaluate_page(
-    html: str, keyword: str | None = None, retailer: str | None = None
-) -> MonitorResult:
+def _parse_common_title_and_text(html: str) -> tuple[str, str]:
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
     title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "Product"
     text = re.sub(r"<[^>]+>", " ", html).lower()
-    normalized_retailer = canonical_retailer(retailer) if retailer else None
+    return title[:180], text
+
+
+def default_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
 
     out_markers = [
         "out of stock",
@@ -478,18 +496,6 @@ def evaluate_page(
         "pickup",
         "ship it",
     ]
-    if normalized_retailer == "pokemoncenter":
-        out_markers.extend(
-            [
-                "notify me when available",
-                "currently unavailable",
-            ]
-        )
-        in_markers.extend(
-            [
-                "add to bag",
-            ]
-        )
 
     has_out = any(m in text for m in out_markers)
     has_in = any(m in text for m in in_markers)
@@ -507,6 +513,55 @@ def evaluate_page(
         status_text=status_text,
         keyword_matched=keyword_matched,
     )
+
+
+def pokemoncenter_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
+    result = default_parser(html, keyword=keyword)
+    out_markers = ["notify me when available", "currently unavailable"]
+    in_markers = ["add to bag"]
+    has_out = any(m in text for m in out_markers)
+    has_in = any(m in text for m in in_markers)
+    if has_out:
+        result.in_stock = False
+        result.status_text = "out_or_unknown"
+    elif has_in:
+        result.in_stock = True
+        result.status_text = "in_stock"
+    result.title = title
+    return result
+
+
+def walmart_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
+    result = default_parser(html, keyword=keyword)
+    if '"availability":"instock"' in text or "fulfillmentoptions" in text:
+        result.in_stock = True
+        result.status_text = "in_stock"
+    if '"availability":"outofstock"' in text or "out of stock" in text:
+        result.in_stock = False
+        result.status_text = "out_or_unknown"
+    result.price_cents = extract_price_cents(html)
+    result.title = title
+    return result
+
+
+PARSERS: dict[str, RetailerParser] = {
+    "walmart": RetailerParser(name="walmart", parse=walmart_parser),
+    "pokemoncenter": RetailerParser(name="pokemoncenter", parse=pokemoncenter_parser),
+}
+
+
+def get_parser_for_retailer(retailer: str | None) -> RetailerParser:
+    normalized = canonical_retailer(retailer) if retailer else ""
+    return PARSERS.get(normalized, RetailerParser(name="default", parse=default_parser))
+
+
+def evaluate_page(
+    html: str, keyword: str | None = None, retailer: str | None = None
+) -> MonitorResult:
+    parser = get_parser_for_retailer(retailer)
+    return parser.parse(html, keyword)
 
 
 def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
@@ -721,6 +776,13 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
         result = fetch_monitor(monitor)
     except Exception as exc:  # noqa: BLE001
         conn = db()
+        conn.execute(
+            """
+            insert into monitor_failures(monitor_id, workspace_id, error_text, failed_at)
+            values (?, ?, ?, ?)
+            """,
+            (monitor["id"], monitor["workspace_id"], str(exc)[:500], utc_now()),
+        )
         conn.execute(
             """
             update monitors
@@ -967,24 +1029,92 @@ def api_dashboard_summary():
 @app.get("/api/ops/metrics")
 @require_auth
 def api_ops_metrics():
+    workspace_id = get_workspace_id_for_request()
     conn = db()
     metrics = {
         "checks_total": conn.execute(
-            "select count(*) as c from monitors where last_checked_at is not null"
+            "select count(*) as c from monitors where workspace_id = ? and last_checked_at is not null",
+            (workspace_id,),
         ).fetchone()["c"],
         "checks_failed_total": conn.execute(
-            "select count(*) as c from monitors where failure_streak > 0"
+            "select count(*) as c from monitors where workspace_id = ? and failure_streak > 0",
+            (workspace_id,),
         ).fetchone()["c"],
-        "alerts_created_total": conn.execute("select count(*) as c from events").fetchone()["c"],
+        "alerts_created_total": conn.execute(
+            """
+            select count(*) as c from events e
+            join monitors m on m.id = e.monitor_id
+            where m.workspace_id = ?
+            """,
+            (workspace_id,),
+        ).fetchone()["c"],
         "webhook_sent_total": conn.execute(
-            "select count(*) as c from deliveries where status = 'sent'"
+            """
+            select count(*) as c from deliveries d
+            join webhooks w on w.id = d.webhook_id
+            where w.workspace_id = ? and d.status = 'sent'
+            """,
+            (workspace_id,),
         ).fetchone()["c"],
         "webhook_failed_total": conn.execute(
-            "select count(*) as c from deliveries where status = 'failed'"
+            """
+            select count(*) as c from deliveries d
+            join webhooks w on w.id = d.webhook_id
+            where w.workspace_id = ? and d.status = 'failed'
+            """,
+            (workspace_id,),
         ).fetchone()["c"],
     }
     conn.close()
     return jsonify(metrics)
+
+
+@app.get("/api/ops/monitor-failure-trends")
+@require_auth
+def api_monitor_failure_trends():
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    rows = conn.execute(
+        """
+        select m.id as monitor_id,
+               coalesce(sum(case when datetime(mf.failed_at) >= datetime('now', '-1 day') then 1 else 0 end), 0) as failures_last_24h,
+               coalesce(sum(case when datetime(mf.failed_at) >= datetime('now', '-7 day') then 1 else 0 end), 0) as failures_last_7d
+        from monitors m
+        left join monitor_failures mf on mf.monitor_id = m.id
+        where m.workspace_id = ?
+        group by m.id
+        order by m.id asc
+        """,
+        (workspace_id,),
+    ).fetchall()
+    conn.close()
+    return jsonify({"trends": [dict(r) for r in rows]})
+
+
+@app.get("/api/ops/webhook-health-trends")
+@require_auth
+def api_webhook_health_trends():
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    rows = conn.execute(
+        """
+        select w.id as webhook_id,
+               w.fail_streak,
+               w.last_status_code,
+               w.last_delivery_status,
+               w.last_delivery_at,
+               coalesce(sum(case when d.status = 'failed' and datetime(d.delivered_at) >= datetime('now', '-1 day') then 1 else 0 end), 0) as recent_failures_24h,
+               coalesce(sum(case when d.status = 'failed' and datetime(d.delivered_at) >= datetime('now', '-7 day') then 1 else 0 end), 0) as recent_failures_7d
+        from webhooks w
+        left join deliveries d on d.webhook_id = w.id
+        where w.workspace_id = ?
+        group by w.id
+        order by w.id asc
+        """,
+        (workspace_id,),
+    ).fetchall()
+    conn.close()
+    return jsonify({"webhooks": [dict(r) for r in rows]})
 
 
 @app.post("/api/monitors")
