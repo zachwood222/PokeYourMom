@@ -517,6 +517,22 @@ def init_db() -> None:
             foreign key(workspace_id) references workspaces(id)
         );
 
+        create table if not exists jobs (
+            id integer primary key autoincrement,
+            job_type text not null default 'monitor_check',
+            monitor_id integer,
+            status text not null default 'queued',
+            attempt_count integer not null default 0,
+            next_run_at text not null,
+            locked_by text,
+            locked_at text,
+            payload_json text,
+            last_error text,
+            created_at text not null,
+            updated_at text not null,
+            foreign key(monitor_id) references monitors(id)
+        );
+
         create table if not exists checkout_tasks (
             id integer primary key autoincrement,
             workspace_id integer not null,
