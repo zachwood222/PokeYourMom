@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import re
+import random
 import secrets
 import sqlite3
 import threading
@@ -29,6 +30,7 @@ from retailers import (
 )
 
 from network.session_manager import RequestResult, SessionManager
+from network.session_manager import RequestBehaviorPolicy
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
@@ -36,6 +38,8 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 POLL_LOOP_SECONDS = int(os.getenv("POLL_LOOP_SECONDS", "15"))
 WORKER_IDLE_SLEEP_SECONDS = float(os.getenv("WORKER_IDLE_SLEEP_SECONDS", "2.0"))
+WORKER_IDLE_SLEEP_JITTER_SECONDS = float(os.getenv("WORKER_IDLE_SLEEP_JITTER_SECONDS", "0.75"))
+WORKER_ACTIVE_JITTER_SECONDS = float(os.getenv("WORKER_ACTIVE_JITTER_SECONDS", "0.2"))
 WORKER_LOCK_TIMEOUT_SECONDS = int(os.getenv("WORKER_LOCK_TIMEOUT_SECONDS", "60"))
 WORKER_ID = os.getenv("WORKER_ID", f"worker-{uuid4()}")
 APP_ROLE = os.getenv("APP_ROLE", "api").lower()
@@ -60,6 +64,7 @@ CAPTCHA_VERIFY_URL = os.getenv(
 )
 CAPTCHA_VERIFY_TIMEOUT_SECONDS = float(os.getenv("CAPTCHA_VERIFY_TIMEOUT_SECONDS", "2.0"))
 TASK_STEP_DELAY_SECONDS = float(os.getenv("TASK_STEP_DELAY_SECONDS", "0.5"))
+QUEUE_ENQUEUE_JITTER_SECONDS = float(os.getenv("QUEUE_ENQUEUE_JITTER_SECONDS", "1.25"))
 STRICT_API_AUTH_TOKEN = (os.getenv("STRICT_API_AUTH_TOKEN", "1") or "").strip().lower() not in {"0", "false", "no", "off"}
 
 PLAN_LIMITS = {
@@ -616,6 +621,7 @@ def init_db() -> None:
             plan text not null,
             proxy_url text,
             session_metadata text,
+            behavior_metadata text,
             subscription_status text not null default 'inactive',
             subscription_source text not null default 'manual',
             subscription_updated_at text,
@@ -657,6 +663,7 @@ def init_db() -> None:
             proxy_url text,
             session_task_key text,
             session_metadata text,
+            behavior_metadata text,
             created_at text not null,
             foreign key(workspace_id) references workspaces(id)
         );
@@ -963,6 +970,7 @@ def init_db() -> None:
     ensure_column(conn, "workspaces", "subscription_updated_at", "text")
     ensure_column(conn, "workspaces", "proxy_url", "text")
     ensure_column(conn, "workspaces", "session_metadata", "text")
+    ensure_column(conn, "workspaces", "behavior_metadata", "text")
     ensure_column(conn, "monitors", "proxy_url", "text")
     ensure_column(conn, "monitors", "session_task_key", "text")
     ensure_column(conn, "monitors", "session_metadata", "text")
@@ -986,6 +994,10 @@ def perform_request(
     url: str,
     workspace_id: int | None,
     proxy_url: str | None,
+    behavior_policy: RequestBehaviorPolicy | None = None,
+    pacing_key: str | None = None,
+    throttle_signal: bool = False,
+    throttle_reason: str | None = None,
     timeout: float,
     retry_total: int,
     backoff_factor: float,
@@ -997,6 +1009,10 @@ def perform_request(
         url=url,
         workspace_id=workspace_id,
         proxy_url=proxy_url,
+        behavior_policy=behavior_policy,
+        pacing_key=pacing_key,
+        throttle_signal=throttle_signal,
+        throttle_reason=throttle_reason,
         timeout=timeout,
         retry_total=retry_total,
         backoff_factor=backoff_factor,
@@ -1006,7 +1022,10 @@ def perform_request(
     level = "warning" if not telemetry.ok else "info"
     log(
         f"http_request task={telemetry.task_key} method={method.upper()} status={telemetry.status_code} "
-        f"latency_ms={telemetry.latency_ms} error_class={telemetry.error_class}",
+        f"latency_ms={telemetry.latency_ms} error_class={telemetry.error_class} "
+        f"pacing_profile={telemetry.pacing_profile} planned_delay_ms={telemetry.planned_delay_ms} "
+        f"applied_delay_ms={telemetry.applied_delay_ms} adaptive_level={telemetry.adaptive_backoff_level} "
+        f"throttled={int(telemetry.throttled)} throttle_reason={telemetry.throttle_reason}",
         level=level,
         workspace_id=workspace_id,
     )
@@ -1672,16 +1691,22 @@ def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
         "Accept-Language": "en-US,en;q=0.9",
     }
     conn = db()
-    workspace = conn.execute("select proxy_url from workspaces where id = ?", (monitor["workspace_id"],)).fetchone()
+    workspace = conn.execute(
+        "select proxy_url, behavior_metadata from workspaces where id = ?",
+        (monitor["workspace_id"],),
+    ).fetchone()
     conn.close()
     proxy_url = monitor["proxy_url"] or (workspace["proxy_url"] if workspace else None)
     task_key = monitor["session_task_key"] or f"monitor-{monitor['id']}"
+    behavior_policy = _build_request_behavior_policy(monitor, workspace)
     req = perform_request(
         task_key=task_key,
         method="GET",
         url=monitor["product_url"],
         workspace_id=monitor["workspace_id"],
         proxy_url=proxy_url,
+        behavior_policy=behavior_policy,
+        pacing_key=f"{monitor['retailer']}:{monitor['id']}",
         timeout=15,
         retry_total=2,
         backoff_factor=0.35,
@@ -2202,6 +2227,24 @@ def serialize_retailer_account(row: sqlite3.Row | None) -> dict[str, Any] | None
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 PHONE_RE = re.compile(r"^[0-9+\-().\s]{7,24}$")
 SESSION_STATUSES = {"active", "expired", "locked", "logged_out"}
+BEHAVIOR_PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,31}$")
+
+DEFAULT_REQUEST_BEHAVIOR_POLICY: dict[str, Any] = {
+    "profile": "default",
+    "base_delay_seconds": 0.2,
+    "jitter_ratio": 0.2,
+    "min_delay_seconds": 0.05,
+    "max_delay_seconds": 2.5,
+    "adaptive_backoff_enabled": True,
+    "adaptive_backoff_step_seconds": 0.4,
+    "adaptive_backoff_cap_seconds": 5.0,
+    "retailer_profiles": {
+        "walmart": {"profile": "walmart", "base_delay_seconds": 0.3, "max_delay_seconds": 3.0},
+        "target": {"profile": "target", "base_delay_seconds": 0.25, "max_delay_seconds": 2.5},
+        "bestbuy": {"profile": "bestbuy", "base_delay_seconds": 0.2, "max_delay_seconds": 2.0},
+        "pokemoncenter": {"profile": "pokemoncenter", "base_delay_seconds": 0.35, "max_delay_seconds": 3.5},
+    },
+}
 
 
 def _validate_email(email: str) -> str:
@@ -2231,6 +2274,78 @@ def _validate_address(value: Any, field_name: str) -> dict[str, Any]:
         if not isinstance(raw, str) or not raw.strip():
             raise ValueError(f"{field_name}.{key} is required")
     return {k: (v.strip() if isinstance(v, str) else v) for k, v in value.items()}
+
+
+def _validate_json_object(value: Any, *, field_name: str, max_length: int = 4000) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be an object")
+    serialized = json.dumps(value)
+    if len(serialized) > max_length:
+        raise ValueError(f"{field_name} exceeds {max_length} bytes")
+    return value
+
+
+def _validate_behavior_policy(value: Any, *, field_name: str = "behavior_metadata") -> dict[str, Any] | None:
+    metadata = _validate_json_object(value, field_name=field_name)
+    if metadata is None:
+        return None
+    for numeric_key in (
+        "base_delay_seconds",
+        "jitter_ratio",
+        "min_delay_seconds",
+        "max_delay_seconds",
+        "adaptive_backoff_step_seconds",
+        "adaptive_backoff_cap_seconds",
+    ):
+        if numeric_key in metadata:
+            numeric_value = float(metadata[numeric_key])
+            if numeric_value < 0:
+                raise ValueError(f"{field_name}.{numeric_key} must be >= 0")
+            metadata[numeric_key] = numeric_value
+    if "jitter_ratio" in metadata and not 0 <= float(metadata["jitter_ratio"]) <= 1:
+        raise ValueError(f"{field_name}.jitter_ratio must be between 0 and 1")
+    if "adaptive_backoff_enabled" in metadata:
+        metadata["adaptive_backoff_enabled"] = bool(metadata["adaptive_backoff_enabled"])
+    if "profile" in metadata:
+        profile = str(metadata["profile"]).strip().lower()
+        if not BEHAVIOR_PROFILE_NAME_RE.match(profile):
+            raise ValueError(f"{field_name}.profile has invalid format")
+        metadata["profile"] = profile
+    if "retailer_profiles" in metadata:
+        retailer_profiles = metadata["retailer_profiles"]
+        if not isinstance(retailer_profiles, dict):
+            raise ValueError(f"{field_name}.retailer_profiles must be an object")
+        normalized_profiles: dict[str, dict[str, Any]] = {}
+        for retailer, profile_cfg in retailer_profiles.items():
+            normalized_retailer = canonical_retailer(str(retailer).strip())
+            if normalized_retailer not in SUPPORTED_RETAILERS:
+                raise ValueError(f"{field_name}.retailer_profiles has unsupported retailer '{retailer}'")
+            if not isinstance(profile_cfg, dict):
+                raise ValueError(f"{field_name}.retailer_profiles.{retailer} must be an object")
+            normalized_profiles[normalized_retailer] = _validate_behavior_policy(
+                profile_cfg, field_name=f"{field_name}.retailer_profiles.{normalized_retailer}"
+            ) or {}
+        metadata["retailer_profiles"] = normalized_profiles
+    if "min_delay_seconds" in metadata and "max_delay_seconds" in metadata:
+        if float(metadata["max_delay_seconds"]) < float(metadata["min_delay_seconds"]):
+            raise ValueError(f"{field_name}.max_delay_seconds must be >= min_delay_seconds")
+    return metadata
+
+
+def _build_request_behavior_policy(monitor: sqlite3.Row, workspace: sqlite3.Row | None) -> RequestBehaviorPolicy:
+    merged: dict[str, Any] = json.loads(json.dumps(DEFAULT_REQUEST_BEHAVIOR_POLICY))
+    for raw in (workspace["behavior_metadata"] if workspace else None, monitor["behavior_metadata"]):
+        if not raw:
+            continue
+        try:
+            candidate = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(candidate, dict):
+            merged.update(candidate)
+    return RequestBehaviorPolicy.from_mapping(merged).for_retailer(monitor["retailer"])
 
 
 def should_send_to_webhook(monitor: sqlite3.Row, hook: sqlite3.Row, eligible: bool) -> bool:
@@ -2459,13 +2574,25 @@ class SQLiteJobQueue:
         ).fetchone()
         if exists:
             return
-        payload = json.dumps({"step_attempts": {}})
+        enqueue_jitter = random.uniform(0.0, max(QUEUE_ENQUEUE_JITTER_SECONDS, 0.0))
+        scheduled_ts = now_ts + enqueue_jitter
+        scheduled_iso = datetime.fromtimestamp(scheduled_ts, tz=timezone.utc).isoformat()
+        payload = json.dumps(
+            {
+                "step_attempts": {},
+                "pacing": {
+                    "enqueue_jitter_ms": int(enqueue_jitter * 1000),
+                    "scheduled_from_iso": now_iso,
+                    "scheduled_for_iso": scheduled_iso,
+                },
+            }
+        )
         self.conn.execute(
             """
             insert into jobs(job_type, monitor_id, status, attempt_count, next_run_at, payload_json, created_at, updated_at)
             values ('monitor_check', ?, 'queued', 0, ?, ?, ?, ?)
             """,
-            (monitor["id"], now_iso, payload, now_iso, now_iso),
+            (monitor["id"], scheduled_iso, payload, now_iso, now_iso),
         )
 
     def claim_due_job(self, *, now_iso: str) -> Job | None:
@@ -2652,7 +2779,12 @@ def worker_loop() -> None:
             conn.commit()
             conn.close()
         if not job:
-            time.sleep(WORKER_IDLE_SLEEP_SECONDS)
+            idle_jitter = random.uniform(0.0, max(WORKER_IDLE_SLEEP_JITTER_SECONDS, 0.0))
+            time.sleep(WORKER_IDLE_SLEEP_SECONDS + idle_jitter)
+        else:
+            active_jitter = random.uniform(0.0, max(WORKER_ACTIVE_JITTER_SECONDS, 0.0))
+            if active_jitter > 0:
+                time.sleep(active_jitter)
     log(f"Worker loop stopped ({WORKER_ID})")
 
 
@@ -2821,6 +2953,37 @@ def api_billing_stripe_webhook():
 def api_workspace():
     row = get_workspace(current_workspace_id())
     return jsonify({"workspace": dict(row), "user": current_user_context()})
+
+
+@app.patch("/api/workspace")
+@require_auth
+def api_update_workspace():
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
+    body = request.json or {}
+    updates: dict[str, Any] = {}
+    try:
+        if "proxy_url" in body:
+            updates["proxy_url"] = (body.get("proxy_url") or "").strip() or None
+        if "session_metadata" in body:
+            session_metadata = _validate_json_object(body.get("session_metadata"), field_name="session_metadata")
+            updates["session_metadata"] = json.dumps(session_metadata) if session_metadata is not None else None
+        if "behavior_metadata" in body:
+            behavior_metadata = _validate_behavior_policy(body.get("behavior_metadata"))
+            updates["behavior_metadata"] = json.dumps(behavior_metadata) if behavior_metadata is not None else None
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not updates:
+        return jsonify({"error": "No updatable fields provided"}), 400
+    workspace_id = current_workspace_id()
+    conn = db()
+    set_clause = ", ".join(f"{column} = ?" for column in updates)
+    conn.execute(f"update workspaces set {set_clause} where id = ?", (*updates.values(), workspace_id))
+    conn.commit()
+    row = conn.execute("select * from workspaces where id = ?", (workspace_id,)).fetchone()
+    conn.close()
+    return jsonify({"workspace": dict(row)})
 
 
 @app.post("/api/workspace/plan")
@@ -3286,6 +3449,10 @@ def api_create_monitor():
         msrp_cents = body.get("msrp_cents")
         if msrp_cents is not None:
             msrp_cents = int(msrp_cents)
+        proxy_url = (body.get("proxy_url") or "").strip() or None
+        session_task_key = (body.get("session_task_key") or "").strip() or None
+        session_metadata = _validate_json_object(body.get("session_metadata"), field_name="session_metadata")
+        behavior_metadata = _validate_behavior_policy(body.get("behavior_metadata"))
         if retailer not in SUPPORTED_RETAILERS:
             raise ValueError(f"Unsupported retailer '{retailer}'")
         if category not in SUPPORTED_MONITOR_CATEGORIES:
@@ -3294,6 +3461,8 @@ def api_create_monitor():
             raise ValueError(f"Retailer '{retailer}' does not support category '{category}'")
         if not (url.startswith("http://") or url.startswith("https://")):
             raise ValueError("product_url must be http(s)")
+        if session_task_key and len(session_task_key) > 80:
+            raise ValueError("session_task_key must be <= 80 chars")
 
         enforce_plan_limits(current_workspace_id(), poll_interval)
     except (KeyError, ValueError) as exc:
@@ -3330,11 +3499,34 @@ def api_update_monitor(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     body = request.json or {}
     enabled = body.get("enabled")
-    if enabled is None:
-        return jsonify({"error": "enabled is required"}), 400
+    updates: dict[str, Any] = {}
+    try:
+        if enabled is not None:
+            updates["enabled"] = int(bool(enabled))
+        if "proxy_url" in body:
+            updates["proxy_url"] = (body.get("proxy_url") or "").strip() or None
+        if "session_task_key" in body:
+            session_task_key = (body.get("session_task_key") or "").strip() or None
+            if session_task_key and len(session_task_key) > 80:
+                raise ValueError("session_task_key must be <= 80 chars")
+            updates["session_task_key"] = session_task_key
+        if "session_metadata" in body:
+            session_metadata = _validate_json_object(body.get("session_metadata"), field_name="session_metadata")
+            updates["session_metadata"] = json.dumps(session_metadata) if session_metadata is not None else None
+        if "behavior_metadata" in body:
+            behavior_metadata = _validate_behavior_policy(body.get("behavior_metadata"))
+            updates["behavior_metadata"] = json.dumps(behavior_metadata) if behavior_metadata is not None else None
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not updates:
+        return jsonify({"error": "No updatable fields provided"}), 400
 
     conn = db()
-    conn.execute("update monitors set enabled = ? where id = ? and workspace_id = ?", (int(bool(enabled)), monitor_id, workspace_id))
+    set_clause = ", ".join(f"{column} = ?" for column in updates)
+    conn.execute(
+        f"update monitors set {set_clause} where id = ? and workspace_id = ?",
+        (*updates.values(), monitor_id, workspace_id),
+    )
     conn.commit()
     row = conn.execute(
         "select * from monitors where id = ? and workspace_id = ?",
