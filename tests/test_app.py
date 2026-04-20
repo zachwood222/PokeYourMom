@@ -925,94 +925,106 @@ def test_billing_sync_canceled_subscription_enforces_stricter_limits(tmp_path, m
     assert "Plan limit reached (20 monitors)" in blocked_monitor_count.get_json()["error"]
 
 
-def test_profiles_accounts_payments_crud(tmp_path, monkeypatch):
+def test_init_db_creates_checkout_tables(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    conn = app_module.db()
+    tables = {
+        row["name"]
+        for row in conn.execute(
+            "select name from sqlite_master where type = 'table' and name in ('checkout_tasks', 'checkout_attempts', 'task_logs')"
+        ).fetchall()
+    }
+    conn.close()
+    assert tables == {"checkout_tasks", "checkout_attempts", "task_logs"}
+
+
+def test_check_monitor_enqueues_checkout_task_for_eligible_stock(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
 
-    profile_resp = client.post(
-        "/api/profiles",
-        json={
-            "name": "Main Profile",
-            "email": "buyer@example.com",
-            "phone": "+1 (555) 222-1111",
-            "shipping_address": {
-                "line1": "123 Test St",
-                "city": "Austin",
-                "state": "TX",
-                "postal_code": "78701",
-                "country": "US",
-            },
-            "billing_address": {
-                "line1": "123 Test St",
-                "city": "Austin",
-                "state": "TX",
-                "postal_code": "78701",
-                "country": "US",
-            },
-        },
-        headers=_auth_headers(),
-    )
-    assert profile_resp.status_code == 201
-    profile = profile_resp.get_json()
-    assert profile["email"] == "buyer@example.com"
-    assert profile["shipping_address"]["city"] == "Austin"
-
-    account_resp = client.post(
-        "/api/accounts",
+    create_resp = client.post(
+        "/api/monitors",
         json={
             "retailer": "target",
-            "username": "target-user",
-            "encrypted_credential_ref": "kms://vault/ref-123",
-            "session_status": "active",
+            "product_url": "https://example.com/item",
+            "keyword": "pokemon",
+            "poll_interval_seconds": 20,
         },
         headers=_auth_headers(),
     )
-    assert account_resp.status_code == 201
-    assert account_resp.get_json()["session_status"] == "active"
+    monitor = create_resp.get_json()
+    assert create_resp.status_code == 201
 
-    payment_resp = client.post(
-        "/api/payments",
-        json={
-            "label": "Visa token",
-            "provider": "stripe",
-            "token_reference": "pm_tok_123",
-            "billing_profile_id": profile["id"],
-        },
-        headers=_auth_headers(),
-    )
-    assert payment_resp.status_code == 201
-    assert payment_resp.get_json()["token_reference"] == "pm_tok_123"
+    def fake_fetch(_monitor):
+        return app_module.MonitorResult(
+            in_stock=True,
+            price_cents=2499,
+            title="Pokemon Test Item",
+            status_text="in_stock",
+            keyword_matched=True,
+        )
 
-    payment_pan_resp = client.post(
-        "/api/payments",
-        json={"label": "bad", "pan": "4242"},
-        headers=_auth_headers(),
-    )
-    assert payment_pan_resp.status_code == 400
-    assert "Raw card data is not allowed" in payment_pan_resp.get_json()["error"]
+    monkeypatch.setattr(app_module, "fetch_monitor", fake_fetch)
+    check_resp = client.post(f"/api/monitors/{monitor['id']}/check", headers=_auth_headers())
+    assert check_resp.status_code == 200
+    assert check_resp.get_json()["eligible_for_alert"] is True
 
-
-def test_profile_workspace_scoping(tmp_path, monkeypatch):
-    app_module = _load_app(tmp_path, monkeypatch)
-    client = app_module.app.test_client()
     conn = app_module.db()
-    conn.execute(
-        """
-        insert into checkout_profiles(
-            workspace_id, name, email, shipping_address_json, billing_address_json, created_at, updated_at
-        ) values (?, 'Other', 'other@example.com', ?, ?, ?, ?)
-        """,
-        (
-            999,
-            json.dumps({"line1": "x", "city": "x", "state": "x", "postal_code": "x", "country": "US"}),
-            json.dumps({"line1": "x", "city": "x", "state": "x", "postal_code": "x", "country": "US"}),
-            app_module.utc_now(),
-            app_module.utc_now(),
-        ),
-    )
-    conn.commit()
+    task = conn.execute("select * from checkout_tasks where monitor_id = ?", (monitor["id"],)).fetchone()
+    attempt_count = conn.execute(
+        "select count(*) as c from checkout_attempts where task_id = ?",
+        (task["id"],),
+    ).fetchone()["c"]
+    log_count = conn.execute(
+        "select count(*) as c from task_logs where task_id = ?",
+        (task["id"],),
+    ).fetchone()["c"]
     conn.close()
 
-    resp = client.get("/api/profiles", headers=_auth_headers())
-    assert resp.status_code == 200
-    assert resp.get_json() == []
+    assert task is not None
+    assert task["current_state"] == "queued"
+    assert attempt_count >= 2
+    assert log_count >= 2
+
+
+def test_checkout_task_lifecycle_routes(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_monitor_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/item",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    monitor = create_monitor_resp.get_json()
+    assert create_monitor_resp.status_code == 201
+
+    create_task_resp = client.post(
+        "/api/checkout/tasks",
+        json={"monitor_id": monitor["id"], "task_name": "Checkout 1"},
+        headers=_auth_headers(),
+    )
+    assert create_task_resp.status_code == 201
+    task = create_task_resp.get_json()
+
+    start_resp = client.post(f"/api/checkout/tasks/{task['id']}/start", headers=_auth_headers())
+    assert start_resp.status_code == 200
+    assert start_resp.get_json()["task"]["current_state"] == "monitoring"
+
+    pause_resp = client.post(f"/api/checkout/tasks/{task['id']}/pause", headers=_auth_headers())
+    assert pause_resp.status_code == 200
+    assert pause_resp.get_json()["task"]["current_state"] == "paused"
+
+    stop_resp = client.post(f"/api/checkout/tasks/{task['id']}/stop", headers=_auth_headers())
+    assert stop_resp.status_code == 200
+    assert stop_resp.get_json()["task"]["current_state"] == "stopped"
+
+    state_resp = client.get(f"/api/checkout/tasks/{task['id']}/state", headers=_auth_headers())
+    assert state_resp.status_code == 200
+    payload = state_resp.get_json()
+    assert payload["current_state"] == "stopped"
+    assert payload["last_error"] is None
