@@ -923,3 +923,96 @@ def test_billing_sync_canceled_subscription_enforces_stricter_limits(tmp_path, m
     )
     assert blocked_monitor_count.status_code == 400
     assert "Plan limit reached (20 monitors)" in blocked_monitor_count.get_json()["error"]
+
+
+def test_profiles_accounts_payments_crud(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    profile_resp = client.post(
+        "/api/profiles",
+        json={
+            "name": "Main Profile",
+            "email": "buyer@example.com",
+            "phone": "+1 (555) 222-1111",
+            "shipping_address": {
+                "line1": "123 Test St",
+                "city": "Austin",
+                "state": "TX",
+                "postal_code": "78701",
+                "country": "US",
+            },
+            "billing_address": {
+                "line1": "123 Test St",
+                "city": "Austin",
+                "state": "TX",
+                "postal_code": "78701",
+                "country": "US",
+            },
+        },
+        headers=_auth_headers(),
+    )
+    assert profile_resp.status_code == 201
+    profile = profile_resp.get_json()
+    assert profile["email"] == "buyer@example.com"
+    assert profile["shipping_address"]["city"] == "Austin"
+
+    account_resp = client.post(
+        "/api/accounts",
+        json={
+            "retailer": "target",
+            "username": "target-user",
+            "encrypted_credential_ref": "kms://vault/ref-123",
+            "session_status": "active",
+        },
+        headers=_auth_headers(),
+    )
+    assert account_resp.status_code == 201
+    assert account_resp.get_json()["session_status"] == "active"
+
+    payment_resp = client.post(
+        "/api/payments",
+        json={
+            "label": "Visa token",
+            "provider": "stripe",
+            "token_reference": "pm_tok_123",
+            "billing_profile_id": profile["id"],
+        },
+        headers=_auth_headers(),
+    )
+    assert payment_resp.status_code == 201
+    assert payment_resp.get_json()["token_reference"] == "pm_tok_123"
+
+    payment_pan_resp = client.post(
+        "/api/payments",
+        json={"label": "bad", "pan": "4242"},
+        headers=_auth_headers(),
+    )
+    assert payment_pan_resp.status_code == 400
+    assert "Raw card data is not allowed" in payment_pan_resp.get_json()["error"]
+
+
+def test_profile_workspace_scoping(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    conn = app_module.db()
+    conn.execute(
+        """
+        insert into checkout_profiles(
+            workspace_id, name, email, shipping_address_json, billing_address_json, created_at, updated_at
+        ) values (?, 'Other', 'other@example.com', ?, ?, ?, ?)
+        """,
+        (
+            999,
+            json.dumps({"line1": "x", "city": "x", "state": "x", "postal_code": "x", "country": "US"}),
+            json.dumps({"line1": "x", "city": "x", "state": "x", "postal_code": "x", "country": "US"}),
+            app_module.utc_now(),
+            app_module.utc_now(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/profiles", headers=_auth_headers())
+    assert resp.status_code == 200
+    assert resp.get_json() == []
