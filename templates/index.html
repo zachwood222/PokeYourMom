@@ -706,15 +706,37 @@
     }
 
     async function createTask() {
-      const payload = {
+      const taskPayload = {
         retailer: document.getElementById('task_retailer').value,
-        url: document.getElementById('task_url').value,
+        product_url: document.getElementById('task_url').value,
         profile: document.getElementById('task_profile').value,
         account: document.getElementById('task_account').value,
         payment: document.getElementById('task_payment').value,
       };
-      const res = await apiFetch('/api/tasks', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+
+      const monitorPayload = {
+        retailer: taskPayload.retailer,
+        product_url: taskPayload.product_url,
+        poll_interval_seconds: Number(document.getElementById('poll_interval').value),
+      };
+      const monitorRes = await apiFetch('/api/monitors', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(monitorPayload))
+      });
+      const monitor = await monitorRes.json();
+      if (monitor.error) {
+        alert(monitor.error);
+        return;
+      }
+
+      const res = await apiFetch('/api/checkout/tasks', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          monitor_id: monitor.id,
+          task_name: `${taskPayload.retailer} task`,
+          task_config: taskPayload,
+          initial_state: 'queued',
+        })
       });
       const data = await res.json();
       if (data.error) {
@@ -753,7 +775,7 @@
     }
 
     async function loadTasks() {
-      const rows = await apiFetch('/api/tasks').then(r => r.json()).catch(() => []);
+      const rows = await apiFetch('/api/checkout/tasks').then(r => r.json()).catch(() => []);
       taskMap = new Map();
       for (const row of rows) {
         taskMap.set(row.id, row);
@@ -762,12 +784,12 @@
     }
 
     async function startTask(id) {
-      await apiFetch(`/api/tasks/${id}/start`, {method: 'POST'});
+      await apiFetch(`/api/checkout/tasks/${id}/start`, {method: 'POST'});
       await loadTasks();
     }
 
     async function stopTask(id) {
-      await apiFetch(`/api/tasks/${id}/stop`, {method: 'POST'});
+      await apiFetch(`/api/checkout/tasks/${id}/stop`, {method: 'POST'});
       await loadTasks();
     }
 
@@ -779,11 +801,11 @@
     }
 
     async function loadTaskAttempts(taskId) {
-      const attempts = await apiFetch(`/api/tasks/${taskId}/attempts`).then(r => r.json()).catch(() => []);
+      const attempts = await apiFetch(`/api/checkout/tasks/${taskId}/attempts`).then(r => r.json()).catch(() => []);
       const logs = document.getElementById('task_logs');
       logs.textContent = '';
       for (const attempt of attempts.slice().reverse()) {
-        logs.textContent += `[${attempt.created_at}] attempt=${attempt.attempt_number} state=${attempt.state} step=${attempt.step || '-'} err=${attempt.error || '-'}\n`;
+        logs.textContent += `[${attempt.created_at}] state=${attempt.state} step=${attempt.step || '-'} err=${attempt.error || '-'}\n`;
       }
       logs.scrollTop = logs.scrollHeight;
     }

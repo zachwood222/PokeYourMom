@@ -1903,6 +1903,27 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return payload
 
 
+def serialize_task_ui(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    payload = serialize_checkout_task(row)
+    if payload is None:
+        return None
+    config = payload.get("task_config") or {}
+    current_state = str(payload.get("current_state") or "queued")
+    state = "running" if current_state == "monitoring" else ("idle" if current_state == "queued" else current_state)
+    return {
+        "id": payload["id"],
+        "state": state,
+        "retries": 0,
+        "last_step": current_state,
+        "last_error": payload.get("last_error"),
+        "retailer": config.get("retailer"),
+        "product_url": config.get("product_url"),
+        "profile": config.get("profile"),
+        "account": config.get("account"),
+        "payment": config.get("payment"),
+    }
+
+
 def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
@@ -3240,6 +3261,18 @@ def api_create_checkout_task():
     return jsonify(serialize_checkout_task(task)), 201
 
 
+@app.get("/api/checkout/tasks")
+@require_auth
+def api_list_checkout_tasks():
+    conn = db()
+    rows = conn.execute(
+        "select * from checkout_tasks where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_task_ui(row) for row in rows])
+
+
 @app.post("/api/checkout/tasks/<int:task_id>/start")
 @require_auth
 def api_start_checkout_task(task_id: int):
@@ -3295,6 +3328,39 @@ def api_stop_checkout_task(task_id: int):
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.get("/api/checkout/tasks/<int:task_id>/attempts")
+@require_auth
+def api_checkout_task_attempts(task_id: int):
+    conn = db()
+    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    attempts = conn.execute(
+        """
+        select id, task_id, state, status, error_text, created_at
+        from checkout_attempts
+        where task_id = ?
+        order by id desc
+        """,
+        (task_id,),
+    ).fetchall()
+    conn.close()
+    return jsonify(
+        [
+            {
+                "id": a["id"],
+                "task_id": a["task_id"],
+                "state": a["state"],
+                "step": a["status"],
+                "error": a["error_text"],
+                "created_at": a["created_at"],
+            }
+            for a in attempts
+        ]
+    )
 
 
 @app.get("/api/checkout/tasks/<int:task_id>/state")
