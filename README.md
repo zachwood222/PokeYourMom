@@ -62,3 +62,22 @@ This project is a scaffold for a subscription monitoring SaaS and should be expa
 - Task creation: `docs/task-creation.md`
 - Error glossary: `docs/errors-and-statuses.md`
 - Retailer playbooks: `docs/retailer-playbooks/`
+
+## Parser fixture tests
+
+Retailer parser snapshots live under `tests/fixtures/<retailer>/` and use this naming convention:
+
+- `in_stock.html`
+- `out_of_stock.html`
+- `ambiguous.html`
+
+The regression harness in `tests/test_parser_fixtures.py` asserts two expectations for each fixture:
+
+- `expected_in_stock` (`True`/`False`)
+- `expected_status` (`in_stock` or `out_or_unknown`)
+
+To add a new fixture case:
+
+1. Add the HTML snapshot in `tests/fixtures/<retailer>/`.
+2. Register a `pytest.param(...)` case in `tests/parser_fixture_harness.py` (case IDs are formatted as `<retailer>:<fixture_name>`).
+3. Run `pytest tests/test_parser_fixtures.py` to validate the new snapshot.

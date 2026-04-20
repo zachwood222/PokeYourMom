@@ -4,11 +4,11 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from parser_fixture_harness import load_fixture_html
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def _load_app(tmp_path, monkeypatch):
@@ -400,24 +400,8 @@ def test_parser_dispatch_uses_walmart_and_fallback(tmp_path, monkeypatch):
 
 def test_walmart_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
-    in_stock_html = """
-    <html>
-      <head><title>Walmart Item</title></head>
-      <body>
-        <script>{"availability":"InStock"}</script>
-        <p>$24.88</p>
-      </body>
-    </html>
-    """
-    out_stock_html = """
-    <html>
-      <head><title>Walmart Item</title></head>
-      <body>
-        <script>{"availability":"OutOfStock"}</script>
-        <p>$24.88</p>
-      </body>
-    </html>
-    """
+    in_stock_html = load_fixture_html("walmart", "in_stock")
+    out_stock_html = load_fixture_html("walmart", "out_of_stock")
 
     in_stock = app_module.evaluate_page(in_stock_html, retailer="walmart")
     out_stock = app_module.evaluate_page(out_stock_html, retailer="walmart")
@@ -430,8 +414,8 @@ def test_walmart_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch
 
 def test_target_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
-    in_stock_html = (FIXTURES / "target" / "in_stock.html").read_text()
-    out_stock_html = (FIXTURES / "target" / "out_of_stock.html").read_text()
+    in_stock_html = load_fixture_html("target", "in_stock")
+    out_stock_html = load_fixture_html("target", "out_of_stock")
 
     in_stock = app_module.evaluate_page(in_stock_html, retailer="target")
     out_stock = app_module.evaluate_page(out_stock_html, retailer="target")
@@ -444,8 +428,8 @@ def test_target_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch)
 
 def test_bestbuy_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
-    in_stock_html = (FIXTURES / "bestbuy" / "in_stock.html").read_text()
-    out_stock_html = (FIXTURES / "bestbuy" / "out_of_stock.html").read_text()
+    in_stock_html = load_fixture_html("bestbuy", "in_stock")
+    out_stock_html = load_fixture_html("bestbuy", "out_of_stock")
 
     in_stock = app_module.evaluate_page(in_stock_html, retailer="bestbuy")
     out_stock = app_module.evaluate_page(out_stock_html, retailer="bestbuy")
@@ -458,8 +442,8 @@ def test_bestbuy_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch
 
 def test_target_and_bestbuy_parsers_keep_default_fallback_for_unknown_markup(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
-    target_unknown_html = (FIXTURES / "target" / "unknown_markup.html").read_text()
-    bestbuy_unknown_html = (FIXTURES / "bestbuy" / "unknown_markup.html").read_text()
+    target_unknown_html = load_fixture_html("target", "ambiguous")
+    bestbuy_unknown_html = load_fixture_html("bestbuy", "ambiguous")
 
     target_result = app_module.evaluate_page(target_unknown_html, retailer="target")
     target_default = app_module.default_parser(target_unknown_html)
