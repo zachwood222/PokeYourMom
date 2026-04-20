@@ -2,6 +2,92 @@
 
 Stock Sentinel is a Flask-based monitor and alert bot for retailer product availability.
 
+## UI Overview
+
+The Cheddah dashboard is organized into tabs along the left sidebar. Each tab corresponds to a major feature area.
+
+### Sidebar Structure
+
+Cheddah is split into three sections:
+
+- **Operations:** Dashboard, Tasks, Alerts, Logs
+- **Setup:** Accounts, Profiles, Proxies, IMAP
+- **System:** Settings
+
+### Main Tabs (What each does)
+
+- **Dashboard:** Real-time performance and health overview
+- **Tasks:** Live Target/PKC task status per account
+- **Alerts:** Discord monitor setup (keywords/TCIN + trigger behavior)
+- **Accounts:** Target accounts, CVV/proxy/session management
+- **Profiles:** Shipping + payment profiles
+- **Proxies:** Proxy groups and testing
+- **IMAP:** Auto email-code handling for Target verification
+- **Logs:** Event history, filtering, timeline analysis, JSON export
+- **Settings:** Updates, captcha provider setup, cleanup tools
+
+### Status Bar (Bottom Left)
+
+Shows:
+
+- backend connection state
+- number of running tasks
+- active alert channels
+
+✅ Green "Connected" means backend is healthy.
+
+## Dashboard: What to Watch First
+
+### Core KPIs
+
+- Checkouts
+- Today
+- Total Spent
+- Avg Time
+
+### Live activity
+
+- running tasks + per-account status
+- PKC queue/browser queue instances
+- stock monitor count
+- Discord alert activity + matched keyword
+- account session state (active / expiring / failed)
+- proxy/session indicators
+- live success/failure feed and login errors
+
+### Additional stats
+
+- Last Checkout
+- Best Time
+- This Week
+- Top Account
+
+### Color readiness
+
+- 🟢 active
+- 🟡 expiring soon
+- 🔴 failed
+
+## Logs: Best Tab for Debugging
+
+### Tracks
+
+- checkouts
+- logins
+- task events
+- monitor polls
+- errors
+
+### Includes
+
+- counters by type (checkout/login/error/total)
+- filters (All, Checkouts, Details, Logins, Tasks, Monitors, Errors)
+- JSON export
+- clear all
+- checkout timeline with elapsed time per step
+
+Best practice: after a drop, filter to **Checkout Details** to identify where time was spent or where failures occurred.
+
 ## Architecture at a glance
 
 - **Web app/API:** Flask (`app.py`) provides dashboard routes and JSON endpoints.
