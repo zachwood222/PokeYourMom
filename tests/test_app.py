@@ -393,6 +393,93 @@ def test_api_routes_allow_authenticated_requests_and_include_context(tmp_path, m
     assert payload["user"]["id"] == 1
 
 
+def test_check_update_reports_update_available_when_upstream_is_newer(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_VERSION", "1.2.3")
+    monkeypatch.setenv("UPDATE_CHECK_URL", "https://updates.example.com/latest")
+    monkeypatch.setenv("UPDATE_CHECK_TIMEOUT_SECONDS", "1.5")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    class DummyResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"latest_version": "1.2.4"}
+
+    captured = {}
+
+    def fake_get(url, timeout):
+        captured["url"] = url
+        captured["timeout"] = timeout
+        return DummyResponse()
+
+    monkeypatch.setattr(app_module.requests, "get", fake_get)
+
+    resp = client.get("/api/meta/check-update", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["ok"] is True
+    assert payload["current_version"] == "1.2.3"
+    assert payload["latest_version"] == "1.2.4"
+    assert payload["update_available"] is True
+    assert "source_error" not in payload
+    assert captured == {"url": "https://updates.example.com/latest", "timeout": 1.5}
+
+
+def test_check_update_reports_no_update_when_versions_match(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_VERSION", "2.0.0")
+    monkeypatch.setenv("UPDATE_CHECK_URL", "https://updates.example.com/latest")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    class DummyResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"latest_version": "2.0.0"}
+
+    monkeypatch.setattr(app_module.requests, "get", lambda url, timeout: DummyResponse())
+
+    resp = client.get("/api/meta/check-update", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["ok"] is True
+    assert payload["current_version"] == "2.0.0"
+    assert payload["latest_version"] == "2.0.0"
+    assert payload["update_available"] is False
+    assert "source_error" not in payload
+
+
+def test_check_update_returns_fallback_payload_on_upstream_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_VERSION", "3.1.0")
+    monkeypatch.setenv("UPDATE_CHECK_URL", "https://updates.example.com/latest")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    def fake_get(url, timeout):
+        raise app_module.requests.RequestException("connection timeout")
+
+    monkeypatch.setattr(app_module.requests, "get", fake_get)
+
+    resp = client.get("/api/meta/check-update", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["ok"] is True
+    assert payload["current_version"] == "3.1.0"
+    assert payload["latest_version"] == "3.1.0"
+    assert payload["update_available"] is False
+    assert "source_error" in payload
+
+
 def test_monitor_failure_trends_returns_seeded_counts(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()

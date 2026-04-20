@@ -1359,18 +1359,68 @@ def api_meta():
     )
 
 
+def normalize_version(value: str) -> tuple[int, ...]:
+    parts = [int(part) for part in re.findall(r"\d+", value or "")]
+    while parts and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts or [0])
+
+
+def is_version_newer(current_version: str, latest_version: str) -> bool:
+    current_parts = list(normalize_version(current_version))
+    latest_parts = list(normalize_version(latest_version))
+    max_len = max(len(current_parts), len(latest_parts))
+    current_parts.extend([0] * (max_len - len(current_parts)))
+    latest_parts.extend([0] * (max_len - len(latest_parts)))
+    return tuple(latest_parts) > tuple(current_parts)
+
+
+def parse_latest_version_from_response(resp: requests.Response) -> str:
+    content_type = (resp.headers.get("Content-Type") or "").lower()
+    if "application/json" in content_type:
+        data = resp.json()
+        if isinstance(data, str):
+            latest_version = data
+        elif isinstance(data, dict):
+            latest_version = data.get("latest_version") or data.get("version") or data.get("tag_name")
+        else:
+            latest_version = None
+    else:
+        latest_version = resp.text
+
+    if not isinstance(latest_version, str) or not latest_version.strip():
+        raise ValueError("Missing latest version in upstream response")
+    return latest_version.strip()
+
+
+def resolve_latest_version() -> tuple[str, str | None]:
+    fallback_version = APP_VERSION
+    if not UPDATE_CHECK_URL:
+        return fallback_version, "update_check_url_not_configured"
+
+    try:
+        resp = requests.get(UPDATE_CHECK_URL, timeout=UPDATE_CHECK_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+        latest = parse_latest_version_from_response(resp)
+        return latest, None
+    except Exception as exc:
+        log(f"Update check failed: {exc}", level="warning")
+        return fallback_version, str(exc)
+
+
 @app.get("/api/meta/check-update")
 def api_meta_check_update():
-    latest = APP_VERSION
-    return jsonify(
-        {
-            "ok": True,
-            "current_version": APP_VERSION,
-            "latest_version": latest,
-            "update_available": latest != APP_VERSION,
-            "release_channel": RELEASE_CHANNEL,
-        }
-    )
+    latest, source_error = resolve_latest_version()
+    payload = {
+        "ok": True,
+        "current_version": APP_VERSION,
+        "latest_version": latest,
+        "update_available": is_version_newer(APP_VERSION, latest),
+        "release_channel": RELEASE_CHANNEL,
+    }
+    if source_error:
+        payload["source_error"] = source_error
+    return jsonify(payload)
 
 
 @app.post("/api/billing/stripe/webhook")
