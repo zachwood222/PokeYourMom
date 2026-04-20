@@ -518,6 +518,62 @@ def init_db() -> None:
             workspace_id integer,
             foreign key(workspace_id) references workspaces(id)
         );
+
+        create table if not exists checkout_profiles (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            name text not null,
+            email text not null,
+            phone text,
+            shipping_address_json text not null,
+            billing_address_json text not null,
+            created_at text not null,
+            updated_at text not null,
+            foreign key(workspace_id) references workspaces(id)
+        );
+
+        create table if not exists payment_methods (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            label text not null,
+            provider text,
+            token_reference text not null,
+            billing_profile_id integer,
+            created_at text not null,
+            updated_at text not null,
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(billing_profile_id) references checkout_profiles(id)
+        );
+
+        create table if not exists retailer_accounts (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            retailer text not null,
+            username text,
+            email text,
+            encrypted_credential_ref text not null,
+            session_status text not null default 'logged_out',
+            created_at text not null,
+            updated_at text not null,
+            foreign key(workspace_id) references workspaces(id)
+        );
+
+        create table if not exists task_profile_bindings (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            checkout_profile_id integer,
+            retailer_account_id integer,
+            payment_method_id integer,
+            created_at text not null,
+            updated_at text not null,
+            unique(workspace_id, monitor_id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id),
+            foreign key(checkout_profile_id) references checkout_profiles(id),
+            foreign key(retailer_account_id) references retailer_accounts(id),
+            foreign key(payment_method_id) references payment_methods(id)
+        );
         """
     )
     existing = conn.execute("select id from workspaces limit 1").fetchone()
@@ -876,6 +932,10 @@ def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str,
     finally:
         conn.close()
     return {"workspace_id": workspace_id, "plan": internal_plan, "status": status}
+
+
+def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return sync_manual_billing_subscription_event(payload)
 
 
 def extract_price_cents(text: str) -> int | None:
@@ -1507,6 +1567,61 @@ def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row)
 
 
+def serialize_checkout_profile(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    payload["shipping_address"] = json.loads(payload.pop("shipping_address_json"))
+    payload["billing_address"] = json.loads(payload.pop("billing_address_json"))
+    return payload
+
+
+def serialize_payment_method(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return dict(row)
+
+
+def serialize_retailer_account(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return dict(row)
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PHONE_RE = re.compile(r"^[0-9+\-().\s]{7,24}$")
+SESSION_STATUSES = {"active", "expired", "locked", "logged_out"}
+
+
+def _validate_email(email: str) -> str:
+    normalized = email.strip().lower()
+    if not EMAIL_RE.match(normalized):
+        raise ValueError("Invalid email")
+    return normalized
+
+
+def _validate_phone(phone: str | None) -> str | None:
+    if phone is None:
+        return None
+    normalized = phone.strip()
+    if not normalized:
+        return None
+    if not PHONE_RE.match(normalized):
+        raise ValueError("Invalid phone")
+    return normalized
+
+
+def _validate_address(value: Any, field_name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be an object")
+    required = ("line1", "city", "state", "postal_code", "country")
+    for key in required:
+        raw = value.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError(f"{field_name}.{key} is required")
+    return {k: (v.strip() if isinstance(v, str) else v) for k, v in value.items()}
+
+
 def should_send_to_webhook(monitor: sqlite3.Row, hook: sqlite3.Row, eligible: bool) -> bool:
     if not hook["enabled"]:
         return False
@@ -1857,7 +1972,6 @@ def api_sync_billing_subscription_event():
     }
     try:
         result = sync_billing_subscription_payload(payload)
-        result = sync_manual_billing_subscription_event(payload)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"ok": True, **result})
@@ -2424,6 +2538,355 @@ def api_delete_webhook(webhook_id: int):
     conn.close()
     if cur.rowcount == 0:
         return jsonify({"error": "Webhook not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.post("/api/profiles")
+@require_auth
+def api_create_profile():
+    body = request.json or {}
+    try:
+        name = (body.get("name") or "").strip()
+        if not name:
+            raise ValueError("name is required")
+        email = _validate_email(body.get("email") or "")
+        phone = _validate_phone(body.get("phone"))
+        shipping = _validate_address(body.get("shipping_address"), "shipping_address")
+        billing = _validate_address(body.get("billing_address"), "billing_address")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    now_iso = utc_now()
+    conn = db()
+    cur = conn.execute(
+        """
+        insert into checkout_profiles(
+            workspace_id, name, email, phone, shipping_address_json, billing_address_json, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (current_workspace_id(), name, email, phone, json.dumps(shipping), json.dumps(billing), now_iso, now_iso),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from checkout_profiles where id = ? and workspace_id = ?",
+        (cur.lastrowid, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    return jsonify(serialize_checkout_profile(row)), 201
+
+
+@app.get("/api/profiles")
+@require_auth
+def api_list_profiles():
+    conn = db()
+    rows = conn.execute(
+        "select * from checkout_profiles where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_checkout_profile(r) for r in rows])
+
+
+@app.patch("/api/profiles/<int:profile_id>")
+@require_auth
+def api_update_profile(profile_id: int):
+    body = request.json or {}
+    fields: list[tuple[str, Any]] = []
+    try:
+        if "name" in body:
+            name = (body.get("name") or "").strip()
+            if not name:
+                raise ValueError("name cannot be empty")
+            fields.append(("name", name))
+        if "email" in body:
+            fields.append(("email", _validate_email(body.get("email") or "")))
+        if "phone" in body:
+            fields.append(("phone", _validate_phone(body.get("phone"))))
+        if "shipping_address" in body:
+            fields.append(("shipping_address_json", json.dumps(_validate_address(body.get("shipping_address"), "shipping_address"))))
+        if "billing_address" in body:
+            fields.append(("billing_address_json", json.dumps(_validate_address(body.get("billing_address"), "billing_address"))))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not fields:
+        return jsonify({"error": "No mutable fields provided"}), 400
+    fields.append(("updated_at", utc_now()))
+    conn = db()
+    for key, value in fields:
+        conn.execute(
+            f"update checkout_profiles set {key} = ? where id = ? and workspace_id = ?",
+            (value, profile_id, current_workspace_id()),
+        )
+    conn.commit()
+    row = conn.execute(
+        "select * from checkout_profiles where id = ? and workspace_id = ?",
+        (profile_id, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Profile not found"}), 404
+    return jsonify(serialize_checkout_profile(row))
+
+
+@app.delete("/api/profiles/<int:profile_id>")
+@require_auth
+def api_delete_profile(profile_id: int):
+    conn = db()
+    cur = conn.execute(
+        "delete from checkout_profiles where id = ? and workspace_id = ?",
+        (profile_id, current_workspace_id()),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Profile not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.post("/api/accounts")
+@require_auth
+def api_create_account():
+    body = request.json or {}
+    try:
+        retailer = canonical_retailer(body.get("retailer") or "")
+        if retailer not in SUPPORTED_RETAILERS:
+            raise ValueError(f"Unsupported retailer '{retailer}'")
+        username = (body.get("username") or "").strip() or None
+        email = body.get("email")
+        email = _validate_email(email) if email else None
+        if not username and not email:
+            raise ValueError("username or email is required")
+        credential_ref = (body.get("encrypted_credential_ref") or "").strip()
+        if not credential_ref:
+            raise ValueError("encrypted_credential_ref is required")
+        session_status = (body.get("session_status") or "logged_out").strip().lower()
+        if session_status not in SESSION_STATUSES:
+            raise ValueError("Invalid session_status")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    now_iso = utc_now()
+    conn = db()
+    cur = conn.execute(
+        """
+        insert into retailer_accounts(
+            workspace_id, retailer, username, email, encrypted_credential_ref, session_status, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (current_workspace_id(), retailer, username, email, credential_ref, session_status, now_iso, now_iso),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from retailer_accounts where id = ? and workspace_id = ?",
+        (cur.lastrowid, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    return jsonify(serialize_retailer_account(row)), 201
+
+
+@app.get("/api/accounts")
+@require_auth
+def api_list_accounts():
+    conn = db()
+    rows = conn.execute(
+        "select * from retailer_accounts where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_retailer_account(r) for r in rows])
+
+
+@app.patch("/api/accounts/<int:account_id>")
+@require_auth
+def api_update_account(account_id: int):
+    body = request.json or {}
+    fields: list[tuple[str, Any]] = []
+    try:
+        if "retailer" in body:
+            retailer = canonical_retailer(body.get("retailer") or "")
+            if retailer not in SUPPORTED_RETAILERS:
+                raise ValueError(f"Unsupported retailer '{retailer}'")
+            fields.append(("retailer", retailer))
+        if "username" in body:
+            fields.append(("username", (body.get("username") or "").strip() or None))
+        if "email" in body:
+            email = body.get("email")
+            fields.append(("email", _validate_email(email) if email else None))
+        if "encrypted_credential_ref" in body:
+            credential_ref = (body.get("encrypted_credential_ref") or "").strip()
+            if not credential_ref:
+                raise ValueError("encrypted_credential_ref cannot be empty")
+            fields.append(("encrypted_credential_ref", credential_ref))
+        if "session_status" in body:
+            session_status = (body.get("session_status") or "").strip().lower()
+            if session_status not in SESSION_STATUSES:
+                raise ValueError("Invalid session_status")
+            fields.append(("session_status", session_status))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not fields:
+        return jsonify({"error": "No mutable fields provided"}), 400
+    fields.append(("updated_at", utc_now()))
+    conn = db()
+    for key, value in fields:
+        conn.execute(
+            f"update retailer_accounts set {key} = ? where id = ? and workspace_id = ?",
+            (value, account_id, current_workspace_id()),
+        )
+    conn.commit()
+    row = conn.execute(
+        "select * from retailer_accounts where id = ? and workspace_id = ?",
+        (account_id, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Account not found"}), 404
+    return jsonify(serialize_retailer_account(row))
+
+
+@app.delete("/api/accounts/<int:account_id>")
+@require_auth
+def api_delete_account(account_id: int):
+    conn = db()
+    cur = conn.execute(
+        "delete from retailer_accounts where id = ? and workspace_id = ?",
+        (account_id, current_workspace_id()),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Account not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.post("/api/payments")
+@require_auth
+def api_create_payment():
+    body = request.json or {}
+    prohibited = {"pan", "card_number", "number", "cvv", "cvc"}
+    if any(key in body for key in prohibited):
+        return jsonify({"error": "Raw card data is not allowed; store tokenized reference only"}), 400
+    try:
+        label = (body.get("label") or "").strip()
+        if not label:
+            raise ValueError("label is required")
+        provider = (body.get("provider") or "").strip() or None
+        token_reference = (body.get("token_reference") or "").strip()
+        if not token_reference:
+            raise ValueError("token_reference is required")
+        billing_profile_id = body.get("billing_profile_id")
+        if billing_profile_id is not None:
+            billing_profile_id = int(billing_profile_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    now_iso = utc_now()
+    conn = db()
+    if billing_profile_id is not None:
+        profile = conn.execute(
+            "select id from checkout_profiles where id = ? and workspace_id = ?",
+            (billing_profile_id, current_workspace_id()),
+        ).fetchone()
+        if not profile:
+            conn.close()
+            return jsonify({"error": "billing_profile_id not found"}), 400
+    cur = conn.execute(
+        """
+        insert into payment_methods(
+            workspace_id, label, provider, token_reference, billing_profile_id, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (current_workspace_id(), label, provider, token_reference, billing_profile_id, now_iso, now_iso),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from payment_methods where id = ? and workspace_id = ?",
+        (cur.lastrowid, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    return jsonify(serialize_payment_method(row)), 201
+
+
+@app.get("/api/payments")
+@require_auth
+def api_list_payments():
+    conn = db()
+    rows = conn.execute(
+        "select * from payment_methods where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_payment_method(r) for r in rows])
+
+
+@app.patch("/api/payments/<int:payment_id>")
+@require_auth
+def api_update_payment(payment_id: int):
+    body = request.json or {}
+    prohibited = {"pan", "card_number", "number", "cvv", "cvc"}
+    if any(key in body for key in prohibited):
+        return jsonify({"error": "Raw card data is not allowed; store tokenized reference only"}), 400
+    fields: list[tuple[str, Any]] = []
+    try:
+        if "label" in body:
+            label = (body.get("label") or "").strip()
+            if not label:
+                raise ValueError("label cannot be empty")
+            fields.append(("label", label))
+        if "provider" in body:
+            fields.append(("provider", (body.get("provider") or "").strip() or None))
+        if "token_reference" in body:
+            token_reference = (body.get("token_reference") or "").strip()
+            if not token_reference:
+                raise ValueError("token_reference cannot be empty")
+            fields.append(("token_reference", token_reference))
+        if "billing_profile_id" in body:
+            billing_profile_id = body.get("billing_profile_id")
+            value = int(billing_profile_id) if billing_profile_id is not None else None
+            fields.append(("billing_profile_id", value))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not fields:
+        return jsonify({"error": "No mutable fields provided"}), 400
+    conn = db()
+    for key, value in fields:
+        if key == "billing_profile_id" and value is not None:
+            profile = conn.execute(
+                "select id from checkout_profiles where id = ? and workspace_id = ?",
+                (value, current_workspace_id()),
+            ).fetchone()
+            if not profile:
+                conn.close()
+                return jsonify({"error": "billing_profile_id not found"}), 400
+        conn.execute(
+            f"update payment_methods set {key} = ? where id = ? and workspace_id = ?",
+            (value, payment_id, current_workspace_id()),
+        )
+    conn.execute(
+        "update payment_methods set updated_at = ? where id = ? and workspace_id = ?",
+        (utc_now(), payment_id, current_workspace_id()),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from payment_methods where id = ? and workspace_id = ?",
+        (payment_id, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Payment method not found"}), 404
+    return jsonify(serialize_payment_method(row))
+
+
+@app.delete("/api/payments/<int:payment_id>")
+@require_auth
+def api_delete_payment(payment_id: int):
+    conn = db()
+    cur = conn.execute(
+        "delete from payment_methods where id = ? and workspace_id = ?",
+        (payment_id, current_workspace_id()),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Payment method not found"}), 404
     return jsonify({"ok": True})
 
 
