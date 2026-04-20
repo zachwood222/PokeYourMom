@@ -1263,6 +1263,38 @@ def test_check_monitor_api_includes_reason_and_confidence_for_ambiguous_markup(t
     assert payload["parser_confidence"] == 0.2
 
 
+def test_check_monitor_notify_failures_do_not_clobber_persisted_state(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    monitor_id = _seed_monitor(app_module)
+    expected = app_module.MonitorResult(
+        in_stock=True,
+        price_cents=1999,
+        title="Pokemon Product",
+        status_text="in_stock",
+        availability_reason="marker_in_stock",
+        parser_confidence=0.91,
+        keyword_matched=True,
+    )
+
+    monkeypatch.setattr(app_module, "fetch_monitor", lambda monitor: expected)
+    monkeypatch.setattr(app_module, "create_event_and_deliver", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("notify down")))
+
+    resp = client.post(f"/api/monitors/{monitor_id}/check", headers=_auth_headers())
+    payload = resp.get_json()
+    assert resp.status_code == 200
+    assert payload["ok"] is True
+    assert payload["eligible_for_alert"] is True
+
+    conn = app_module.db()
+    row = conn.execute("select failure_streak, last_error, last_price_cents, last_in_stock from monitors where id = ?", (monitor_id,)).fetchone()
+    conn.close()
+    assert row["failure_streak"] == 0
+    assert row["last_error"] is None
+    assert row["last_price_cents"] == 1999
+    assert row["last_in_stock"] == 1
+
+
 def test_billing_sync_upgrade_relaxes_plan_limits(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()

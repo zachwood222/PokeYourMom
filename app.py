@@ -3237,16 +3237,56 @@ def persist_monitor_state(monitor: sqlite3.Row, result: MonitorResult, eligible:
     conn.commit()
     conn.close()
 
+def process_post_persist_actions(
+    monitor: sqlite3.Row,
+    result: MonitorResult,
+    eligible: bool,
+    *,
+    strict: bool,
+) -> None:
     if eligible:
-        enqueue_checkout_for_monitor(monitor, result)
-    create_event_and_deliver(monitor, result, eligible)
+        try:
+            enqueue_checkout_for_monitor(monitor, result)
+        except Exception as exc:  # noqa: BLE001
+            if strict:
+                raise
+            log(
+                f"Checkout enqueue failed for monitor {monitor['id']}: {exc}",
+                level="warning",
+                workspace_id=monitor["workspace_id"],
+                monitor_id=monitor["id"],
+            )
+
+    try:
+        create_event_and_deliver(monitor, result, eligible)
+    except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise
+        log(
+            f"Event/webhook notify failed for monitor {monitor['id']}: {exc}",
+            level="warning",
+            workspace_id=monitor["workspace_id"],
+            monitor_id=monitor["id"],
+        )
+
+    try:
+        emit_monitor_events(monitor, result, eligible)
+    except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise
+        log(
+            f"Telemetry emit failed for monitor {monitor['id']}: {exc}",
+            level="warning",
+            workspace_id=monitor["workspace_id"],
+            monitor_id=monitor["id"],
+        )
 
 
 def run_monitor_pipeline_once(monitor: sqlite3.Row) -> dict[str, Any]:
     result = fetch_monitor(monitor)
     eligible = alert_eligibility(monitor, result)
     persist_monitor_state(monitor, result, eligible)
-    emit_monitor_events(monitor, result, eligible)
+    process_post_persist_actions(monitor, result, eligible, strict=False)
 
     log(
         f"Checked monitor {monitor['id']} | {monitor['retailer']} | {result.status_text} | {cents_to_dollars(result.price_cents)}",
@@ -3499,7 +3539,7 @@ def execute_monitor_job(queue: SQLiteJobQueue, job: Job, *, now_iso: str) -> Non
         )
         return
     try:
-        emit_monitor_events(monitor, result, eligible)
+        process_post_persist_actions(monitor, result, eligible, strict=True)
         log(
             f"Checked monitor {monitor['id']} | {monitor['retailer']} | {result.status_text} | {cents_to_dollars(result.price_cents)}",
             workspace_id=monitor["workspace_id"],
@@ -4599,6 +4639,18 @@ def api_list_checkout_tasks():
     return jsonify([serialize_task_ui(row) for row in rows])
 
 
+@app.get("/api/checkout/tasks")
+@require_auth
+def api_list_checkout_tasks():
+    conn = db()
+    rows = conn.execute(
+        "select * from checkout_tasks where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_task_ui(row) for row in rows])
+
+
 @app.post("/api/checkout/tasks/<int:task_id>/start")
 @require_auth
 def api_start_checkout_task(task_id: int):
@@ -4660,6 +4712,39 @@ def api_stop_checkout_task(task_id: int):
     payload = serialize_checkout_task_summary(row)
     socketio.emit("task_update", payload)
     return jsonify({"ok": True, "task": payload})
+
+
+@app.get("/api/checkout/tasks/<int:task_id>/attempts")
+@require_auth
+def api_checkout_task_attempts(task_id: int):
+    conn = db()
+    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    attempts = conn.execute(
+        """
+        select id, task_id, state, status, error_text, created_at
+        from checkout_attempts
+        where task_id = ?
+        order by id desc
+        """,
+        (task_id,),
+    ).fetchall()
+    conn.close()
+    return jsonify(
+        [
+            {
+                "id": a["id"],
+                "task_id": a["task_id"],
+                "state": a["state"],
+                "step": a["status"],
+                "error": a["error_text"],
+                "created_at": a["created_at"],
+            }
+            for a in attempts
+        ]
+    )
 
 
 @app.get("/api/checkout/tasks/<int:task_id>/attempts")
