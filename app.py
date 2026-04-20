@@ -32,6 +32,9 @@ API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "dev-token")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
 UPDATE_CHECK_TIMEOUT_SECONDS = float(os.getenv("UPDATE_CHECK_TIMEOUT_SECONDS", "2.0"))
+CAPTCHA_PROVIDER = os.getenv("CAPTCHA_PROVIDER", "turnstile")
+CAPTCHA_SITE_KEY = os.getenv("CAPTCHA_SITE_KEY", "")
+CAPTCHA_SCRIPT_URL = os.getenv("CAPTCHA_SCRIPT_URL", "https://challenges.cloudflare.com/turnstile/v0/api.js")
 
 PLAN_LIMITS = {
     "basic": {"max_monitors": 20, "min_poll_seconds": 20},
@@ -1342,7 +1345,12 @@ def monitor_loop() -> None:
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template(
+        "index.html",
+        captcha_provider=CAPTCHA_PROVIDER,
+        captcha_site_key=CAPTCHA_SITE_KEY,
+        captcha_script_url=CAPTCHA_SCRIPT_URL,
+    )
 
 
 @app.get("/healthz")
