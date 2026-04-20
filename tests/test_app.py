@@ -237,12 +237,19 @@ def test_keyword_and_max_price_filter_block_event(tmp_path, monkeypatch):
     class DummyResponse:
         status_code = 204
         text = ""
+        ok = True
 
-    def fake_post(url, json, timeout):
-        posted_payloads.append((url, json, timeout))
-        return DummyResponse()
+    class FakeReqResult:
+        def __init__(self, response):
+            self.response = response
+            self.error = None
+            self.telemetry = None
 
-    monkeypatch.setattr(app_module.requests, "post", fake_post)
+    def fake_request(**kwargs):
+        posted_payloads.append((kwargs["url"], kwargs["json"], kwargs["timeout"]))
+        return FakeReqResult(DummyResponse())
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
 
     conn = app_module.db()
     conn.execute(
@@ -362,9 +369,15 @@ def test_init_db_migrates_existing_monitors_table_with_msrp_column(tmp_path, mon
 
     conn = sqlite3.connect(db_path)
     columns = {row[1] for row in conn.execute("pragma table_info(monitors)").fetchall()}
+    workspace_columns = {row[1] for row in conn.execute("pragma table_info(workspaces)").fetchall()}
     conn.close()
 
     assert "msrp_cents" in columns
+    assert "proxy_url" in columns
+    assert "session_task_key" in columns
+    assert "session_metadata" in columns
+    assert "proxy_url" in workspace_columns
+    assert "session_metadata" in workspace_columns
 
 
 def test_api_routes_require_auth(tmp_path, monkeypatch):
@@ -677,12 +690,18 @@ def test_check_update_reports_update_available_when_upstream_is_newer(tmp_path, 
 
     captured = {}
 
-    def fake_get(url, timeout):
-        captured["url"] = url
-        captured["timeout"] = timeout
-        return DummyResponse()
+    class FakeReqResult:
+        def __init__(self, response):
+            self.response = response
+            self.error = None
+            self.telemetry = None
 
-    monkeypatch.setattr(app_module.requests, "get", fake_get)
+    def fake_request(**kwargs):
+        captured["url"] = kwargs["url"]
+        captured["timeout"] = kwargs["timeout"]
+        return FakeReqResult(DummyResponse())
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
 
     resp = client.get("/api/meta/check-update", headers=_auth_headers())
     payload = resp.get_json()
@@ -711,7 +730,17 @@ def test_check_update_reports_no_update_when_versions_match(tmp_path, monkeypatc
         def json(self):
             return {"latest_version": "2.0.0"}
 
-    monkeypatch.setattr(app_module.requests, "get", lambda url, timeout: DummyResponse())
+    class FakeReqResult:
+        def __init__(self, response):
+            self.response = response
+            self.error = None
+            self.telemetry = None
+
+    monkeypatch.setattr(
+        app_module,
+        "perform_request",
+        lambda **kwargs: FakeReqResult(DummyResponse()),
+    )
 
     resp = client.get("/api/meta/check-update", headers=_auth_headers())
     payload = resp.get_json()
@@ -730,10 +759,17 @@ def test_check_update_returns_fallback_payload_on_upstream_failure(tmp_path, mon
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
 
-    def fake_get(url, timeout):
-        raise app_module.requests.RequestException("connection timeout")
+    class FakeReqResult:
+        def __init__(self, error):
+            self.response = None
+            self.error = error
+            self.telemetry = None
 
-    monkeypatch.setattr(app_module.requests, "get", fake_get)
+    monkeypatch.setattr(
+        app_module,
+        "perform_request",
+        lambda **kwargs: FakeReqResult(app_module.requests.RequestException("connection timeout")),
+    )
 
     resp = client.get("/api/meta/check-update", headers=_auth_headers())
     payload = resp.get_json()
