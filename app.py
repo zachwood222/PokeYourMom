@@ -702,6 +702,7 @@ def map_subscription_to_internal_plan(
     return "basic"
 
 
+def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str, Any]:
     provider = (payload.get("provider") or "stripe").strip().lower()
     subscription_id = (payload.get("provider_subscription_id") or "").strip()
@@ -974,12 +975,12 @@ def bestbuy_parser(html: str, keyword: str | None = None) -> MonitorResult:
     in_markers = [
         '"buttonstate":"add to cart"',
         '"shipping":"available"',
-        "add to cart",
-        "get it today",
+        "ready for pickup today",
     ]
     out_markers = [
         '"buttonstate":"sold out"',
         '"buttonstate":"coming soon"',
+        '"shipping":"unavailable"',
         "sold out",
         "coming soon",
     ]
@@ -1520,6 +1521,7 @@ def api_sync_billing_subscription_event():
         "source": body.get("source") or "billing_subscriptions",
     }
     try:
+        result = sync_billing_subscription_payload(payload)
         result = sync_manual_billing_subscription_event(payload)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
