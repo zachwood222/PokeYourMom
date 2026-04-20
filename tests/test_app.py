@@ -593,18 +593,18 @@ def test_webhook_health_trends_scoped_to_workspace(tmp_path, monkeypatch):
     assert payload["webhooks"][0]["recent_failures_7d"] == 1
 
 
-def test_parser_dispatch_uses_walmart_and_fallback(tmp_path, monkeypatch):
+def test_adapter_dispatch_uses_walmart_and_fallback(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
 
-    walmart_parser = app_module.get_parser_for_retailer("walmart")
-    target_parser = app_module.get_parser_for_retailer("target")
-    bestbuy_parser = app_module.get_parser_for_retailer("bestbuy")
-    fallback_parser = app_module.get_parser_for_retailer("unknown-retailer")
+    walmart_adapter = app_module.get_adapter_for_retailer("walmart")
+    target_adapter = app_module.get_adapter_for_retailer("target")
+    bestbuy_adapter = app_module.get_adapter_for_retailer("bestbuy")
+    fallback_adapter = app_module.get_adapter_for_retailer("unknown-retailer")
 
-    assert walmart_parser.name == "walmart"
-    assert target_parser.name == "target"
-    assert bestbuy_parser.name == "bestbuy"
-    assert fallback_parser.name == "default"
+    assert walmart_adapter.name == "walmart"
+    assert target_adapter.name == "target"
+    assert bestbuy_adapter.name == "bestbuy"
+    assert fallback_adapter.name == "default"
 
 
 def test_walmart_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch):
@@ -923,3 +923,108 @@ def test_billing_sync_canceled_subscription_enforces_stricter_limits(tmp_path, m
     )
     assert blocked_monitor_count.status_code == 400
     assert "Plan limit reached (20 monitors)" in blocked_monitor_count.get_json()["error"]
+
+
+def test_init_db_creates_checkout_tables(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    conn = app_module.db()
+    tables = {
+        row["name"]
+        for row in conn.execute(
+            "select name from sqlite_master where type = 'table' and name in ('checkout_tasks', 'checkout_attempts', 'task_logs')"
+        ).fetchall()
+    }
+    conn.close()
+    assert tables == {"checkout_tasks", "checkout_attempts", "task_logs"}
+
+
+def test_check_monitor_enqueues_checkout_task_for_eligible_stock(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://example.com/item",
+            "keyword": "pokemon",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    monitor = create_resp.get_json()
+    assert create_resp.status_code == 201
+
+    def fake_fetch(_monitor):
+        return app_module.MonitorResult(
+            in_stock=True,
+            price_cents=2499,
+            title="Pokemon Test Item",
+            status_text="in_stock",
+            keyword_matched=True,
+        )
+
+    monkeypatch.setattr(app_module, "fetch_monitor", fake_fetch)
+    check_resp = client.post(f"/api/monitors/{monitor['id']}/check", headers=_auth_headers())
+    assert check_resp.status_code == 200
+    assert check_resp.get_json()["eligible_for_alert"] is True
+
+    conn = app_module.db()
+    task = conn.execute("select * from checkout_tasks where monitor_id = ?", (monitor["id"],)).fetchone()
+    attempt_count = conn.execute(
+        "select count(*) as c from checkout_attempts where task_id = ?",
+        (task["id"],),
+    ).fetchone()["c"]
+    log_count = conn.execute(
+        "select count(*) as c from task_logs where task_id = ?",
+        (task["id"],),
+    ).fetchone()["c"]
+    conn.close()
+
+    assert task is not None
+    assert task["current_state"] == "queued"
+    assert attempt_count >= 2
+    assert log_count >= 2
+
+
+def test_checkout_task_lifecycle_routes(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_monitor_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/item",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    monitor = create_monitor_resp.get_json()
+    assert create_monitor_resp.status_code == 201
+
+    create_task_resp = client.post(
+        "/api/checkout/tasks",
+        json={"monitor_id": monitor["id"], "task_name": "Checkout 1"},
+        headers=_auth_headers(),
+    )
+    assert create_task_resp.status_code == 201
+    task = create_task_resp.get_json()
+
+    start_resp = client.post(f"/api/checkout/tasks/{task['id']}/start", headers=_auth_headers())
+    assert start_resp.status_code == 200
+    assert start_resp.get_json()["task"]["current_state"] == "monitoring"
+
+    pause_resp = client.post(f"/api/checkout/tasks/{task['id']}/pause", headers=_auth_headers())
+    assert pause_resp.status_code == 200
+    assert pause_resp.get_json()["task"]["current_state"] == "paused"
+
+    stop_resp = client.post(f"/api/checkout/tasks/{task['id']}/stop", headers=_auth_headers())
+    assert stop_resp.status_code == 200
+    assert stop_resp.get_json()["task"]["current_state"] == "stopped"
+
+    state_resp = client.get(f"/api/checkout/tasks/{task['id']}/state", headers=_auth_headers())
+    assert state_resp.status_code == 200
+    payload = state_resp.get_json()
+    assert payload["current_state"] == "stopped"
+    assert payload["last_error"] is None
