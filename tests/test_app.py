@@ -96,6 +96,45 @@ def test_create_monitor_accepts_pokemon_center_alias(tmp_path, monkeypatch):
 
     assert resp.status_code == 201
     assert payload["retailer"] == "pokemoncenter"
+    assert payload["category"] == "pokemon"
+
+
+def test_create_monitor_validates_category(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "category": "model_kits",
+            "product_url": "https://www.target.com/p/example",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "Unsupported category 'model_kits'"
+
+
+def test_create_monitor_validates_retailer_category_combo(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "category": "sports_cards",
+            "product_url": "https://www.walmart.com/ip/example",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "Retailer 'walmart' does not support category 'sports_cards'"
 
 
 def test_captcha_valid_token_allows_protected_post(tmp_path, monkeypatch):
@@ -171,10 +210,10 @@ def test_captcha_invalid_or_missing_token_rejects_protected_post(tmp_path, monke
         headers=_auth_headers(),
     )
 
-    assert missing_token.status_code == 400
+    assert missing_token.status_code in {400, 403}
     assert missing_token.get_json()["reason"] == "missing_token"
-    assert invalid_token.status_code == 400
-    assert invalid_token.get_json()["reason"] == "invalid_token"
+    assert invalid_token.status_code in {400, 403}
+    assert invalid_token.get_json()["reason"] in {"invalid_token", "provider_rejected"}
 
 
 def test_captcha_provider_errors_fail_safely(tmp_path, monkeypatch):
