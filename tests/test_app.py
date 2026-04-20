@@ -680,3 +680,158 @@ def test_check_monitor_api_includes_reason_and_confidence_for_ambiguous_markup(t
     assert resp.status_code == 200
     assert payload["availability_reason"] == "fallback_unknown"
     assert payload["parser_confidence"] == 0.2
+
+
+def test_billing_sync_upgrade_relaxes_plan_limits(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        """
+        insert into billing_customers(workspace_id, user_id, provider, provider_customer_id, created_at, updated_at)
+        values (1, 1, 'stripe', 'cus_upgrade', ?, ?)
+        """,
+        (app_module.utc_now(), app_module.utc_now()),
+    )
+    for idx in range(20):
+        conn.execute(
+            """
+            insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+            values (1, 'target', ?, 20, ?)
+            """,
+            (f"https://example.com/basic-{idx}", app_module.utc_now()),
+        )
+    conn.commit()
+    conn.close()
+
+    blocked = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://example.com/blocked-upgrade",
+            "poll_interval_seconds": 10,
+        },
+        headers=_auth_headers(),
+    )
+    assert blocked.status_code == 400
+
+    sync = client.post(
+        "/api/billing/subscription-events",
+        json={
+            "provider": "stripe",
+            "provider_subscription_id": "sub_upgrade",
+            "provider_customer_id": "cus_upgrade",
+            "status": "active",
+            "plan_code": "price_pro_monthly",
+            "plan_lookup_key": "pro",
+            "cancel_at_period_end": False,
+        },
+        headers=_auth_headers(),
+    )
+    assert sync.status_code == 200
+
+    upgraded = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://example.com/after-upgrade",
+            "poll_interval_seconds": 10,
+        },
+        headers=_auth_headers(),
+    )
+    assert upgraded.status_code == 201
+
+
+def test_billing_sync_canceled_subscription_enforces_stricter_limits(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute("update workspaces set plan = 'pro' where id = 1")
+    conn.execute(
+        """
+        insert into billing_customers(workspace_id, user_id, provider, provider_customer_id, created_at, updated_at)
+        values (1, 1, 'stripe', 'cus_cancel', ?, ?)
+        """,
+        (app_module.utc_now(), app_module.utc_now()),
+    )
+    for idx in range(18):
+        conn.execute(
+            """
+            insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+            values (1, 'walmart', ?, 20, ?)
+            """,
+            (f"https://example.com/pro-{idx}", app_module.utc_now()),
+        )
+    conn.commit()
+    conn.close()
+
+    allowed_before_cancel = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/before-cancel",
+            "poll_interval_seconds": 10,
+        },
+        headers=_auth_headers(),
+    )
+    assert allowed_before_cancel.status_code == 201
+
+    sync = client.post(
+        "/api/billing/subscription-events",
+        json={
+            "provider": "stripe",
+            "provider_subscription_id": "sub_cancel",
+            "provider_customer_id": "cus_cancel",
+            "status": "canceled",
+            "plan_code": "price_pro_monthly",
+            "plan_lookup_key": "pro",
+            "cancel_at_period_end": True,
+            "source": "billing_subscriptions",
+        },
+        headers=_auth_headers(),
+    )
+    assert sync.status_code == 200
+
+    conn = app_module.db()
+    workspace = conn.execute("select * from workspaces where id = 1").fetchone()
+    conn.close()
+    assert workspace["plan"] == "basic"
+    assert workspace["subscription_status"] == "canceled"
+    assert workspace["subscription_source"] == "billing_subscriptions"
+
+    blocked_poll = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/after-cancel-poll",
+            "poll_interval_seconds": 10,
+        },
+        headers=_auth_headers(),
+    )
+    assert blocked_poll.status_code == 400
+    assert "minimum poll interval is 20 seconds" in blocked_poll.get_json()["error"]
+
+    allowed_at_basic_limit = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/after-cancel-allowed",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    assert allowed_at_basic_limit.status_code == 201
+
+    blocked_monitor_count = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/after-cancel-count",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    assert blocked_monitor_count.status_code == 400
+    assert "Plan limit reached (20 monitors)" in blocked_monitor_count.get_json()["error"]

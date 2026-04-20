@@ -36,6 +36,11 @@ PLAN_LIMITS = {
     "pro": {"max_monitors": 100, "min_poll_seconds": 10},
     "team": {"max_monitors": 500, "min_poll_seconds": 5},
 }
+PLAN_LOOKUP_TO_INTERNAL_PLAN = {
+    "basic": "basic",
+    "pro": "pro",
+    "team": "team",
+}
 SUPPORTED_RETAILERS = {"walmart", "target", "bestbuy", "pokemoncenter"}
 RETAILER_ALIASES = {
     "pokemon-center": "pokemoncenter",
@@ -299,6 +304,9 @@ def init_db() -> None:
             id integer primary key autoincrement,
             name text not null,
             plan text not null,
+            subscription_status text not null default 'inactive',
+            subscription_source text not null default 'manual',
+            subscription_updated_at text,
             created_at text not null
         );
 
@@ -496,6 +504,9 @@ def init_db() -> None:
     ensure_column(conn, "webhooks", "fail_streak", "integer not null default 0")
     ensure_column(conn, "webhooks", "last_error", "text")
     ensure_column(conn, "webhooks", "last_status_code", "integer")
+    ensure_column(conn, "workspaces", "subscription_status", "text not null default 'inactive'")
+    ensure_column(conn, "workspaces", "subscription_source", "text not null default 'manual'")
+    ensure_column(conn, "workspaces", "subscription_updated_at", "text")
     conn.commit()
     conn.close()
 
@@ -655,6 +666,150 @@ def enforce_plan_limits(workspace_id: int, poll_interval_seconds: int) -> None:
         raise ValueError(
             f"Plan {workspace['plan']} minimum poll interval is {limits['min_poll_seconds']} seconds"
         )
+
+
+def _normalize_plan_hint(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def map_subscription_to_internal_plan(
+    *,
+    status: str,
+    plan_code: str | None,
+    plan_lookup_key: str | None,
+    cancel_at_period_end: bool,
+) -> str:
+    normalized_status = (status or "").strip().lower()
+    if normalized_status in {"canceled", "incomplete_expired", "unpaid"}:
+        return "basic"
+
+    if cancel_at_period_end and normalized_status in {"canceled"}:
+        return "basic"
+
+    lookup = PLAN_LOOKUP_TO_INTERNAL_PLAN.get(_normalize_plan_hint(plan_lookup_key))
+    if lookup:
+        return lookup
+
+    combined = f"{_normalize_plan_hint(plan_lookup_key)} {_normalize_plan_hint(plan_code)}"
+    if "team" in combined:
+        return "team"
+    if "pro" in combined:
+        return "pro"
+    return "basic"
+
+
+def sync_billing_subscription_event(payload: dict[str, Any]) -> dict[str, Any]:
+    provider = (payload.get("provider") or "stripe").strip().lower()
+    subscription_id = (payload.get("provider_subscription_id") or "").strip()
+    customer_id = (payload.get("provider_customer_id") or "").strip() or None
+    status = (payload.get("status") or "incomplete").strip().lower()
+    plan_code = payload.get("plan_code")
+    plan_lookup_key = payload.get("plan_lookup_key")
+    cancel_at_period_end = bool(payload.get("cancel_at_period_end", False))
+    current_period_end = payload.get("current_period_end")
+    source = (payload.get("source") or "billing_subscriptions").strip()
+
+    if not subscription_id:
+        raise ValueError("provider_subscription_id is required")
+
+    conn = db()
+    try:
+        conn.execute("begin")
+        existing = conn.execute(
+            """
+            select workspace_id, billing_customer_id
+            from billing_subscriptions
+            where provider = ? and provider_subscription_id = ?
+            """,
+            (provider, subscription_id),
+        ).fetchone()
+        customer = None
+        if customer_id:
+            customer = conn.execute(
+                """
+                select id, workspace_id
+                from billing_customers
+                where provider = ? and provider_customer_id = ?
+                """,
+                (provider, customer_id),
+            ).fetchone()
+
+        workspace_id: int | None = existing["workspace_id"] if existing else None
+        billing_customer_id: int | None = existing["billing_customer_id"] if existing else None
+
+        if customer:
+            workspace_id = customer["workspace_id"]
+            billing_customer_id = customer["id"]
+
+        if workspace_id is None:
+            raise ValueError("Unable to resolve workspace for subscription event")
+
+        now = utc_now()
+        conn.execute(
+            """
+            insert into billing_subscriptions(
+                workspace_id,
+                provider,
+                provider_subscription_id,
+                billing_customer_id,
+                status,
+                current_period_end,
+                cancel_at_period_end,
+                plan_code,
+                plan_interval,
+                plan_lookup_key,
+                created_at,
+                updated_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, null, ?, ?, ?)
+            on conflict(provider_subscription_id) do update set
+                workspace_id = excluded.workspace_id,
+                billing_customer_id = excluded.billing_customer_id,
+                status = excluded.status,
+                current_period_end = excluded.current_period_end,
+                cancel_at_period_end = excluded.cancel_at_period_end,
+                plan_code = excluded.plan_code,
+                plan_lookup_key = excluded.plan_lookup_key,
+                updated_at = excluded.updated_at
+            """,
+            (
+                workspace_id,
+                provider,
+                subscription_id,
+                billing_customer_id,
+                status,
+                current_period_end,
+                int(cancel_at_period_end),
+                plan_code,
+                plan_lookup_key,
+                now,
+                now,
+            ),
+        )
+
+        internal_plan = map_subscription_to_internal_plan(
+            status=status,
+            plan_code=plan_code,
+            plan_lookup_key=plan_lookup_key,
+            cancel_at_period_end=cancel_at_period_end,
+        )
+        conn.execute(
+            """
+            update workspaces
+            set plan = ?, subscription_status = ?, subscription_source = ?, subscription_updated_at = ?
+            where id = ?
+            """,
+            (internal_plan, status, source, now, workspace_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"workspace_id": workspace_id, "plan": internal_plan, "status": status}
 
 
 def extract_price_cents(text: str) -> int | None:
@@ -1292,6 +1447,32 @@ def api_update_plan():
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "plan": plan})
+
+
+@app.post("/api/billing/subscription-events")
+@require_auth
+def api_sync_billing_subscription_event():
+    owner_error = ensure_workspace_owner()
+    if owner_error:
+        return owner_error
+    body = request.json or {}
+    subscription = body.get("subscription") if isinstance(body.get("subscription"), dict) else {}
+    payload = {
+        "provider": body.get("provider", "stripe"),
+        "provider_subscription_id": body.get("provider_subscription_id") or subscription.get("id"),
+        "provider_customer_id": body.get("provider_customer_id") or subscription.get("customer_id"),
+        "status": body.get("status") or subscription.get("status"),
+        "plan_code": body.get("plan_code") or subscription.get("plan_code"),
+        "plan_lookup_key": body.get("plan_lookup_key") or subscription.get("plan_lookup_key"),
+        "cancel_at_period_end": body.get("cancel_at_period_end", subscription.get("cancel_at_period_end")),
+        "current_period_end": body.get("current_period_end") or subscription.get("current_period_end"),
+        "source": body.get("source") or "billing_subscriptions",
+    }
+    try:
+        result = sync_billing_subscription_event(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
 
 
 @app.get("/api/monitors")
