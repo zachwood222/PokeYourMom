@@ -166,6 +166,18 @@
     }
 
     .warn { color: #f7b955; font-size: 13px; }
+    .config-warn {
+      display: none;
+      margin: 16px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid #7a3f2b;
+      background: rgba(152, 67, 42, 0.2);
+      color: #ffd9cb;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    .config-warn.show { display: block; }
 
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
@@ -194,6 +206,10 @@
     </div>
     <div class="topbar-right" id="clock">--:--:--</div>
   </header>
+  <div id="api_auth_warning" class="config-warn" role="alert" aria-live="polite">
+    API auth token is not configured. API requests to <code>/api/*</code> will return <code>401 Unauthorized</code>
+    until <code>API_AUTH_TOKEN</code> is set to a non-empty bearer token.
+  </div>
 
   <div class="layout">
     <aside class="sidebar">
@@ -479,6 +495,8 @@
   <script>
     const socket = io();
     const API_AUTH_TOKEN = {{ api_auth_token|tojson }};
+    const API_AUTH_TOKEN_NORMALIZED = typeof API_AUTH_TOKEN === 'string' ? API_AUTH_TOKEN.trim() : '';
+    const HAS_API_AUTH_TOKEN = API_AUTH_TOKEN_NORMALIZED.length > 0;
     let loopRunning = false;
     let selectedTaskId = null;
     let taskMap = new Map();
@@ -506,8 +524,8 @@
       const opts = {...options};
       const method = (opts.method || 'GET').toUpperCase();
       const headers = new Headers(opts.headers || {});
-      if (API_AUTH_TOKEN && !headers.has('Authorization')) {
-        headers.set('Authorization', `Bearer ${API_AUTH_TOKEN}`);
+      if (HAS_API_AUTH_TOKEN && !headers.has('Authorization')) {
+        headers.set('Authorization', `Bearer ${API_AUTH_TOKEN_NORMALIZED}`);
       }
       const token = getCaptchaToken();
       if (token) {
@@ -532,6 +550,17 @@
       document.querySelectorAll('.top-nav button').forEach(el => el.classList.remove('active'));
       document.getElementById(`tab-${tab}`).classList.add('active');
       document.querySelector(`.top-nav button[data-tab="${tab}"]`).classList.add('active');
+    }
+
+    function renderApiAuthWarning() {
+      const warning = document.getElementById('api_auth_warning');
+      if (!warning) return;
+      if (HAS_API_AUTH_TOKEN) {
+        warning.classList.remove('show');
+        return;
+      }
+      warning.classList.add('show');
+      console.warn('API_AUTH_TOKEN is empty; /api/* requests are expected to return 401 until configured.');
     }
 
     socket.on('log', (d) => {
@@ -931,6 +960,7 @@
       setInterval(paint, 1000);
     }
 
+    renderApiAuthWarning();
     loadWorkspace();
     loadMeta();
     loadWebhooks();

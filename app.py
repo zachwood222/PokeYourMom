@@ -44,7 +44,8 @@ DEFAULT_PLAN = os.getenv("DEFAULT_PLAN", "basic")
 POKEMON_MSRP_BUFFER_CENTS = int(os.getenv("POKEMON_MSRP_BUFFER_CENTS", "1000"))
 APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
 RELEASE_CHANNEL = os.getenv("RELEASE_CHANNEL", "stable")
-API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "dev-token")
+_api_auth_token_raw = os.getenv("API_AUTH_TOKEN")
+API_AUTH_TOKEN = _api_auth_token_raw.strip() if _api_auth_token_raw is not None else "dev-token"
 SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY", "local-dev-secret-key")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
@@ -59,6 +60,7 @@ CAPTCHA_VERIFY_URL = os.getenv(
 )
 CAPTCHA_VERIFY_TIMEOUT_SECONDS = float(os.getenv("CAPTCHA_VERIFY_TIMEOUT_SECONDS", "2.0"))
 TASK_STEP_DELAY_SECONDS = float(os.getenv("TASK_STEP_DELAY_SECONDS", "0.5"))
+STRICT_API_AUTH_TOKEN = (os.getenv("STRICT_API_AUTH_TOKEN", "1") or "").strip().lower() not in {"0", "false", "no", "off"}
 
 PLAN_LIMITS = {
     "basic": {"max_monitors": 20, "min_poll_seconds": 20},
@@ -118,6 +120,33 @@ class Job:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def is_dev_environment() -> bool:
+    mode = (
+        os.getenv("FLASK_ENV")
+        or os.getenv("APP_ENV")
+        or os.getenv("ENV")
+        or os.getenv("PYTHON_ENV")
+        or ""
+    ).strip().lower()
+    if mode in {"dev", "development", "local", "test", "testing"}:
+        return True
+    return (os.getenv("FLASK_DEBUG", "0") or "").strip() == "1"
+
+
+def validate_startup_configuration() -> None:
+    if API_AUTH_TOKEN:
+        return
+    warning_message = (
+        "API_AUTH_TOKEN is empty after normalization. /api/* endpoints will return 401 "
+        "unless requests include a valid bearer token."
+    )
+    log(warning_message, level="error")
+    if STRICT_API_AUTH_TOKEN and not is_dev_environment():
+        raise RuntimeError(
+            f"{warning_message} Set API_AUTH_TOKEN to a non-empty value before startup."
+        )
 
 
 def verify_stripe_webhook_signature(payload: bytes, signature_header: str | None) -> None:
@@ -3872,6 +3901,7 @@ def api_stop():
 
 if __name__ == "__main__":
     init_db()
+    validate_startup_configuration()
     log(
         "Legal/ethical note: this project provides stock monitoring + alerts only. Auto-checkout is intentionally not implemented.",
         level="warning",
