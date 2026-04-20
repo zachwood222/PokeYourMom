@@ -1447,6 +1447,23 @@ def test_check_monitor_enqueues_checkout_task_for_eligible_stock(tmp_path, monke
     )
     monitor = create_resp.get_json()
     assert create_resp.status_code == 201
+    account_resp = client.post(
+        "/api/accounts",
+        json={
+            "retailer": "target",
+            "username": "target-user",
+            "encrypted_credential_ref": "cred-ref",
+            "proxy_url": "http://proxy-1.local:8080",
+        },
+        headers=_auth_headers(),
+    )
+    assert account_resp.status_code == 201
+    binding_resp = client.post(
+        "/api/task-profile-bindings",
+        json={"monitor_id": monitor["id"], "retailer_account_id": account_resp.get_json()["id"]},
+        headers=_auth_headers(),
+    )
+    assert binding_resp.status_code == 201
 
     def fake_fetch(_monitor):
         return app_module.MonitorResult(
@@ -1495,6 +1512,18 @@ def test_checkout_task_lifecycle_routes(tmp_path, monkeypatch):
     )
     monitor = create_monitor_resp.get_json()
     assert create_monitor_resp.status_code == 201
+    account_resp = client.post(
+        "/api/accounts",
+        json={"retailer": "walmart", "username": "w-user", "encrypted_credential_ref": "cred-ref"},
+        headers=_auth_headers(),
+    )
+    assert account_resp.status_code == 201
+    binding_resp = client.post(
+        "/api/task-profile-bindings",
+        json={"monitor_id": monitor["id"], "retailer_account_id": account_resp.get_json()["id"]},
+        headers=_auth_headers(),
+    )
+    assert binding_resp.status_code == 201
 
     create_task_resp = client.post(
         "/api/checkout/tasks",
@@ -1521,3 +1550,70 @@ def test_checkout_task_lifecycle_routes(tmp_path, monkeypatch):
     payload = state_resp.get_json()
     assert payload["current_state"] == "stopped"
     assert payload["last_error"] is None
+
+
+def test_checkout_task_create_requires_retailer_account_binding(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    monitor_resp = client.post(
+        "/api/monitors",
+        json={"retailer": "walmart", "product_url": "https://example.com/no-binding", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
+    )
+    assert monitor_resp.status_code == 201
+    create_task_resp = client.post(
+        "/api/checkout/tasks",
+        json={"monitor_id": monitor_resp.get_json()["id"]},
+        headers=_auth_headers(),
+    )
+    assert create_task_resp.status_code == 400
+    assert "Task binding is required" in create_task_resp.get_json()["error"]
+
+
+def test_account_execution_endpoints_show_queue_and_proxy_lock(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    monitor_resp = client.post(
+        "/api/monitors",
+        json={"retailer": "walmart", "product_url": "https://example.com/q", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
+    )
+    monitor = monitor_resp.get_json()
+    account_resp = client.post(
+        "/api/accounts",
+        json={
+            "retailer": "walmart",
+            "username": "exec-user",
+            "encrypted_credential_ref": "cred-ref",
+            "proxy_url": "http://proxy-lock.local:8080",
+        },
+        headers=_auth_headers(),
+    )
+    account = account_resp.get_json()
+    bind_resp = client.post(
+        "/api/task-profile-bindings",
+        json={"monitor_id": monitor["id"], "retailer_account_id": account["id"]},
+        headers=_auth_headers(),
+    )
+    assert bind_resp.status_code == 201
+    create_task_resp = client.post(
+        "/api/checkout/tasks",
+        json={"monitor_id": monitor["id"], "task_name": "Bound task"},
+        headers=_auth_headers(),
+    )
+    assert create_task_resp.status_code == 201
+    conn = app_module.db()
+    app_module.run_checkout_account_scheduler(conn, now_iso=app_module.utc_now())
+    conn.commit()
+    conn.close()
+    execution_resp = client.get("/api/accounts/execution", headers=_auth_headers())
+    assert execution_resp.status_code == 200
+    execution_payload = execution_resp.get_json()
+    account_row = next(item for item in execution_payload if item["id"] == account["id"])
+    assert account_row["queue_depth"] >= 1
+    assert account_row["proxy_lock_state"] == "locked"
+    locks_resp = client.get("/api/accounts/proxy-locks", headers=_auth_headers())
+    assert locks_resp.status_code == 200
+    lock_payload = locks_resp.get_json()
+    lock_row = next(item for item in lock_payload if item["account_id"] == account["id"])
+    assert lock_row["proxy_lock_owner"] == f"account:{account['id']}"
