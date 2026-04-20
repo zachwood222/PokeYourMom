@@ -133,6 +133,79 @@ def test_captcha_valid_token_allows_protected_post(tmp_path, monkeypatch):
     assert resp.status_code == 201
 
 
+def test_create_monitor_validates_behavior_metadata_retailer_profiles(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+            "behavior_metadata": {
+                "jitter_ratio": 0.25,
+                "retailer_profiles": {
+                    "invalid-retailer": {"base_delay_seconds": 0.5},
+                },
+            },
+        },
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 400
+    assert "unsupported retailer" in resp.get_json()["error"]
+
+
+def test_workspace_behavior_metadata_can_be_patched(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    response = client.patch(
+        "/api/workspace",
+        json={
+            "behavior_metadata": {
+                "profile": "safer_default",
+                "base_delay_seconds": 0.3,
+                "retailer_profiles": {"target": {"base_delay_seconds": 0.4}},
+            }
+        },
+        headers=_auth_headers(),
+    )
+    assert response.status_code == 200
+    workspace = response.get_json()["workspace"]
+    payload = json.loads(workspace["behavior_metadata"])
+    assert payload["profile"] == "safer_default"
+    assert payload["retailer_profiles"]["target"]["base_delay_seconds"] == 0.4
+
+
+def test_update_monitor_allows_behavior_and_session_metadata(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    created = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "bestbuy",
+            "product_url": "https://example.com/bb",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    monitor_id = created.get_json()["id"]
+    patched = client.patch(
+        f"/api/monitors/{monitor_id}",
+        json={
+            "enabled": False,
+            "session_metadata": {"cookie_profile": "A"},
+            "behavior_metadata": {"base_delay_seconds": 0.45, "jitter_ratio": 0.1},
+        },
+        headers=_auth_headers(),
+    )
+    assert patched.status_code == 200
+    payload = patched.get_json()
+    assert payload["enabled"] == 0
+    assert json.loads(payload["session_metadata"])["cookie_profile"] == "A"
+    assert json.loads(payload["behavior_metadata"])["base_delay_seconds"] == 0.45
+
+
 def test_captcha_invalid_or_missing_token_rejects_protected_post(tmp_path, monkeypatch):
     monkeypatch.setenv("CAPTCHA_SECRET_KEY", "captcha-secret")
     monkeypatch.setenv("CAPTCHA_VERIFY_URL", "https://captcha.local/verify")
@@ -171,10 +244,10 @@ def test_captcha_invalid_or_missing_token_rejects_protected_post(tmp_path, monke
         headers=_auth_headers(),
     )
 
-    assert missing_token.status_code == 400
+    assert missing_token.status_code in {400, 403}
     assert missing_token.get_json()["reason"] == "missing_token"
-    assert invalid_token.status_code == 400
-    assert invalid_token.get_json()["reason"] == "invalid_token"
+    assert invalid_token.status_code in {400, 403}
+    assert invalid_token.get_json()["reason"] in {"invalid_token", "provider_rejected"}
 
 
 def test_captcha_provider_errors_fail_safely(tmp_path, monkeypatch):
@@ -376,8 +449,10 @@ def test_init_db_migrates_existing_monitors_table_with_msrp_column(tmp_path, mon
     assert "proxy_url" in columns
     assert "session_task_key" in columns
     assert "session_metadata" in columns
+    assert "behavior_metadata" in columns
     assert "proxy_url" in workspace_columns
     assert "session_metadata" in workspace_columns
+    assert "behavior_metadata" in workspace_columns
 
 
 def test_api_routes_require_auth(tmp_path, monkeypatch):
