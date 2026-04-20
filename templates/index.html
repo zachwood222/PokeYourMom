@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Stock Sentinel</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+  {% if captcha_site_key %}<script src="{{ captcha_script_url }}" async defer></script>{% endif %}
   <style>
     :root {
       color-scheme: dark;
@@ -153,6 +154,16 @@
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 12px;
     }
+    .task-log-panel { height: 280px; }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: #1a2438;
+      border: 1px solid #2a3856;
+      font-size: 11px;
+      margin-right: 6px;
+    }
 
     .warn { color: #f7b955; font-size: 13px; }
 
@@ -270,6 +281,54 @@
       <section id="tab-monitors" class="tab">
         <h1>Task Controls</h1>
         <div class="card">
+          <h2>Create Automation Task</h2>
+          <div class="row">
+            <div>
+              <label>Retailer</label>
+              <select id="task_retailer">
+                <option>walmart</option>
+                <option>target</option>
+                <option>bestbuy</option>
+                <option>pokemoncenter</option>
+              </select>
+            </div>
+            <div>
+              <label>Product URL</label>
+              <input id="task_url" placeholder="https://www.walmart.com/ip/..." />
+            </div>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <div>
+              <label>Profile</label>
+              <input id="task_profile" placeholder="profile-main" />
+            </div>
+            <div>
+              <label>Account</label>
+              <input id="task_account" placeholder="acc-primary" />
+            </div>
+          </div>
+          <div style="margin-top:10px;">
+            <label>Payment</label>
+            <input id="task_payment" placeholder="visa-ending-4242" />
+          </div>
+          <button style="margin-top:10px;" onclick="createTask()">Create Task</button>
+        </div>
+
+        <div class="card" style="margin-top:14px;">
+          <h2 class="section-title">Live Task Table</h2>
+          <table>
+            <thead><tr><th>ID</th><th>Retailer</th><th>State</th><th>Retries</th><th>Last Step</th><th>Last Error</th><th>Actions</th></tr></thead>
+            <tbody id="tasks"></tbody>
+          </table>
+        </div>
+
+        <div class="card" style="margin-top:14px;">
+          <h2 class="section-title">Per-Task Log Panel</h2>
+          <div class="small" id="task_log_title">Select a task to inspect attempts.</div>
+          <div id="task_logs" class="logs task-log-panel"></div>
+        </div>
+
+        <div class="card" style="margin-top:14px;">
           <h2>Add Product Monitor</h2>
           <div class="row">
             <div>
@@ -296,6 +355,13 @@
               <label class="small">Original MSRP Cents (Pokemon only)</label>
               <input id="msrp_cents" type="number" placeholder="499" />
             </div>
+            <input id="captcha_token" type="hidden" value="" />
+            {% if captcha_site_key %}
+            <div style="margin-top:10px;">
+              <label class="small">CAPTCHA Verification</label>
+              <div id="captcha_widget" class="cf-turnstile" data-sitekey="{{ captcha_site_key }}" data-theme="dark" data-callback="onCaptchaSuccess" data-expired-callback="onCaptchaExpired" data-error-callback="onCaptchaError"></div>
+            </div>
+            {% endif %}
             <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
           </div>
 
@@ -408,7 +474,49 @@
   <script>
     const socket = io();
     let loopRunning = false;
+    let selectedTaskId = null;
+    let taskMap = new Map();
     const toArray = (value, key) => Array.isArray(value) ? value : (value && Array.isArray(value[key]) ? value[key] : []);
+    function getCaptchaToken() {
+      return (document.getElementById('captcha_token')?.value || "").trim();
+    }
+
+    function onCaptchaSuccess(token) {
+      const el = document.getElementById('captcha_token');
+      if (el) el.value = token || '';
+    }
+
+    function onCaptchaExpired() {
+      const el = document.getElementById('captcha_token');
+      if (el) el.value = '';
+    }
+
+    function onCaptchaError() {
+      const el = document.getElementById('captcha_token');
+      if (el) el.value = '';
+    }
+
+    async function apiFetch(url, options = {}) {
+      const opts = {...options};
+      const method = (opts.method || 'GET').toUpperCase();
+      const headers = new Headers(opts.headers || {});
+      const token = getCaptchaToken();
+      if (token) {
+        headers.set('X-Captcha-Token', token);
+      }
+      if (method !== 'GET' && method !== 'HEAD' && token && !opts.body) {
+        opts.body = JSON.stringify({captcha_token: token});
+        headers.set('Content-Type', headers.get('Content-Type') || 'application/json');
+      }
+      opts.headers = headers;
+      const response = await fetch(url, opts);
+      return response;
+    }
+
+    function appendCaptchaToken(payload = {}) {
+      const token = getCaptchaToken();
+      return token ? {...payload, captcha_token: token} : payload;
+    }
 
     function setTab(tab) {
       document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
@@ -421,6 +529,26 @@
       const logs = document.getElementById('logs');
       logs.textContent += d.message + "\n";
       logs.scrollTop = logs.scrollHeight;
+      const selected = selectedTaskId;
+      if (!selected) return;
+      if ((d.message || '').includes(`Task ${selected}`)) {
+        const taskLogs = document.getElementById('task_logs');
+        taskLogs.textContent += `[${d.timestamp}] ${d.message}\n`;
+        taskLogs.scrollTop = taskLogs.scrollHeight;
+      }
+    });
+
+    socket.on('task_update', (task) => {
+      if (!task || !task.id) return;
+      taskMap.set(task.id, task);
+      renderTaskTable();
+    });
+
+    socket.on('task_attempt', async (attempt) => {
+      if (!attempt || !attempt.task_id) return;
+      if (selectedTaskId === attempt.task_id) {
+        await loadTaskAttempts(attempt.task_id);
+      }
     });
 
     async function loadWorkspace() {
@@ -481,7 +609,7 @@
     async function savePlan() {
       const plan = document.getElementById('plan').value;
       const res = await apiFetch('/api/workspace/plan', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({plan})
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken({plan}))
       });
       const data = await res.json();
       alert(data.error || `Plan updated to ${data.plan}`);
@@ -496,7 +624,7 @@
         notify_restock_only: document.getElementById('notify_restock_only').checked,
       };
       const res = await apiFetch('/api/webhooks', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))
       });
       const data = await res.json();
       alert(data.error || `Webhook added (id=${data.id})`);
@@ -525,12 +653,95 @@
       };
 
       const res = await apiFetch('/api/monitors', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))
       });
       const data = await res.json();
       alert(data.error || `Monitor added (id=${data.id})`);
       await loadMonitors();
       await loadDashboardSummary();
+    }
+
+    async function createTask() {
+      const payload = {
+        retailer: document.getElementById('task_retailer').value,
+        url: document.getElementById('task_url').value,
+        profile: document.getElementById('task_profile').value,
+        account: document.getElementById('task_account').value,
+        payment: document.getElementById('task_payment').value,
+      };
+      const res = await apiFetch('/api/tasks', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (data.error) {
+        alert(data.error);
+        return;
+      }
+      await loadTasks();
+      selectTask(data.id);
+    }
+
+    function taskErrorLabel(value) {
+      return value ? value : '-';
+    }
+
+    function renderTaskTable() {
+      const tbody = document.getElementById('tasks');
+      tbody.innerHTML = '';
+      const rows = Array.from(taskMap.values()).sort((a, b) => b.id - a.id);
+      for (const task of rows) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${task.id}</td>
+          <td>${task.retailer}</td>
+          <td>${task.state}</td>
+          <td>${task.retries || 0}</td>
+          <td>${task.last_step || '-'}</td>
+          <td>${taskErrorLabel(task.last_error)}</td>
+          <td class="actions">
+            <button onclick="startTask(${task.id})">Start</button>
+            <button onclick="stopTask(${task.id})">Stop</button>
+            <button onclick="selectTask(${task.id})">Logs</button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function loadTasks() {
+      const rows = await apiFetch('/api/tasks').then(r => r.json()).catch(() => []);
+      taskMap = new Map();
+      for (const row of rows) {
+        taskMap.set(row.id, row);
+      }
+      renderTaskTable();
+    }
+
+    async function startTask(id) {
+      await apiFetch(`/api/tasks/${id}/start`, {method: 'POST'});
+      await loadTasks();
+    }
+
+    async function stopTask(id) {
+      await apiFetch(`/api/tasks/${id}/stop`, {method: 'POST'});
+      await loadTasks();
+    }
+
+    async function selectTask(taskId) {
+      selectedTaskId = taskId;
+      const title = document.getElementById('task_log_title');
+      title.textContent = `Task #${taskId} attempts + live logs`;
+      await loadTaskAttempts(taskId);
+    }
+
+    async function loadTaskAttempts(taskId) {
+      const attempts = await apiFetch(`/api/tasks/${taskId}/attempts`).then(r => r.json()).catch(() => []);
+      const logs = document.getElementById('task_logs');
+      logs.textContent = '';
+      for (const attempt of attempts.slice().reverse()) {
+        logs.textContent += `[${attempt.created_at}] attempt=${attempt.attempt_number} state=${attempt.state} step=${attempt.step || '-'} err=${attempt.error || '-'}\n`;
+      }
+      logs.scrollTop = logs.scrollHeight;
     }
 
     async function loadMonitors() {
@@ -643,7 +854,7 @@
         new_poll_interval_seconds: Number(document.getElementById('schedule_poll').value),
       };
       const res = await apiFetch('/api/schedules', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))
       });
       const data = await res.json();
       alert(data.error || `Created ${data.created?.length || 0} schedule(s)`);
@@ -717,6 +928,7 @@
     loadMeta();
     loadWebhooks();
     loadMonitors();
+    loadTasks();
     loadDashboardSummary();
     startClock();
   </script>
