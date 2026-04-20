@@ -51,6 +51,28 @@ def test_protected_endpoint_requires_auth(tmp_path, monkeypatch):
     assert "Unauthorized" in resp.get_json()["error"]
 
 
+def test_workspace_endpoint_requires_auth(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/workspace")
+
+    assert resp.status_code == 401
+    assert resp.get_json() == {"error": "Unauthorized"}
+
+
+def test_workspace_endpoint_allows_authenticated_user_and_returns_context(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/workspace", headers={"Authorization": "Bearer test-token"})
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["workspace"]["id"] == 1
+    assert payload["user"]["email"] == "owner@local.test"
+
+
 def test_create_monitor_validates_retailer(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()

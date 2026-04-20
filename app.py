@@ -817,6 +817,13 @@ def current_workspace_id() -> int:
     return workspace_id
 
 
+def current_user_context() -> dict[str, Any]:
+    user = getattr(g, "current_user", None)
+    if not user:
+        raise RuntimeError("Missing user context")
+    return dict(user)
+
+
 def get_workspace_for_user(user_id: int) -> sqlite3.Row | None:
     conn = db()
     row = conn.execute(
@@ -2672,7 +2679,7 @@ def api_billing_stripe_webhook():
 @require_auth
 def api_workspace():
     row = get_workspace(current_workspace_id())
-    return jsonify({"workspace": dict(row), "user": dict(g.current_user)})
+    return jsonify({"workspace": dict(row), "user": current_user_context()})
 
 
 @app.post("/api/workspace/plan")
