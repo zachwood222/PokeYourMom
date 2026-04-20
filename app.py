@@ -68,6 +68,19 @@ running = False
 monitor_thread: threading.Thread | None = None
 lock = threading.Lock()
 
+CHECKOUT_TASK_STATES = {
+    "queued",
+    "monitoring",
+    "carting",
+    "shipping",
+    "payment",
+    "submitting",
+    "success",
+    "failed",
+    "paused",
+    "stopped",
+}
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -393,6 +406,53 @@ def init_db() -> None:
             foreign key(workspace_id) references workspaces(id)
         );
 
+        create table if not exists checkout_tasks (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            task_name text,
+            task_config text,
+            current_state text not null default 'queued',
+            enabled integer not null default 0,
+            is_paused integer not null default 0,
+            last_error text,
+            created_at text not null,
+            updated_at text not null,
+            last_transition_at text,
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id)
+        );
+
+        create table if not exists checkout_attempts (
+            id integer primary key autoincrement,
+            task_id integer not null,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            state text not null,
+            status text not null,
+            details text,
+            error_text text,
+            created_at text not null,
+            foreign key(task_id) references checkout_tasks(id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id)
+        );
+
+        create table if not exists task_logs (
+            id integer primary key autoincrement,
+            task_id integer not null,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            level text not null,
+            event_type text not null,
+            message text not null,
+            payload text,
+            created_at text not null,
+            foreign key(task_id) references checkout_tasks(id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id)
+        );
+
         create table if not exists billing_customers (
             id integer primary key autoincrement,
             workspace_id integer not null,
@@ -438,6 +498,62 @@ def init_db() -> None:
             event_type text not null,
             workspace_id integer,
             foreign key(workspace_id) references workspaces(id)
+        );
+
+        create table if not exists checkout_profiles (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            name text not null,
+            email text not null,
+            phone text,
+            shipping_address_json text not null,
+            billing_address_json text not null,
+            created_at text not null,
+            updated_at text not null,
+            foreign key(workspace_id) references workspaces(id)
+        );
+
+        create table if not exists payment_methods (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            label text not null,
+            provider text,
+            token_reference text not null,
+            billing_profile_id integer,
+            created_at text not null,
+            updated_at text not null,
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(billing_profile_id) references checkout_profiles(id)
+        );
+
+        create table if not exists retailer_accounts (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            retailer text not null,
+            username text,
+            email text,
+            encrypted_credential_ref text not null,
+            session_status text not null default 'logged_out',
+            created_at text not null,
+            updated_at text not null,
+            foreign key(workspace_id) references workspaces(id)
+        );
+
+        create table if not exists task_profile_bindings (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            checkout_profile_id integer,
+            retailer_account_id integer,
+            payment_method_id integer,
+            created_at text not null,
+            updated_at text not null,
+            unique(workspace_id, monitor_id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id),
+            foreign key(checkout_profile_id) references checkout_profiles(id),
+            foreign key(retailer_account_id) references retailer_accounts(id),
+            foreign key(payment_method_id) references payment_methods(id)
         );
         """
     )
@@ -799,8 +915,209 @@ def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str,
     return {"workspace_id": workspace_id, "plan": internal_plan, "status": status}
 
 
-def get_adapter_for_retailer(retailer: str | None):
-    return resolve_retailer_adapter(retailer)
+def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return sync_manual_billing_subscription_event(payload)
+
+
+def extract_price_cents(text: str) -> int | None:
+    matches = re.findall(r"\$\s*(\d{1,4}(?:\.\d{2})?)", text)
+    if not matches:
+        return None
+    values = []
+    for m in matches:
+        try:
+            v = float(m)
+            if 1.0 <= v <= 2000.0:
+                values.append(int(round(v * 100)))
+        except ValueError:
+            continue
+    return min(values) if values else None
+
+
+def canonical_retailer(retailer: str) -> str:
+    value = retailer.strip().lower()
+    return RETAILER_ALIASES.get(value, value)
+
+
+def _parse_common_title_and_text(html: str) -> tuple[str, str]:
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "Product"
+    text = re.sub(r"<[^>]+>", " ", html).lower()
+    return title[:180], text
+
+
+def default_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
+
+    out_markers = [
+        "out of stock",
+        "sold out",
+        "unavailable",
+        "not available",
+        "coming soon",
+        "temporarily out of stock",
+    ]
+    in_markers = [
+        "in stock",
+        "add to cart",
+        "buy now",
+        "pickup",
+        "ship it",
+    ]
+
+    has_out = any(m in text for m in out_markers)
+    has_in = any(m in text for m in in_markers)
+
+    in_stock = has_in and not has_out
+    availability_reason = "fallback_unknown"
+    parser_confidence = 0.2
+    if has_out and not has_in:
+        availability_reason = "marker_out_of_stock"
+        parser_confidence = 0.9
+    elif has_in and not has_out:
+        availability_reason = "marker_in_stock"
+        parser_confidence = 0.9
+    elif has_in and has_out:
+        availability_reason = "marker_conflict"
+        parser_confidence = 0.35
+    keyword_matched: bool | None = None
+    if keyword:
+        keyword_matched = keyword.lower() in text
+    price_cents = extract_price_cents(re.sub(r"<[^>]+>", " ", html))
+    status_text = "in_stock" if in_stock else "out_or_unknown"
+    return MonitorResult(
+        in_stock=in_stock,
+        price_cents=price_cents,
+        title=title[:180],
+        status_text=status_text,
+        availability_reason=availability_reason,
+        parser_confidence=parser_confidence,
+        keyword_matched=keyword_matched,
+    )
+
+
+def pokemoncenter_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
+    result = default_parser(html, keyword=keyword)
+    out_markers = ["notify me when available", "currently unavailable"]
+    in_markers = ["add to bag"]
+    has_out = any(m in text for m in out_markers)
+    has_in = any(m in text for m in in_markers)
+    if has_out:
+        result.in_stock = False
+        result.status_text = "out_or_unknown"
+        result.availability_reason = "pokemoncenter_marker_out_of_stock"
+        result.parser_confidence = 0.98
+    elif has_in:
+        result.in_stock = True
+        result.status_text = "in_stock"
+        result.availability_reason = "pokemoncenter_marker_in_stock"
+        result.parser_confidence = 0.98
+    result.title = title
+    return result
+
+
+def walmart_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
+    result = default_parser(html, keyword=keyword)
+    if '"availability":"instock"' in text or "fulfillmentoptions" in text:
+        result.in_stock = True
+        result.status_text = "in_stock"
+        result.availability_reason = "walmart_marker_in_stock"
+        result.parser_confidence = 0.98
+    if '"availability":"outofstock"' in text or "out of stock" in text:
+        result.in_stock = False
+        result.status_text = "out_or_unknown"
+        result.availability_reason = "walmart_marker_out_of_stock"
+        result.parser_confidence = 0.98
+    result.price_cents = extract_price_cents(html)
+    result.title = title
+    return result
+
+
+def target_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
+    result = default_parser(html, keyword=keyword)
+
+    in_markers = [
+        '"availability":"instock"',
+        '"availability":"in_stock"',
+        "add to cart",
+        "ship it",
+        "pick up",
+    ]
+    out_markers = [
+        '"availability":"outofstock"',
+        '"availability":"out_of_stock"',
+        "out of stock",
+        "sold out",
+        "unavailable",
+    ]
+    has_in = any(marker in text for marker in in_markers)
+    has_out = any(marker in text for marker in out_markers)
+
+    if has_out:
+        result.in_stock = False
+        result.status_text = "out_or_unknown"
+        result.availability_reason = "target_marker_out_of_stock"
+        result.parser_confidence = 0.98
+    elif has_in:
+        result.in_stock = True
+        result.status_text = "in_stock"
+        result.availability_reason = "target_marker_in_stock"
+        result.parser_confidence = 0.98
+
+    result.price_cents = extract_price_cents(html)
+    result.title = title
+    return result
+
+
+def bestbuy_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
+    result = default_parser(html, keyword=keyword)
+
+    in_markers = [
+        '"buttonstate":"add to cart"',
+        '"shipping":"available"',
+        "ready for pickup today",
+    ]
+    out_markers = [
+        '"buttonstate":"sold out"',
+        '"buttonstate":"coming soon"',
+        '"shipping":"unavailable"',
+        "sold out",
+        "coming soon",
+    ]
+    has_in = any(marker in text for marker in in_markers)
+    has_out = any(marker in text for marker in out_markers)
+
+    if has_out:
+        result.in_stock = False
+        result.status_text = "out_or_unknown"
+        result.availability_reason = "bestbuy_marker_out_of_stock"
+        result.parser_confidence = 0.98
+    elif has_in:
+        result.in_stock = True
+        result.status_text = "in_stock"
+        result.availability_reason = "bestbuy_marker_in_stock"
+        result.parser_confidence = 0.98
+
+    result.price_cents = extract_price_cents(html)
+    result.title = title
+    return result
+
+
+PARSERS: dict[str, RetailerParser] = {
+    "walmart": RetailerParser(name="walmart", parse=walmart_parser),
+    "target": RetailerParser(name="target", parse=target_parser),
+    "bestbuy": RetailerParser(name="bestbuy", parse=bestbuy_parser),
+    "pokemoncenter": RetailerParser(name="pokemoncenter", parse=pokemoncenter_parser),
+}
+
+
+def get_parser_for_retailer(retailer: str | None) -> RetailerParser:
+    normalized = canonical_retailer(retailer) if retailer else ""
+    return PARSERS.get(normalized, RetailerParser(name="default", parse=default_parser))
 
 
 def evaluate_page(
@@ -949,16 +1266,341 @@ def create_event_and_deliver(
     )
 
 
+def normalize_checkout_state(raw_state: Any, *, allow_control_states: bool = True) -> str:
+    state = str(raw_state or "").strip().lower()
+    valid_states = CHECKOUT_TASK_STATES if allow_control_states else CHECKOUT_TASK_STATES - {"paused", "stopped"}
+    if state not in valid_states:
+        raise ValueError(
+            "Invalid checkout state. Expected one of: queued, monitoring, carting, shipping, payment, submitting, success, failed"
+        )
+    return state
+
+
+def record_checkout_attempt(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    workspace_id: int,
+    monitor_id: int,
+    state: str,
+    status: str,
+    details: dict[str, Any] | None = None,
+    error_text: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        insert into checkout_attempts(task_id, workspace_id, monitor_id, state, status, details, error_text, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            workspace_id,
+            monitor_id,
+            state,
+            status,
+            json.dumps(details or {}),
+            (error_text or "")[:500] if error_text else None,
+            utc_now(),
+        ),
+    )
+
+
+def record_task_log(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    workspace_id: int,
+    monitor_id: int,
+    level: str,
+    event_type: str,
+    message: str,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    conn.execute(
+        """
+        insert into task_logs(task_id, workspace_id, monitor_id, level, event_type, message, payload, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            workspace_id,
+            monitor_id,
+            level.lower(),
+            event_type,
+            message,
+            json.dumps(payload or {}),
+            utc_now(),
+        ),
+    )
+
+
+def create_checkout_task(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: int,
+    monitor_id: int,
+    task_name: str | None = None,
+    task_config: dict[str, Any] | None = None,
+    initial_state: str = "queued",
+) -> sqlite3.Row:
+    normalized_state = normalize_checkout_state(initial_state, allow_control_states=False)
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into checkout_tasks(
+            workspace_id,
+            monitor_id,
+            task_name,
+            task_config,
+            current_state,
+            enabled,
+            is_paused,
+            created_at,
+            updated_at,
+            last_transition_at
+        )
+        values (?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+        """,
+        (workspace_id, monitor_id, task_name, json.dumps(task_config or {}), normalized_state, now_iso, now_iso, now_iso),
+    )
+    task_id = cur.lastrowid
+    record_checkout_attempt(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        monitor_id=monitor_id,
+        state=normalized_state,
+        status="created",
+        details={"reason": "api_create"},
+    )
+    record_task_log(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        monitor_id=monitor_id,
+        level="info",
+        event_type="task_created",
+        message=f"Checkout task {task_id} created",
+        payload={"initial_state": normalized_state},
+    )
+    return conn.execute("select * from checkout_tasks where id = ?", (task_id,)).fetchone()
+
+
+def get_checkout_task_for_workspace(
+    conn: sqlite3.Connection, task_id: int, workspace_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from checkout_tasks where id = ? and workspace_id = ?",
+        (task_id, workspace_id),
+    ).fetchone()
+
+
+def transition_checkout_task(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    workspace_id: int,
+    requested_state: str,
+    reason: str,
+    error_text: str | None = None,
+) -> sqlite3.Row | None:
+    row = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+    if not row:
+        return None
+
+    normalized_state = normalize_checkout_state(requested_state)
+    enabled = int(normalized_state not in {"stopped", "success", "failed"})
+    is_paused = int(normalized_state == "paused")
+    now_iso = utc_now()
+    conn.execute(
+        """
+        update checkout_tasks
+        set current_state = ?,
+            enabled = ?,
+            is_paused = ?,
+            last_error = ?,
+            updated_at = ?,
+            last_transition_at = ?
+        where id = ? and workspace_id = ?
+        """,
+        (
+            normalized_state,
+            enabled,
+            is_paused,
+            (error_text or "")[:500] if error_text else None,
+            now_iso,
+            now_iso,
+            task_id,
+            workspace_id,
+        ),
+    )
+    record_checkout_attempt(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        monitor_id=row["monitor_id"],
+        state=normalized_state,
+        status="transition",
+        details={"reason": reason},
+        error_text=error_text,
+    )
+    record_task_log(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        monitor_id=row["monitor_id"],
+        level="info" if not error_text else "error",
+        event_type="state_transition",
+        message=f"Task transitioned to {normalized_state}",
+        payload={"reason": reason},
+    )
+    return get_checkout_task_for_workspace(conn, task_id, workspace_id)
+
+
+def enqueue_checkout_for_monitor(
+    monitor: sqlite3.Row, result: MonitorResult, *, reason: str = "in_stock_detected"
+) -> int | None:
+    if not result.in_stock:
+        return None
+    conn = db()
+    existing = conn.execute(
+        """
+        select * from checkout_tasks
+        where workspace_id = ? and monitor_id = ?
+          and current_state not in ('success', 'failed', 'stopped')
+        order by id desc
+        limit 1
+        """,
+        (monitor["workspace_id"], monitor["id"]),
+    ).fetchone()
+    if existing:
+        record_task_log(
+            conn,
+            task_id=existing["id"],
+            workspace_id=monitor["workspace_id"],
+            monitor_id=monitor["id"],
+            level="info",
+            event_type="enqueue_skipped_existing",
+            message=f"Existing active checkout task {existing['id']} detected",
+            payload={"reason": reason},
+        )
+        conn.commit()
+        conn.close()
+        return existing["id"]
+
+    task = create_checkout_task(
+        conn,
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+        task_name=f"Monitor {monitor['id']} checkout",
+        task_config={"retailer": monitor["retailer"], "product_url": monitor["product_url"]},
+        initial_state="queued",
+    )
+    record_checkout_attempt(
+        conn,
+        task_id=task["id"],
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+        state="queued",
+        status="enqueued",
+        details={
+            "reason": reason,
+            "title": result.title,
+            "price_cents": result.price_cents,
+        },
+    )
+    record_task_log(
+        conn,
+        task_id=task["id"],
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+        level="warning",
+        event_type="task_enqueued",
+        message=f"Checkout task {task['id']} enqueued from monitor {monitor['id']}",
+        payload={"price_cents": result.price_cents, "title": result.title},
+    )
+    conn.commit()
+    conn.close()
+    return int(task["id"])
+
+
 def cents_to_dollars(cents: int | None) -> str:
     if cents is None:
         return "unknown"
     return f"${cents / 100:.2f}"
 
 
+def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    config_raw = payload.get("task_config")
+    try:
+        payload["task_config"] = json.loads(config_raw) if config_raw else {}
+    except (TypeError, json.JSONDecodeError):
+        payload["task_config"] = {}
+    return payload
+
+
 def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     return dict(row)
+
+
+def serialize_checkout_profile(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    payload["shipping_address"] = json.loads(payload.pop("shipping_address_json"))
+    payload["billing_address"] = json.loads(payload.pop("billing_address_json"))
+    return payload
+
+
+def serialize_payment_method(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return dict(row)
+
+
+def serialize_retailer_account(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return dict(row)
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PHONE_RE = re.compile(r"^[0-9+\-().\s]{7,24}$")
+SESSION_STATUSES = {"active", "expired", "locked", "logged_out"}
+
+
+def _validate_email(email: str) -> str:
+    normalized = email.strip().lower()
+    if not EMAIL_RE.match(normalized):
+        raise ValueError("Invalid email")
+    return normalized
+
+
+def _validate_phone(phone: str | None) -> str | None:
+    if phone is None:
+        return None
+    normalized = phone.strip()
+    if not normalized:
+        return None
+    if not PHONE_RE.match(normalized):
+        raise ValueError("Invalid phone")
+    return normalized
+
+
+def _validate_address(value: Any, field_name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be an object")
+    required = ("line1", "city", "state", "postal_code", "country")
+    for key in required:
+        raw = value.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError(f"{field_name}.{key} is required")
+    return {k: (v.strip() if isinstance(v, str) else v) for k, v in value.items()}
 
 
 def should_send_to_webhook(monitor: sqlite3.Row, hook: sqlite3.Row, eligible: bool) -> bool:
@@ -1062,6 +1704,8 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
     conn.commit()
     conn.close()
 
+    if eligible:
+        enqueue_checkout_for_monitor(monitor, result)
     create_event_and_deliver(monitor, result, eligible)
 
     log(
@@ -1309,7 +1953,6 @@ def api_sync_billing_subscription_event():
     }
     try:
         result = sync_billing_subscription_payload(payload)
-        result = sync_manual_billing_subscription_event(payload)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"ok": True, **result})
@@ -1596,6 +2239,129 @@ def api_check_monitor(monitor_id: int):
     return jsonify(check_monitor_once(row))
 
 
+@app.post("/api/checkout/tasks")
+@require_auth
+def api_create_checkout_task():
+    body = request.json or {}
+    monitor_id = body.get("monitor_id")
+    if monitor_id is None:
+        return jsonify({"error": "monitor_id is required"}), 400
+
+    workspace_id = current_workspace_id()
+    conn = db()
+    monitor = conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (int(monitor_id), workspace_id),
+    ).fetchone()
+    if not monitor:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+
+    initial_state = body.get("initial_state", "queued")
+    try:
+        task = create_checkout_task(
+            conn,
+            workspace_id=workspace_id,
+            monitor_id=int(monitor_id),
+            task_name=(body.get("task_name") or "").strip() or None,
+            task_config=body.get("task_config") if isinstance(body.get("task_config"), dict) else None,
+            initial_state=initial_state,
+        )
+    except ValueError as exc:
+        conn.close()
+        return jsonify({"error": str(exc)}), 400
+
+    conn.commit()
+    conn.close()
+    return jsonify(serialize_checkout_task(task)), 201
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/start")
+@require_auth
+def api_start_checkout_task(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="monitoring",
+        reason="api_start",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/pause")
+@require_auth
+def api_pause_checkout_task(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="paused",
+        reason="api_pause",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/stop")
+@require_auth
+def api_stop_checkout_task(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="stopped",
+        reason="api_stop",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.get("/api/checkout/tasks/<int:task_id>/state")
+@require_auth
+def api_checkout_task_state(task_id: int):
+    conn = db()
+    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    last_attempt = conn.execute(
+        """
+        select * from checkout_attempts
+        where task_id = ?
+        order by id desc
+        limit 1
+        """,
+        (task_id,),
+    ).fetchone()
+    conn.close()
+    return jsonify(
+        {
+            "task_id": task_id,
+            "current_state": row["current_state"],
+            "last_error": row["last_error"],
+            "last_transition_at": row["last_transition_at"],
+            "last_attempt": dict(last_attempt) if last_attempt else None,
+        }
+    )
+
+
 @app.get("/api/events")
 @require_auth
 def api_events():
@@ -1753,6 +2519,355 @@ def api_delete_webhook(webhook_id: int):
     conn.close()
     if cur.rowcount == 0:
         return jsonify({"error": "Webhook not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.post("/api/profiles")
+@require_auth
+def api_create_profile():
+    body = request.json or {}
+    try:
+        name = (body.get("name") or "").strip()
+        if not name:
+            raise ValueError("name is required")
+        email = _validate_email(body.get("email") or "")
+        phone = _validate_phone(body.get("phone"))
+        shipping = _validate_address(body.get("shipping_address"), "shipping_address")
+        billing = _validate_address(body.get("billing_address"), "billing_address")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    now_iso = utc_now()
+    conn = db()
+    cur = conn.execute(
+        """
+        insert into checkout_profiles(
+            workspace_id, name, email, phone, shipping_address_json, billing_address_json, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (current_workspace_id(), name, email, phone, json.dumps(shipping), json.dumps(billing), now_iso, now_iso),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from checkout_profiles where id = ? and workspace_id = ?",
+        (cur.lastrowid, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    return jsonify(serialize_checkout_profile(row)), 201
+
+
+@app.get("/api/profiles")
+@require_auth
+def api_list_profiles():
+    conn = db()
+    rows = conn.execute(
+        "select * from checkout_profiles where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_checkout_profile(r) for r in rows])
+
+
+@app.patch("/api/profiles/<int:profile_id>")
+@require_auth
+def api_update_profile(profile_id: int):
+    body = request.json or {}
+    fields: list[tuple[str, Any]] = []
+    try:
+        if "name" in body:
+            name = (body.get("name") or "").strip()
+            if not name:
+                raise ValueError("name cannot be empty")
+            fields.append(("name", name))
+        if "email" in body:
+            fields.append(("email", _validate_email(body.get("email") or "")))
+        if "phone" in body:
+            fields.append(("phone", _validate_phone(body.get("phone"))))
+        if "shipping_address" in body:
+            fields.append(("shipping_address_json", json.dumps(_validate_address(body.get("shipping_address"), "shipping_address"))))
+        if "billing_address" in body:
+            fields.append(("billing_address_json", json.dumps(_validate_address(body.get("billing_address"), "billing_address"))))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not fields:
+        return jsonify({"error": "No mutable fields provided"}), 400
+    fields.append(("updated_at", utc_now()))
+    conn = db()
+    for key, value in fields:
+        conn.execute(
+            f"update checkout_profiles set {key} = ? where id = ? and workspace_id = ?",
+            (value, profile_id, current_workspace_id()),
+        )
+    conn.commit()
+    row = conn.execute(
+        "select * from checkout_profiles where id = ? and workspace_id = ?",
+        (profile_id, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Profile not found"}), 404
+    return jsonify(serialize_checkout_profile(row))
+
+
+@app.delete("/api/profiles/<int:profile_id>")
+@require_auth
+def api_delete_profile(profile_id: int):
+    conn = db()
+    cur = conn.execute(
+        "delete from checkout_profiles where id = ? and workspace_id = ?",
+        (profile_id, current_workspace_id()),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Profile not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.post("/api/accounts")
+@require_auth
+def api_create_account():
+    body = request.json or {}
+    try:
+        retailer = canonical_retailer(body.get("retailer") or "")
+        if retailer not in SUPPORTED_RETAILERS:
+            raise ValueError(f"Unsupported retailer '{retailer}'")
+        username = (body.get("username") or "").strip() or None
+        email = body.get("email")
+        email = _validate_email(email) if email else None
+        if not username and not email:
+            raise ValueError("username or email is required")
+        credential_ref = (body.get("encrypted_credential_ref") or "").strip()
+        if not credential_ref:
+            raise ValueError("encrypted_credential_ref is required")
+        session_status = (body.get("session_status") or "logged_out").strip().lower()
+        if session_status not in SESSION_STATUSES:
+            raise ValueError("Invalid session_status")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    now_iso = utc_now()
+    conn = db()
+    cur = conn.execute(
+        """
+        insert into retailer_accounts(
+            workspace_id, retailer, username, email, encrypted_credential_ref, session_status, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (current_workspace_id(), retailer, username, email, credential_ref, session_status, now_iso, now_iso),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from retailer_accounts where id = ? and workspace_id = ?",
+        (cur.lastrowid, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    return jsonify(serialize_retailer_account(row)), 201
+
+
+@app.get("/api/accounts")
+@require_auth
+def api_list_accounts():
+    conn = db()
+    rows = conn.execute(
+        "select * from retailer_accounts where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_retailer_account(r) for r in rows])
+
+
+@app.patch("/api/accounts/<int:account_id>")
+@require_auth
+def api_update_account(account_id: int):
+    body = request.json or {}
+    fields: list[tuple[str, Any]] = []
+    try:
+        if "retailer" in body:
+            retailer = canonical_retailer(body.get("retailer") or "")
+            if retailer not in SUPPORTED_RETAILERS:
+                raise ValueError(f"Unsupported retailer '{retailer}'")
+            fields.append(("retailer", retailer))
+        if "username" in body:
+            fields.append(("username", (body.get("username") or "").strip() or None))
+        if "email" in body:
+            email = body.get("email")
+            fields.append(("email", _validate_email(email) if email else None))
+        if "encrypted_credential_ref" in body:
+            credential_ref = (body.get("encrypted_credential_ref") or "").strip()
+            if not credential_ref:
+                raise ValueError("encrypted_credential_ref cannot be empty")
+            fields.append(("encrypted_credential_ref", credential_ref))
+        if "session_status" in body:
+            session_status = (body.get("session_status") or "").strip().lower()
+            if session_status not in SESSION_STATUSES:
+                raise ValueError("Invalid session_status")
+            fields.append(("session_status", session_status))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not fields:
+        return jsonify({"error": "No mutable fields provided"}), 400
+    fields.append(("updated_at", utc_now()))
+    conn = db()
+    for key, value in fields:
+        conn.execute(
+            f"update retailer_accounts set {key} = ? where id = ? and workspace_id = ?",
+            (value, account_id, current_workspace_id()),
+        )
+    conn.commit()
+    row = conn.execute(
+        "select * from retailer_accounts where id = ? and workspace_id = ?",
+        (account_id, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Account not found"}), 404
+    return jsonify(serialize_retailer_account(row))
+
+
+@app.delete("/api/accounts/<int:account_id>")
+@require_auth
+def api_delete_account(account_id: int):
+    conn = db()
+    cur = conn.execute(
+        "delete from retailer_accounts where id = ? and workspace_id = ?",
+        (account_id, current_workspace_id()),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Account not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.post("/api/payments")
+@require_auth
+def api_create_payment():
+    body = request.json or {}
+    prohibited = {"pan", "card_number", "number", "cvv", "cvc"}
+    if any(key in body for key in prohibited):
+        return jsonify({"error": "Raw card data is not allowed; store tokenized reference only"}), 400
+    try:
+        label = (body.get("label") or "").strip()
+        if not label:
+            raise ValueError("label is required")
+        provider = (body.get("provider") or "").strip() or None
+        token_reference = (body.get("token_reference") or "").strip()
+        if not token_reference:
+            raise ValueError("token_reference is required")
+        billing_profile_id = body.get("billing_profile_id")
+        if billing_profile_id is not None:
+            billing_profile_id = int(billing_profile_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    now_iso = utc_now()
+    conn = db()
+    if billing_profile_id is not None:
+        profile = conn.execute(
+            "select id from checkout_profiles where id = ? and workspace_id = ?",
+            (billing_profile_id, current_workspace_id()),
+        ).fetchone()
+        if not profile:
+            conn.close()
+            return jsonify({"error": "billing_profile_id not found"}), 400
+    cur = conn.execute(
+        """
+        insert into payment_methods(
+            workspace_id, label, provider, token_reference, billing_profile_id, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (current_workspace_id(), label, provider, token_reference, billing_profile_id, now_iso, now_iso),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from payment_methods where id = ? and workspace_id = ?",
+        (cur.lastrowid, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    return jsonify(serialize_payment_method(row)), 201
+
+
+@app.get("/api/payments")
+@require_auth
+def api_list_payments():
+    conn = db()
+    rows = conn.execute(
+        "select * from payment_methods where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_payment_method(r) for r in rows])
+
+
+@app.patch("/api/payments/<int:payment_id>")
+@require_auth
+def api_update_payment(payment_id: int):
+    body = request.json or {}
+    prohibited = {"pan", "card_number", "number", "cvv", "cvc"}
+    if any(key in body for key in prohibited):
+        return jsonify({"error": "Raw card data is not allowed; store tokenized reference only"}), 400
+    fields: list[tuple[str, Any]] = []
+    try:
+        if "label" in body:
+            label = (body.get("label") or "").strip()
+            if not label:
+                raise ValueError("label cannot be empty")
+            fields.append(("label", label))
+        if "provider" in body:
+            fields.append(("provider", (body.get("provider") or "").strip() or None))
+        if "token_reference" in body:
+            token_reference = (body.get("token_reference") or "").strip()
+            if not token_reference:
+                raise ValueError("token_reference cannot be empty")
+            fields.append(("token_reference", token_reference))
+        if "billing_profile_id" in body:
+            billing_profile_id = body.get("billing_profile_id")
+            value = int(billing_profile_id) if billing_profile_id is not None else None
+            fields.append(("billing_profile_id", value))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not fields:
+        return jsonify({"error": "No mutable fields provided"}), 400
+    conn = db()
+    for key, value in fields:
+        if key == "billing_profile_id" and value is not None:
+            profile = conn.execute(
+                "select id from checkout_profiles where id = ? and workspace_id = ?",
+                (value, current_workspace_id()),
+            ).fetchone()
+            if not profile:
+                conn.close()
+                return jsonify({"error": "billing_profile_id not found"}), 400
+        conn.execute(
+            f"update payment_methods set {key} = ? where id = ? and workspace_id = ?",
+            (value, payment_id, current_workspace_id()),
+        )
+    conn.execute(
+        "update payment_methods set updated_at = ? where id = ? and workspace_id = ?",
+        (utc_now(), payment_id, current_workspace_id()),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from payment_methods where id = ? and workspace_id = ?",
+        (payment_id, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Payment method not found"}), 404
+    return jsonify(serialize_payment_method(row))
+
+
+@app.delete("/api/payments/<int:payment_id>")
+@require_auth
+def api_delete_payment(payment_id: int):
+    conn = db()
+    cur = conn.execute(
+        "delete from payment_methods where id = ? and workspace_id = ?",
+        (payment_id, current_workspace_id()),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Payment method not found"}), 404
     return jsonify({"ok": True})
 
 
