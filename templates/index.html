@@ -833,14 +833,6 @@
       await loadWebhooks();
     }
 
-    async function testFirstWebhook() {
-      const hooks = await fetch('/api/webhooks').then(r => r.json()).catch(() => []);
-      if (!Array.isArray(hooks) || !hooks.length) {
-        alert('No webhooks available to test.');
-        return;
-      }
-      await testWebhook(hooks[0].id);
-    }
 
     function selectedMonitorIds() {
       return Array.from(document.querySelectorAll('.monitor-select:checked')).map(x => Number(x.value));
