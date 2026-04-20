@@ -2460,6 +2460,7 @@ def index():
         captcha_provider=CAPTCHA_PROVIDER,
         captcha_site_key=CAPTCHA_SITE_KEY,
         captcha_script_url=CAPTCHA_SCRIPT_URL,
+        api_auth_token=API_AUTH_TOKEN,
     )
 
 
