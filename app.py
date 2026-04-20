@@ -244,6 +244,44 @@ def init_db() -> None:
             foreign key(monitor_id) references monitors(id),
             foreign key(workspace_id) references workspaces(id)
         );
+
+        create table if not exists billing_customers (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            user_id integer not null,
+            provider text not null default 'stripe',
+            provider_customer_id text,
+            created_at text not null,
+            updated_at text not null,
+            unique(workspace_id, user_id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(user_id) references users(id)
+        );
+
+        create table if not exists billing_subscriptions (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            provider text not null default 'stripe',
+            provider_subscription_id text,
+            billing_customer_id integer,
+            status text not null default 'incomplete',
+            current_period_end text,
+            cancel_at_period_end integer not null default 0,
+            plan_code text,
+            plan_interval text,
+            plan_lookup_key text,
+            created_at text not null,
+            updated_at text not null,
+            unique(workspace_id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(billing_customer_id) references billing_customers(id)
+        );
+
+        create unique index if not exists idx_billing_customers_provider_customer_id
+            on billing_customers(provider_customer_id);
+
+        create unique index if not exists idx_billing_subscriptions_provider_subscription_id
+            on billing_subscriptions(provider_subscription_id);
         """
     )
     existing = conn.execute("select id from workspaces limit 1").fetchone()
