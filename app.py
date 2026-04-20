@@ -66,6 +66,8 @@ class MonitorResult:
     price_cents: int | None
     title: str
     status_text: str
+    availability_reason: str | None = None
+    parser_confidence: float | None = None
     keyword_matched: bool | None = None
     price_within_limit: bool | None = None
     within_msrp_delta: bool | None = None
@@ -501,6 +503,17 @@ def default_parser(html: str, keyword: str | None = None) -> MonitorResult:
     has_in = any(m in text for m in in_markers)
 
     in_stock = has_in and not has_out
+    availability_reason = "fallback_unknown"
+    parser_confidence = 0.2
+    if has_out and not has_in:
+        availability_reason = "marker_out_of_stock"
+        parser_confidence = 0.9
+    elif has_in and not has_out:
+        availability_reason = "marker_in_stock"
+        parser_confidence = 0.9
+    elif has_in and has_out:
+        availability_reason = "marker_conflict"
+        parser_confidence = 0.35
     keyword_matched: bool | None = None
     if keyword:
         keyword_matched = keyword.lower() in text
@@ -511,6 +524,8 @@ def default_parser(html: str, keyword: str | None = None) -> MonitorResult:
         price_cents=price_cents,
         title=title[:180],
         status_text=status_text,
+        availability_reason=availability_reason,
+        parser_confidence=parser_confidence,
         keyword_matched=keyword_matched,
     )
 
@@ -525,9 +540,13 @@ def pokemoncenter_parser(html: str, keyword: str | None = None) -> MonitorResult
     if has_out:
         result.in_stock = False
         result.status_text = "out_or_unknown"
+        result.availability_reason = "pokemoncenter_marker_out_of_stock"
+        result.parser_confidence = 0.98
     elif has_in:
         result.in_stock = True
         result.status_text = "in_stock"
+        result.availability_reason = "pokemoncenter_marker_in_stock"
+        result.parser_confidence = 0.98
     result.title = title
     return result
 
@@ -538,9 +557,13 @@ def walmart_parser(html: str, keyword: str | None = None) -> MonitorResult:
     if '"availability":"instock"' in text or "fulfillmentoptions" in text:
         result.in_stock = True
         result.status_text = "in_stock"
+        result.availability_reason = "walmart_marker_in_stock"
+        result.parser_confidence = 0.98
     if '"availability":"outofstock"' in text or "out of stock" in text:
         result.in_stock = False
         result.status_text = "out_or_unknown"
+        result.availability_reason = "walmart_marker_out_of_stock"
+        result.parser_confidence = 0.98
     result.price_cents = extract_price_cents(html)
     result.title = title
     return result
@@ -570,9 +593,13 @@ def target_parser(html: str, keyword: str | None = None) -> MonitorResult:
     if has_out:
         result.in_stock = False
         result.status_text = "out_or_unknown"
+        result.availability_reason = "target_marker_out_of_stock"
+        result.parser_confidence = 0.98
     elif has_in:
         result.in_stock = True
         result.status_text = "in_stock"
+        result.availability_reason = "target_marker_in_stock"
+        result.parser_confidence = 0.98
 
     result.price_cents = extract_price_cents(html)
     result.title = title
@@ -602,9 +629,13 @@ def bestbuy_parser(html: str, keyword: str | None = None) -> MonitorResult:
     if has_out:
         result.in_stock = False
         result.status_text = "out_or_unknown"
+        result.availability_reason = "bestbuy_marker_out_of_stock"
+        result.parser_confidence = 0.98
     elif has_in:
         result.in_stock = True
         result.status_text = "in_stock"
+        result.availability_reason = "bestbuy_marker_in_stock"
+        result.parser_confidence = 0.98
 
     result.price_cents = extract_price_cents(html)
     result.title = title
@@ -895,6 +926,8 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
         "in_stock": result.in_stock,
         "eligible_for_alert": eligible,
         "price_cents": result.price_cents,
+        "availability_reason": result.availability_reason,
+        "parser_confidence": result.parser_confidence,
         "keyword_matched": result.keyword_matched,
         "price_within_limit": result.price_within_limit,
         "within_msrp_delta": result.within_msrp_delta,

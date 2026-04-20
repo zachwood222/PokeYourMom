@@ -424,8 +424,12 @@ def test_walmart_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch
 
     assert in_stock.in_stock is True
     assert in_stock.price_cents == 2488
+    assert in_stock.availability_reason == "walmart_marker_in_stock"
+    assert in_stock.parser_confidence == 0.98
     assert out_stock.in_stock is False
     assert out_stock.price_cents == 2488
+    assert out_stock.availability_reason == "walmart_marker_out_of_stock"
+    assert out_stock.parser_confidence == 0.98
 
 
 def test_target_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch):
@@ -438,8 +442,12 @@ def test_target_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch)
 
     assert in_stock.in_stock is True
     assert in_stock.price_cents == 1999
+    assert in_stock.availability_reason == "target_marker_in_stock"
+    assert in_stock.parser_confidence == 0.98
     assert out_stock.in_stock is False
     assert out_stock.price_cents == 1999
+    assert out_stock.availability_reason == "target_marker_out_of_stock"
+    assert out_stock.parser_confidence == 0.98
 
 
 def test_bestbuy_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch):
@@ -452,8 +460,12 @@ def test_bestbuy_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch
 
     assert in_stock.in_stock is True
     assert in_stock.price_cents == 5499
+    assert in_stock.availability_reason == "bestbuy_marker_in_stock"
+    assert in_stock.parser_confidence == 0.98
     assert out_stock.in_stock is False
     assert out_stock.price_cents == 5499
+    assert out_stock.availability_reason == "bestbuy_marker_out_of_stock"
+    assert out_stock.parser_confidence == 0.98
 
 
 def test_target_and_bestbuy_parsers_keep_default_fallback_for_unknown_markup(tmp_path, monkeypatch):
@@ -469,6 +481,97 @@ def test_target_and_bestbuy_parsers_keep_default_fallback_for_unknown_markup(tmp
     assert target_result.in_stock == target_default.in_stock
     assert target_result.status_text == target_default.status_text
     assert target_result.price_cents == target_default.price_cents
+    assert target_result.availability_reason == target_default.availability_reason
+    assert target_result.parser_confidence == target_default.parser_confidence
     assert bestbuy_result.in_stock == bestbuy_default.in_stock
     assert bestbuy_result.status_text == bestbuy_default.status_text
     assert bestbuy_result.price_cents == bestbuy_default.price_cents
+    assert bestbuy_result.availability_reason == bestbuy_default.availability_reason
+    assert bestbuy_result.parser_confidence == bestbuy_default.parser_confidence
+
+
+def _seed_monitor(app_module):
+    conn = app_module.db()
+    cur = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'target', 'https://example.com/item', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    conn.commit()
+    monitor_id = cur.lastrowid
+    conn.close()
+    return monitor_id
+
+
+def test_check_monitor_api_includes_reason_and_confidence_for_in_stock(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    monitor_id = _seed_monitor(app_module)
+    expected = app_module.MonitorResult(
+        in_stock=True,
+        price_cents=2499,
+        title="Pokemon Product",
+        status_text="in_stock",
+        availability_reason="marker_in_stock",
+        parser_confidence=0.91,
+        keyword_matched=True,
+    )
+
+    monkeypatch.setattr(app_module, "fetch_monitor", lambda monitor: expected)
+
+    resp = client.post(f"/api/monitors/{monitor_id}/check", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["availability_reason"] == "marker_in_stock"
+    assert payload["parser_confidence"] == 0.91
+
+
+def test_check_monitor_api_includes_reason_and_confidence_for_out_of_stock(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    monitor_id = _seed_monitor(app_module)
+    expected = app_module.MonitorResult(
+        in_stock=False,
+        price_cents=2499,
+        title="Pokemon Product",
+        status_text="out_or_unknown",
+        availability_reason="marker_out_of_stock",
+        parser_confidence=0.94,
+        keyword_matched=True,
+    )
+
+    monkeypatch.setattr(app_module, "fetch_monitor", lambda monitor: expected)
+
+    resp = client.post(f"/api/monitors/{monitor_id}/check", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["availability_reason"] == "marker_out_of_stock"
+    assert payload["parser_confidence"] == 0.94
+
+
+def test_check_monitor_api_includes_reason_and_confidence_for_ambiguous_markup(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    monitor_id = _seed_monitor(app_module)
+    expected = app_module.MonitorResult(
+        in_stock=False,
+        price_cents=None,
+        title="Pokemon Product",
+        status_text="out_or_unknown",
+        availability_reason="fallback_unknown",
+        parser_confidence=0.2,
+        keyword_matched=None,
+    )
+
+    monkeypatch.setattr(app_module, "fetch_monitor", lambda monitor: expected)
+
+    resp = client.post(f"/api/monitors/{monitor_id}/check", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["availability_reason"] == "fallback_unknown"
+    assert payload["parser_confidence"] == 0.2
