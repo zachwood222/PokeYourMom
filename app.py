@@ -69,6 +69,19 @@ running = False
 monitor_thread: threading.Thread | None = None
 lock = threading.Lock()
 
+CHECKOUT_TASK_STATES = {
+    "queued",
+    "monitoring",
+    "carting",
+    "shipping",
+    "payment",
+    "submitting",
+    "success",
+    "failed",
+    "paused",
+    "stopped",
+}
+
 
 @dataclass
 class MonitorResult:
@@ -412,6 +425,53 @@ def init_db() -> None:
             foreign key(workspace_id) references workspaces(id)
         );
 
+        create table if not exists checkout_tasks (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            task_name text,
+            task_config text,
+            current_state text not null default 'queued',
+            enabled integer not null default 0,
+            is_paused integer not null default 0,
+            last_error text,
+            created_at text not null,
+            updated_at text not null,
+            last_transition_at text,
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id)
+        );
+
+        create table if not exists checkout_attempts (
+            id integer primary key autoincrement,
+            task_id integer not null,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            state text not null,
+            status text not null,
+            details text,
+            error_text text,
+            created_at text not null,
+            foreign key(task_id) references checkout_tasks(id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id)
+        );
+
+        create table if not exists task_logs (
+            id integer primary key autoincrement,
+            task_id integer not null,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            level text not null,
+            event_type text not null,
+            message text not null,
+            payload text,
+            created_at text not null,
+            foreign key(task_id) references checkout_tasks(id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id)
+        );
+
         create table if not exists billing_customers (
             id integer primary key autoincrement,
             workspace_id integer not null,
@@ -703,6 +763,9 @@ def map_subscription_to_internal_plan(
 
 
 def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return sync_manual_billing_subscription_event(payload)
+
+
 def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str, Any]:
     provider = (payload.get("provider") or "stripe").strip().lower()
     subscription_id = (payload.get("provider_subscription_id") or "").strip()
@@ -1162,10 +1225,280 @@ def create_event_and_deliver(
     )
 
 
+def normalize_checkout_state(raw_state: Any, *, allow_control_states: bool = True) -> str:
+    state = str(raw_state or "").strip().lower()
+    valid_states = CHECKOUT_TASK_STATES if allow_control_states else CHECKOUT_TASK_STATES - {"paused", "stopped"}
+    if state not in valid_states:
+        raise ValueError(
+            "Invalid checkout state. Expected one of: queued, monitoring, carting, shipping, payment, submitting, success, failed"
+        )
+    return state
+
+
+def record_checkout_attempt(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    workspace_id: int,
+    monitor_id: int,
+    state: str,
+    status: str,
+    details: dict[str, Any] | None = None,
+    error_text: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        insert into checkout_attempts(task_id, workspace_id, monitor_id, state, status, details, error_text, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            workspace_id,
+            monitor_id,
+            state,
+            status,
+            json.dumps(details or {}),
+            (error_text or "")[:500] if error_text else None,
+            utc_now(),
+        ),
+    )
+
+
+def record_task_log(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    workspace_id: int,
+    monitor_id: int,
+    level: str,
+    event_type: str,
+    message: str,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    conn.execute(
+        """
+        insert into task_logs(task_id, workspace_id, monitor_id, level, event_type, message, payload, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            workspace_id,
+            monitor_id,
+            level.lower(),
+            event_type,
+            message,
+            json.dumps(payload or {}),
+            utc_now(),
+        ),
+    )
+
+
+def create_checkout_task(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: int,
+    monitor_id: int,
+    task_name: str | None = None,
+    task_config: dict[str, Any] | None = None,
+    initial_state: str = "queued",
+) -> sqlite3.Row:
+    normalized_state = normalize_checkout_state(initial_state, allow_control_states=False)
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into checkout_tasks(
+            workspace_id,
+            monitor_id,
+            task_name,
+            task_config,
+            current_state,
+            enabled,
+            is_paused,
+            created_at,
+            updated_at,
+            last_transition_at
+        )
+        values (?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+        """,
+        (workspace_id, monitor_id, task_name, json.dumps(task_config or {}), normalized_state, now_iso, now_iso, now_iso),
+    )
+    task_id = cur.lastrowid
+    record_checkout_attempt(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        monitor_id=monitor_id,
+        state=normalized_state,
+        status="created",
+        details={"reason": "api_create"},
+    )
+    record_task_log(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        monitor_id=monitor_id,
+        level="info",
+        event_type="task_created",
+        message=f"Checkout task {task_id} created",
+        payload={"initial_state": normalized_state},
+    )
+    return conn.execute("select * from checkout_tasks where id = ?", (task_id,)).fetchone()
+
+
+def get_checkout_task_for_workspace(
+    conn: sqlite3.Connection, task_id: int, workspace_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from checkout_tasks where id = ? and workspace_id = ?",
+        (task_id, workspace_id),
+    ).fetchone()
+
+
+def transition_checkout_task(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    workspace_id: int,
+    requested_state: str,
+    reason: str,
+    error_text: str | None = None,
+) -> sqlite3.Row | None:
+    row = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+    if not row:
+        return None
+
+    normalized_state = normalize_checkout_state(requested_state)
+    enabled = int(normalized_state not in {"stopped", "success", "failed"})
+    is_paused = int(normalized_state == "paused")
+    now_iso = utc_now()
+    conn.execute(
+        """
+        update checkout_tasks
+        set current_state = ?,
+            enabled = ?,
+            is_paused = ?,
+            last_error = ?,
+            updated_at = ?,
+            last_transition_at = ?
+        where id = ? and workspace_id = ?
+        """,
+        (
+            normalized_state,
+            enabled,
+            is_paused,
+            (error_text or "")[:500] if error_text else None,
+            now_iso,
+            now_iso,
+            task_id,
+            workspace_id,
+        ),
+    )
+    record_checkout_attempt(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        monitor_id=row["monitor_id"],
+        state=normalized_state,
+        status="transition",
+        details={"reason": reason},
+        error_text=error_text,
+    )
+    record_task_log(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        monitor_id=row["monitor_id"],
+        level="info" if not error_text else "error",
+        event_type="state_transition",
+        message=f"Task transitioned to {normalized_state}",
+        payload={"reason": reason},
+    )
+    return get_checkout_task_for_workspace(conn, task_id, workspace_id)
+
+
+def enqueue_checkout_for_monitor(
+    monitor: sqlite3.Row, result: MonitorResult, *, reason: str = "in_stock_detected"
+) -> int | None:
+    if not result.in_stock:
+        return None
+    conn = db()
+    existing = conn.execute(
+        """
+        select * from checkout_tasks
+        where workspace_id = ? and monitor_id = ?
+          and current_state not in ('success', 'failed', 'stopped')
+        order by id desc
+        limit 1
+        """,
+        (monitor["workspace_id"], monitor["id"]),
+    ).fetchone()
+    if existing:
+        record_task_log(
+            conn,
+            task_id=existing["id"],
+            workspace_id=monitor["workspace_id"],
+            monitor_id=monitor["id"],
+            level="info",
+            event_type="enqueue_skipped_existing",
+            message=f"Existing active checkout task {existing['id']} detected",
+            payload={"reason": reason},
+        )
+        conn.commit()
+        conn.close()
+        return existing["id"]
+
+    task = create_checkout_task(
+        conn,
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+        task_name=f"Monitor {monitor['id']} checkout",
+        task_config={"retailer": monitor["retailer"], "product_url": monitor["product_url"]},
+        initial_state="queued",
+    )
+    record_checkout_attempt(
+        conn,
+        task_id=task["id"],
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+        state="queued",
+        status="enqueued",
+        details={
+            "reason": reason,
+            "title": result.title,
+            "price_cents": result.price_cents,
+        },
+    )
+    record_task_log(
+        conn,
+        task_id=task["id"],
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+        level="warning",
+        event_type="task_enqueued",
+        message=f"Checkout task {task['id']} enqueued from monitor {monitor['id']}",
+        payload={"price_cents": result.price_cents, "title": result.title},
+    )
+    conn.commit()
+    conn.close()
+    return int(task["id"])
+
+
 def cents_to_dollars(cents: int | None) -> str:
     if cents is None:
         return "unknown"
     return f"${cents / 100:.2f}"
+
+
+def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    config_raw = payload.get("task_config")
+    try:
+        payload["task_config"] = json.loads(config_raw) if config_raw else {}
+    except (TypeError, json.JSONDecodeError):
+        payload["task_config"] = {}
+    return payload
 
 
 def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -1275,6 +1608,8 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
     conn.commit()
     conn.close()
 
+    if eligible:
+        enqueue_checkout_for_monitor(monitor, result)
     create_event_and_deliver(monitor, result, eligible)
 
     log(
@@ -1807,6 +2142,129 @@ def api_check_monitor(monitor_id: int):
     if not row:
         return jsonify({"error": "Monitor not found"}), 404
     return jsonify(check_monitor_once(row))
+
+
+@app.post("/api/checkout/tasks")
+@require_auth
+def api_create_checkout_task():
+    body = request.json or {}
+    monitor_id = body.get("monitor_id")
+    if monitor_id is None:
+        return jsonify({"error": "monitor_id is required"}), 400
+
+    workspace_id = current_workspace_id()
+    conn = db()
+    monitor = conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (int(monitor_id), workspace_id),
+    ).fetchone()
+    if not monitor:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+
+    initial_state = body.get("initial_state", "queued")
+    try:
+        task = create_checkout_task(
+            conn,
+            workspace_id=workspace_id,
+            monitor_id=int(monitor_id),
+            task_name=(body.get("task_name") or "").strip() or None,
+            task_config=body.get("task_config") if isinstance(body.get("task_config"), dict) else None,
+            initial_state=initial_state,
+        )
+    except ValueError as exc:
+        conn.close()
+        return jsonify({"error": str(exc)}), 400
+
+    conn.commit()
+    conn.close()
+    return jsonify(serialize_checkout_task(task)), 201
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/start")
+@require_auth
+def api_start_checkout_task(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="monitoring",
+        reason="api_start",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/pause")
+@require_auth
+def api_pause_checkout_task(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="paused",
+        reason="api_pause",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/stop")
+@require_auth
+def api_stop_checkout_task(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="stopped",
+        reason="api_stop",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.get("/api/checkout/tasks/<int:task_id>/state")
+@require_auth
+def api_checkout_task_state(task_id: int):
+    conn = db()
+    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    last_attempt = conn.execute(
+        """
+        select * from checkout_attempts
+        where task_id = ?
+        order by id desc
+        limit 1
+        """,
+        (task_id,),
+    ).fetchone()
+    conn.close()
+    return jsonify(
+        {
+            "task_id": task_id,
+            "current_state": row["current_state"],
+            "last_error": row["last_error"],
+            "last_transition_at": row["last_transition_at"],
+            "last_attempt": dict(last_attempt) if last_attempt else None,
+        }
+    )
 
 
 @app.get("/api/events")
