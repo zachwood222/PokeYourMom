@@ -51,6 +51,28 @@ def test_protected_endpoint_requires_auth(tmp_path, monkeypatch):
     assert "Unauthorized" in resp.get_json()["error"]
 
 
+def test_workspace_endpoint_requires_auth(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/workspace")
+
+    assert resp.status_code == 401
+    assert resp.get_json() == {"error": "Unauthorized"}
+
+
+def test_workspace_endpoint_allows_authenticated_user_and_returns_context(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/workspace", headers={"Authorization": "Bearer test-token"})
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["workspace"]["id"] == 1
+    assert payload["user"]["email"] == "owner@local.test"
+
+
 def test_create_monitor_validates_retailer(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -96,6 +118,45 @@ def test_create_monitor_accepts_pokemon_center_alias(tmp_path, monkeypatch):
 
     assert resp.status_code == 201
     assert payload["retailer"] == "pokemoncenter"
+    assert payload["category"] == "pokemon"
+
+
+def test_create_monitor_validates_category(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "category": "model_kits",
+            "product_url": "https://www.target.com/p/example",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "Unsupported category 'model_kits'"
+
+
+def test_create_monitor_validates_retailer_category_combo(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "category": "sports_cards",
+            "product_url": "https://www.walmart.com/ip/example",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "Retailer 'walmart' does not support category 'sports_cards'"
 
 
 def test_captcha_valid_token_allows_protected_post(tmp_path, monkeypatch):
@@ -131,6 +192,79 @@ def test_captcha_valid_token_allows_protected_post(tmp_path, monkeypatch):
     )
 
     assert resp.status_code == 201
+
+
+def test_create_monitor_validates_behavior_metadata_retailer_profiles(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+            "behavior_metadata": {
+                "jitter_ratio": 0.25,
+                "retailer_profiles": {
+                    "invalid-retailer": {"base_delay_seconds": 0.5},
+                },
+            },
+        },
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 400
+    assert "unsupported retailer" in resp.get_json()["error"]
+
+
+def test_workspace_behavior_metadata_can_be_patched(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    response = client.patch(
+        "/api/workspace",
+        json={
+            "behavior_metadata": {
+                "profile": "safer_default",
+                "base_delay_seconds": 0.3,
+                "retailer_profiles": {"target": {"base_delay_seconds": 0.4}},
+            }
+        },
+        headers=_auth_headers(),
+    )
+    assert response.status_code == 200
+    workspace = response.get_json()["workspace"]
+    payload = json.loads(workspace["behavior_metadata"])
+    assert payload["profile"] == "safer_default"
+    assert payload["retailer_profiles"]["target"]["base_delay_seconds"] == 0.4
+
+
+def test_update_monitor_allows_behavior_and_session_metadata(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    created = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "bestbuy",
+            "product_url": "https://example.com/bb",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    monitor_id = created.get_json()["id"]
+    patched = client.patch(
+        f"/api/monitors/{monitor_id}",
+        json={
+            "enabled": False,
+            "session_metadata": {"cookie_profile": "A"},
+            "behavior_metadata": {"base_delay_seconds": 0.45, "jitter_ratio": 0.1},
+        },
+        headers=_auth_headers(),
+    )
+    assert patched.status_code == 200
+    payload = patched.get_json()
+    assert payload["enabled"] == 0
+    assert json.loads(payload["session_metadata"])["cookie_profile"] == "A"
+    assert json.loads(payload["behavior_metadata"])["base_delay_seconds"] == 0.45
 
 
 def test_captcha_invalid_or_missing_token_rejects_protected_post(tmp_path, monkeypatch):
@@ -175,6 +309,10 @@ def test_captcha_invalid_or_missing_token_rejects_protected_post(tmp_path, monke
     assert missing_token.get_json()["reason"] == "missing_token"
     assert invalid_token.status_code in {400, 403}
     assert invalid_token.get_json()["reason"] in {"invalid_token", "provider_rejected"}
+    assert missing_token.status_code == 403
+    assert missing_token.get_json()["reason"] == "missing_token"
+    assert invalid_token.status_code == 403
+    assert invalid_token.get_json()["reason"] == "provider_rejected"
 
 
 def test_captcha_provider_errors_fail_safely(tmp_path, monkeypatch):
@@ -376,8 +514,39 @@ def test_init_db_migrates_existing_monitors_table_with_msrp_column(tmp_path, mon
     assert "proxy_url" in columns
     assert "session_task_key" in columns
     assert "session_metadata" in columns
+    assert "behavior_metadata" in columns
     assert "proxy_url" in workspace_columns
     assert "session_metadata" in workspace_columns
+    assert "behavior_metadata" in workspace_columns
+
+
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
 
 
 def test_api_routes_require_auth(tmp_path, monkeypatch):
@@ -1262,6 +1431,24 @@ def test_init_db_creates_checkout_tables(tmp_path, monkeypatch):
     assert tables == {"checkout_tasks", "checkout_attempts", "task_logs"}
 
 
+def test_init_db_creates_proxy_tables(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    conn = app_module.db()
+    tables = {
+        row["name"]
+        for row in conn.execute(
+            "select name from sqlite_master where type = 'table' and name in ('proxies', 'proxy_leases')"
+        ).fetchall()
+    }
+    monitor_columns = {row["name"] for row in conn.execute("pragma table_info(monitors)").fetchall()}
+    conn.close()
+
+    assert tables == {"proxies", "proxy_leases"}
+    assert {"proxy_type", "proxy_region", "proxy_residential_only", "proxy_sticky_session_seconds"}.issubset(
+        monitor_columns
+    )
+
+
 def test_check_monitor_enqueues_checkout_task_for_eligible_stock(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -1278,6 +1465,23 @@ def test_check_monitor_enqueues_checkout_task_for_eligible_stock(tmp_path, monke
     )
     monitor = create_resp.get_json()
     assert create_resp.status_code == 201
+    account_resp = client.post(
+        "/api/accounts",
+        json={
+            "retailer": "target",
+            "username": "target-user",
+            "encrypted_credential_ref": "cred-ref",
+            "proxy_url": "http://proxy-1.local:8080",
+        },
+        headers=_auth_headers(),
+    )
+    assert account_resp.status_code == 201
+    binding_resp = client.post(
+        "/api/task-profile-bindings",
+        json={"monitor_id": monitor["id"], "retailer_account_id": account_resp.get_json()["id"]},
+        headers=_auth_headers(),
+    )
+    assert binding_resp.status_code == 201
 
     def fake_fetch(_monitor):
         return app_module.MonitorResult(
@@ -1326,6 +1530,18 @@ def test_checkout_task_lifecycle_routes(tmp_path, monkeypatch):
     )
     monitor = create_monitor_resp.get_json()
     assert create_monitor_resp.status_code == 201
+    account_resp = client.post(
+        "/api/accounts",
+        json={"retailer": "walmart", "username": "w-user", "encrypted_credential_ref": "cred-ref"},
+        headers=_auth_headers(),
+    )
+    assert account_resp.status_code == 201
+    binding_resp = client.post(
+        "/api/task-profile-bindings",
+        json={"monitor_id": monitor["id"], "retailer_account_id": account_resp.get_json()["id"]},
+        headers=_auth_headers(),
+    )
+    assert binding_resp.status_code == 201
 
     create_task_resp = client.post(
         "/api/checkout/tasks",
@@ -1354,97 +1570,68 @@ def test_checkout_task_lifecycle_routes(tmp_path, monkeypatch):
     assert payload["last_error"] is None
 
 
-def test_create_mailbox_credential_encrypts_secret(tmp_path, monkeypatch):
+def test_checkout_task_create_requires_retailer_account_binding(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
-
-    resp = client.post(
-        "/api/mailboxes",
-        json={
-            "provider": "gmail",
-            "email": "buyer@example.com",
-            "password": "mailbox-app-password",
-            "secret_type": "mailbox_password",
-        },
-        headers=_auth_headers(),
-    )
-
-    assert resp.status_code == 201
-    payload = resp.get_json()
-    assert "secret_id" not in payload
-
-    conn = app_module.db()
-    row = conn.execute("select * from mailbox_credentials where id = ?", (payload["id"],)).fetchone()
-    secret = conn.execute("select * from account_secrets where id = ?", (row["secret_id"],)).fetchone()
-    conn.close()
-
-    assert secret["secret_type"] == "mailbox_password"
-    assert "mailbox-app-password" not in secret["ciphertext"]
-
-
-def test_transition_to_payment_waits_for_otp_and_updates_state(tmp_path, monkeypatch):
-    app_module = _load_app(tmp_path, monkeypatch)
-    client = app_module.app.test_client()
-
-    create_monitor_resp = client.post(
+    monitor_resp = client.post(
         "/api/monitors",
-        json={"retailer": "walmart", "product_url": "https://example.com/item", "poll_interval_seconds": 20},
+        json={"retailer": "walmart", "product_url": "https://example.com/no-binding", "poll_interval_seconds": 20},
         headers=_auth_headers(),
     )
-    monitor = create_monitor_resp.get_json()
-    assert create_monitor_resp.status_code == 201
-
-    mailbox_resp = client.post(
-        "/api/mailboxes",
-        json={"provider": "gmail", "email": "buyer@example.com", "password": "mailbox-app-password"},
-        headers=_auth_headers(),
-    )
-    mailbox = mailbox_resp.get_json()
-    assert mailbox_resp.status_code == 201
-
+    assert monitor_resp.status_code == 201
     create_task_resp = client.post(
         "/api/checkout/tasks",
+        json={"monitor_id": monitor_resp.get_json()["id"]},
+        headers=_auth_headers(),
+    )
+    assert create_task_resp.status_code == 400
+    assert "Task binding is required" in create_task_resp.get_json()["error"]
+
+
+def test_account_execution_endpoints_show_queue_and_proxy_lock(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    monitor_resp = client.post(
+        "/api/monitors",
+        json={"retailer": "walmart", "product_url": "https://example.com/q", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
+    )
+    monitor = monitor_resp.get_json()
+    account_resp = client.post(
+        "/api/accounts",
         json={
-            "monitor_id": monitor["id"],
-            "task_name": "OTP Checkout",
-            "task_config": {
-                "otp_required": True,
-                "mailbox_credential_id": mailbox["id"],
-                "otp_timeout_seconds": 20,
-                "otp_poll_interval_seconds": 2,
-            },
+            "retailer": "walmart",
+            "username": "exec-user",
+            "encrypted_credential_ref": "cred-ref",
+            "proxy_url": "http://proxy-lock.local:8080",
         },
         headers=_auth_headers(),
     )
-    task = create_task_resp.get_json()
+    account = account_resp.get_json()
+    bind_resp = client.post(
+        "/api/task-profile-bindings",
+        json={"monitor_id": monitor["id"], "retailer_account_id": account["id"]},
+        headers=_auth_headers(),
+    )
+    assert bind_resp.status_code == 201
+    create_task_resp = client.post(
+        "/api/checkout/tasks",
+        json={"monitor_id": monitor["id"], "task_name": "Bound task"},
+        headers=_auth_headers(),
+    )
     assert create_task_resp.status_code == 201
-
-    monkeypatch.setattr(
-        app_module,
-        "poll_for_otp_with_provider",
-        lambda **kwargs: {
-            "otp_code": "123456",
-            "sender": "no-reply@target.com",
-            "subject": "Your code",
-            "received_at": app_module.utc_now(),
-            "provider": "gmail",
-            "message_id": "99",
-        },
-    )
-
     conn = app_module.db()
-    transitioned = app_module.transition_checkout_task(
-        conn,
-        task_id=task["id"],
-        workspace_id=1,
-        requested_state="payment",
-        reason="test_payment_transition",
-    )
+    app_module.run_checkout_account_scheduler(conn, now_iso=app_module.utc_now())
     conn.commit()
     conn.close()
-
-    assert transitioned is not None
-    assert transitioned["current_state"] == "verification_code_received"
-    config = transitioned["task_config"]
-    parsed = json.loads(config)
-    assert parsed["consumed_otp"]["otp_code"] == "123456"
+    execution_resp = client.get("/api/accounts/execution", headers=_auth_headers())
+    assert execution_resp.status_code == 200
+    execution_payload = execution_resp.get_json()
+    account_row = next(item for item in execution_payload if item["id"] == account["id"])
+    assert account_row["queue_depth"] >= 1
+    assert account_row["proxy_lock_state"] == "locked"
+    locks_resp = client.get("/api/accounts/proxy-locks", headers=_auth_headers())
+    assert locks_resp.status_code == 200
+    lock_payload = locks_resp.get_json()
+    lock_row = next(item for item in lock_payload if item["account_id"] == account["id"])
+    assert lock_row["proxy_lock_owner"] == f"account:{account['id']}"
