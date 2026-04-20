@@ -45,6 +45,12 @@ SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY", "local-dev-secret-key
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
 UPDATE_CHECK_TIMEOUT_SECONDS = float(os.getenv("UPDATE_CHECK_TIMEOUT_SECONDS", "2.0"))
+CAPTCHA_SECRET_KEY = os.getenv("CAPTCHA_SECRET_KEY", "")
+CAPTCHA_VERIFY_URL = os.getenv(
+    "CAPTCHA_VERIFY_URL",
+    "https://www.google.com/recaptcha/api/siteverify",
+)
+CAPTCHA_VERIFY_TIMEOUT_SECONDS = float(os.getenv("CAPTCHA_VERIFY_TIMEOUT_SECONDS", "2.0"))
 TASK_STEP_DELAY_SECONDS = float(os.getenv("TASK_STEP_DELAY_SECONDS", "0.5"))
 
 PLAN_LIMITS = {
@@ -843,6 +849,59 @@ def verify_captcha_token(token: str) -> tuple[bool, str | None]:
     return True, None
 
 
+def _is_captcha_protected_request() -> bool:
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return False
+    if request.path == "/api/billing/stripe/webhook":
+        return False
+    return request.path.startswith("/api/")
+
+
+def _captcha_token_from_request() -> str:
+    header_token = (request.headers.get("X-CAPTCHA-Token") or "").strip()
+    if header_token:
+        return header_token
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict):
+        for key in ("captcha_token", "captchaToken", "captcha-response", "captchaResponse"):
+            candidate = payload.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    form_token = (request.form.get("captcha_token") or "").strip()
+    if form_token:
+        return form_token
+    return ""
+
+
+def verify_captcha_token(token: str) -> tuple[bool, str]:
+    if not CAPTCHA_SECRET_KEY:
+        return True, "skipped_not_configured"
+    if not token:
+        return False, "missing_token"
+    try:
+        response = requests.post(
+            CAPTCHA_VERIFY_URL,
+            data={
+                "secret": CAPTCHA_SECRET_KEY,
+                "response": token,
+                "remoteip": request.remote_addr,
+            },
+            timeout=CAPTCHA_VERIFY_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        return False, "provider_request_failed"
+    if response.status_code != 200:
+        return False, "provider_http_error"
+    try:
+        payload = response.json()
+    except ValueError:
+        return False, "provider_invalid_json"
+    success = bool(payload.get("success"))
+    if success:
+        return True, "ok"
+    return False, "provider_rejected"
+
+
 @app.before_request
 def require_api_auth() -> tuple[dict[str, str], int] | None:
     incoming_correlation_id = (request.headers.get("X-Correlation-ID") or "").strip()
@@ -864,6 +923,19 @@ def require_api_auth() -> tuple[dict[str, str], int] | None:
         else:
             return jsonify({"error": "Unauthorized"}), 401
 
+    if _is_captcha_protected_request():
+        captcha_token = _captcha_token_from_request()
+        is_valid, failure_reason = verify_captcha_token(captcha_token)
+        if not is_valid:
+            log(
+                "captcha_verification_failed",
+                level="warning",
+                workspace_id=getattr(g, "workspace_id", None),
+            )
+            return (
+                jsonify({"error": "CAPTCHA verification failed", "reason": failure_reason}),
+                403,
+            )
     if request.method in {"POST", "PATCH", "PUT", "DELETE"}:
         captcha_token = _extract_captcha_token()
         captcha_ok, reason = verify_captcha_token(captcha_token or "")
