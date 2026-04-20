@@ -1,9 +1,14 @@
 import importlib
+import hashlib
+import hmac
+import json
 import sqlite3
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from parser_fixture_harness import load_fixture_html
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +21,7 @@ def _load_app(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(db_path))
     monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "test-token")
     monkeypatch.setenv("API_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("STRIPE_WEBHOOK_SECRET", "whsec_test")
 
     import app as app_module
 
@@ -26,6 +32,13 @@ def _load_app(tmp_path, monkeypatch):
 
 def _auth_headers(token="test-token"):
     return {"Authorization": f"Bearer {token}", "X-API-Token": "api-token"}
+
+
+def _stripe_signature(payload: str, secret: str, timestamp: int | None = None) -> str:
+    ts = timestamp or int(time.time())
+    signed = f"{ts}.{payload}".encode("utf-8")
+    digest = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
+    return f"t={ts},v1={digest}"
 
 
 def test_protected_endpoint_requires_auth(tmp_path, monkeypatch):
@@ -49,7 +62,7 @@ def test_create_monitor_validates_retailer(tmp_path, monkeypatch):
     )
 
     assert resp.status_code == 400
-    assert "Unsupported retailer" in resp.get_json()["error"]
+    assert resp.get_json()["error"] == "Unsupported retailer 'amazon'"
 
 
 def test_create_monitor_requires_http_url(tmp_path, monkeypatch):
@@ -63,7 +76,7 @@ def test_create_monitor_requires_http_url(tmp_path, monkeypatch):
     )
 
     assert resp.status_code == 400
-    assert "product_url" in resp.get_json()["error"]
+    assert resp.get_json()["error"] == "product_url must be http(s)"
 
 
 def test_create_monitor_accepts_pokemon_center_alias(tmp_path, monkeypatch):
@@ -257,6 +270,115 @@ def test_api_routes_require_auth(tmp_path, monkeypatch):
 
     assert resp.status_code == 401
     assert resp.get_json() == {"error": "Unauthorized"}
+
+
+def test_stripe_webhook_valid_signature_accepted(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    event = {
+        "id": "evt_valid_1",
+        "type": "customer.subscription.created",
+        "data": {
+            "object": {
+                "id": "sub_123",
+                "customer": "cus_123",
+                "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_end": int(time.time()) + 86400,
+                "metadata": {"workspace_id": "1"},
+                "plan": {"id": "pro_monthly", "interval": "month"},
+                "items": {"data": [{"price": {"lookup_key": "pro-monthly"}}]},
+            }
+        },
+    }
+    payload = json.dumps(event)
+    signature = _stripe_signature(payload, "whsec_test")
+
+    resp = client.post(
+        "/api/billing/stripe/webhook",
+        data=payload,
+        headers={"Stripe-Signature": signature, "Content-Type": "application/json"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "noop": False}
+
+    conn = app_module.db()
+    processed_events = conn.execute("select count(*) as c from billing_webhook_events").fetchone()["c"]
+    subscription = conn.execute(
+        "select provider_subscription_id, status from billing_subscriptions where workspace_id = 1"
+    ).fetchone()
+    conn.close()
+
+    assert processed_events == 1
+    assert subscription["provider_subscription_id"] == "sub_123"
+    assert subscription["status"] == "active"
+
+
+def test_stripe_webhook_invalid_signature_rejected(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    payload = json.dumps({"id": "evt_invalid_1", "type": "customer.subscription.updated", "data": {"object": {}}})
+
+    resp = client.post(
+        "/api/billing/stripe/webhook",
+        data=payload,
+        headers={"Stripe-Signature": "t=1,v1=bad", "Content-Type": "application/json"},
+    )
+
+    assert resp.status_code == 401
+    conn = app_module.db()
+    processed_events = conn.execute("select count(*) as c from billing_webhook_events").fetchone()["c"]
+    conn.close()
+    assert processed_events == 0
+
+
+def test_stripe_webhook_duplicate_event_is_noop(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    event = {
+        "id": "evt_dupe_1",
+        "type": "customer.subscription.updated",
+        "data": {
+            "object": {
+                "id": "sub_dupe",
+                "customer": "cus_dupe",
+                "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_end": int(time.time()) + 3600,
+                "metadata": {"workspace_id": "1"},
+                "plan": {"id": "team_monthly", "interval": "month"},
+                "items": {"data": [{"price": {"lookup_key": "team-monthly"}}]},
+            }
+        },
+    }
+    payload = json.dumps(event)
+    signature = _stripe_signature(payload, "whsec_test")
+
+    first = client.post(
+        "/api/billing/stripe/webhook",
+        data=payload,
+        headers={"Stripe-Signature": signature, "Content-Type": "application/json"},
+    )
+    second = client.post(
+        "/api/billing/stripe/webhook",
+        data=payload,
+        headers={"Stripe-Signature": signature, "Content-Type": "application/json"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.get_json() == {"ok": True, "noop": True}
+
+    conn = app_module.db()
+    processed_events = conn.execute("select count(*) as c from billing_webhook_events").fetchone()["c"]
+    subscriptions = conn.execute(
+        "select count(*) as c from billing_subscriptions where provider_subscription_id = 'sub_dupe'"
+    ).fetchone()["c"]
+    conn.close()
+
+    assert processed_events == 1
+    assert subscriptions == 1
 
 
 def test_api_routes_allow_authenticated_requests_and_include_context(tmp_path, monkeypatch):
@@ -646,3 +768,158 @@ def test_check_monitor_api_includes_reason_and_confidence_for_ambiguous_markup(t
     assert resp.status_code == 200
     assert payload["availability_reason"] == "fallback_unknown"
     assert payload["parser_confidence"] == 0.2
+
+
+def test_billing_sync_upgrade_relaxes_plan_limits(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        """
+        insert into billing_customers(workspace_id, user_id, provider, provider_customer_id, created_at, updated_at)
+        values (1, 1, 'stripe', 'cus_upgrade', ?, ?)
+        """,
+        (app_module.utc_now(), app_module.utc_now()),
+    )
+    for idx in range(20):
+        conn.execute(
+            """
+            insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+            values (1, 'target', ?, 20, ?)
+            """,
+            (f"https://example.com/basic-{idx}", app_module.utc_now()),
+        )
+    conn.commit()
+    conn.close()
+
+    blocked = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://example.com/blocked-upgrade",
+            "poll_interval_seconds": 10,
+        },
+        headers=_auth_headers(),
+    )
+    assert blocked.status_code == 400
+
+    sync = client.post(
+        "/api/billing/subscription-events",
+        json={
+            "provider": "stripe",
+            "provider_subscription_id": "sub_upgrade",
+            "provider_customer_id": "cus_upgrade",
+            "status": "active",
+            "plan_code": "price_pro_monthly",
+            "plan_lookup_key": "pro",
+            "cancel_at_period_end": False,
+        },
+        headers=_auth_headers(),
+    )
+    assert sync.status_code == 200
+
+    upgraded = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://example.com/after-upgrade",
+            "poll_interval_seconds": 10,
+        },
+        headers=_auth_headers(),
+    )
+    assert upgraded.status_code == 201
+
+
+def test_billing_sync_canceled_subscription_enforces_stricter_limits(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute("update workspaces set plan = 'pro' where id = 1")
+    conn.execute(
+        """
+        insert into billing_customers(workspace_id, user_id, provider, provider_customer_id, created_at, updated_at)
+        values (1, 1, 'stripe', 'cus_cancel', ?, ?)
+        """,
+        (app_module.utc_now(), app_module.utc_now()),
+    )
+    for idx in range(18):
+        conn.execute(
+            """
+            insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+            values (1, 'walmart', ?, 20, ?)
+            """,
+            (f"https://example.com/pro-{idx}", app_module.utc_now()),
+        )
+    conn.commit()
+    conn.close()
+
+    allowed_before_cancel = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/before-cancel",
+            "poll_interval_seconds": 10,
+        },
+        headers=_auth_headers(),
+    )
+    assert allowed_before_cancel.status_code == 201
+
+    sync = client.post(
+        "/api/billing/subscription-events",
+        json={
+            "provider": "stripe",
+            "provider_subscription_id": "sub_cancel",
+            "provider_customer_id": "cus_cancel",
+            "status": "canceled",
+            "plan_code": "price_pro_monthly",
+            "plan_lookup_key": "pro",
+            "cancel_at_period_end": True,
+            "source": "billing_subscriptions",
+        },
+        headers=_auth_headers(),
+    )
+    assert sync.status_code == 200
+
+    conn = app_module.db()
+    workspace = conn.execute("select * from workspaces where id = 1").fetchone()
+    conn.close()
+    assert workspace["plan"] == "basic"
+    assert workspace["subscription_status"] == "canceled"
+    assert workspace["subscription_source"] == "billing_subscriptions"
+
+    blocked_poll = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/after-cancel-poll",
+            "poll_interval_seconds": 10,
+        },
+        headers=_auth_headers(),
+    )
+    assert blocked_poll.status_code == 400
+    assert "minimum poll interval is 20 seconds" in blocked_poll.get_json()["error"]
+
+    allowed_at_basic_limit = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/after-cancel-allowed",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    assert allowed_at_basic_limit.status_code == 201
+
+    blocked_monitor_count = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/after-cancel-count",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    assert blocked_monitor_count.status_code == 400
+    assert "Plan limit reached (20 monitors)" in blocked_monitor_count.get_json()["error"]

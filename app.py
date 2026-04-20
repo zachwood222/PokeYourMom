@@ -7,6 +7,8 @@ import secrets
 import sqlite3
 import threading
 import time
+import hashlib
+import hmac
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
@@ -27,25 +29,17 @@ POKEMON_MSRP_BUFFER_CENTS = int(os.getenv("POKEMON_MSRP_BUFFER_CENTS", "1000"))
 APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
 RELEASE_CHANNEL = os.getenv("RELEASE_CHANNEL", "stable")
 API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "dev-token")
-UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "").strip()
-
-
-def env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
-UPDATE_CHECK_TIMEOUT_SECONDS = env_float("UPDATE_CHECK_TIMEOUT_SECONDS", 3.0)
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
 PLAN_LIMITS = {
     "basic": {"max_monitors": 20, "min_poll_seconds": 20},
     "pro": {"max_monitors": 100, "min_poll_seconds": 10},
     "team": {"max_monitors": 500, "min_poll_seconds": 5},
+}
+PLAN_LOOKUP_TO_INTERNAL_PLAN = {
+    "basic": "basic",
+    "pro": "pro",
+    "team": "team",
 }
 SUPPORTED_RETAILERS = {"walmart", "target", "bestbuy", "pokemoncenter"}
 RETAILER_ALIASES = {
@@ -94,6 +88,158 @@ class RetailerParser:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def verify_stripe_webhook_signature(payload: bytes, signature_header: str | None) -> None:
+    if not STRIPE_WEBHOOK_SECRET or not signature_header:
+        raise PermissionError("Missing Stripe webhook secret or signature")
+    parts = {}
+    for item in signature_header.split(","):
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        parts.setdefault(key.strip(), []).append(value.strip())
+    timestamp_raw = (parts.get("t") or [None])[0]
+    signatures = parts.get("v1") or []
+    if not timestamp_raw or not signatures:
+        raise PermissionError("Malformed Stripe-Signature header")
+    try:
+        timestamp = int(timestamp_raw)
+    except ValueError as exc:
+        raise PermissionError("Invalid Stripe signature timestamp") from exc
+    if abs(time.time() - timestamp) > 300:
+        raise PermissionError("Stripe signature timestamp outside tolerance")
+    signed_payload = f"{timestamp}.{payload.decode('utf-8')}".encode("utf-8")
+    expected_signature = hmac.new(
+        STRIPE_WEBHOOK_SECRET.encode("utf-8"),
+        signed_payload,
+        hashlib.sha256,
+    ).hexdigest()
+    if not any(hmac.compare_digest(expected_signature, candidate) for candidate in signatures):
+        raise PermissionError("Invalid Stripe signature")
+
+
+def _workspace_id_from_subscription_object(subscription: dict[str, Any]) -> int | None:
+    metadata = subscription.get("metadata") or {}
+    raw_workspace_id = metadata.get("workspace_id")
+    if raw_workspace_id is None:
+        return None
+    try:
+        return int(raw_workspace_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _iso_from_unix_timestamp(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _resolve_workspace_user_id(conn: sqlite3.Connection, workspace_id: int) -> int | None:
+    row = conn.execute(
+        """
+        select user_id
+        from workspace_members
+        where workspace_id = ?
+        order by case when role = 'owner' then 0 else 1 end, id asc
+        limit 1
+        """,
+        (workspace_id,),
+    ).fetchone()
+    return int(row["user_id"]) if row else None
+
+
+def sync_billing_subscription_event(conn: sqlite3.Connection, event: dict[str, Any]) -> None:
+    event_type = event.get("type", "")
+    subscription = ((event.get("data") or {}).get("object") or {})
+    if not isinstance(subscription, dict):
+        return
+    workspace_id = _workspace_id_from_subscription_object(subscription)
+    if workspace_id is None:
+        return
+    provider_customer_id = subscription.get("customer")
+    billing_customer_id = None
+    if isinstance(provider_customer_id, str) and provider_customer_id:
+        user_id = _resolve_workspace_user_id(conn, workspace_id)
+        if user_id is not None:
+            now_iso = utc_now()
+            conn.execute(
+                """
+                insert into billing_customers(workspace_id, user_id, provider, provider_customer_id, created_at, updated_at)
+                values (?, ?, 'stripe', ?, ?, ?)
+                on conflict(workspace_id, user_id)
+                do update set provider_customer_id = excluded.provider_customer_id, updated_at = excluded.updated_at
+                """,
+                (workspace_id, user_id, provider_customer_id, now_iso, now_iso),
+            )
+            customer_row = conn.execute(
+                """
+                select id from billing_customers
+                where workspace_id = ? and user_id = ?
+                """,
+                (workspace_id, user_id),
+            ).fetchone()
+            billing_customer_id = int(customer_row["id"]) if customer_row else None
+
+    status = subscription.get("status") or "incomplete"
+    if event_type == "customer.subscription.deleted":
+        status = "canceled"
+    cancel_at_period_end = int(bool(subscription.get("cancel_at_period_end", False)))
+    if event_type == "customer.subscription.deleted":
+        cancel_at_period_end = 1
+
+    plan_obj = subscription.get("plan") or {}
+    now_iso = utc_now()
+    conn.execute(
+        """
+        insert into billing_subscriptions(
+            workspace_id,
+            provider,
+            provider_subscription_id,
+            billing_customer_id,
+            status,
+            current_period_end,
+            cancel_at_period_end,
+            plan_code,
+            plan_interval,
+            plan_lookup_key,
+            created_at,
+            updated_at
+        )
+        values (?, 'stripe', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(workspace_id)
+        do update set
+            provider_subscription_id = excluded.provider_subscription_id,
+            billing_customer_id = coalesce(excluded.billing_customer_id, billing_subscriptions.billing_customer_id),
+            status = excluded.status,
+            current_period_end = excluded.current_period_end,
+            cancel_at_period_end = excluded.cancel_at_period_end,
+            plan_code = excluded.plan_code,
+            plan_interval = excluded.plan_interval,
+            plan_lookup_key = excluded.plan_lookup_key,
+            updated_at = excluded.updated_at
+        """,
+        (
+            workspace_id,
+            subscription.get("id"),
+            billing_customer_id,
+            status,
+            _iso_from_unix_timestamp(subscription.get("current_period_end")),
+            cancel_at_period_end,
+            plan_obj.get("id"),
+            plan_obj.get("interval"),
+            (subscription.get("items") or {}).get("data", [{}])[0].get("price", {}).get("lookup_key")
+            if isinstance((subscription.get("items") or {}).get("data"), list)
+            and (subscription.get("items") or {}).get("data")
+            else None,
+            now_iso,
+            now_iso,
+        ),
+    )
 
 
 def format_log_entry(
@@ -158,6 +304,9 @@ def init_db() -> None:
             id integer primary key autoincrement,
             name text not null,
             plan text not null,
+            subscription_status text not null default 'inactive',
+            subscription_source text not null default 'manual',
+            subscription_updated_at text,
             created_at text not null
         );
 
@@ -298,6 +447,15 @@ def init_db() -> None:
 
         create unique index if not exists idx_billing_subscriptions_provider_subscription_id
             on billing_subscriptions(provider_subscription_id);
+
+        create table if not exists billing_webhook_events (
+            id integer primary key autoincrement,
+            event_id text not null unique,
+            processed_at text not null,
+            event_type text not null,
+            workspace_id integer,
+            foreign key(workspace_id) references workspaces(id)
+        );
         """
     )
     existing = conn.execute("select id from workspaces limit 1").fetchone()
@@ -346,6 +504,9 @@ def init_db() -> None:
     ensure_column(conn, "webhooks", "fail_streak", "integer not null default 0")
     ensure_column(conn, "webhooks", "last_error", "text")
     ensure_column(conn, "webhooks", "last_status_code", "integer")
+    ensure_column(conn, "workspaces", "subscription_status", "text not null default 'inactive'")
+    ensure_column(conn, "workspaces", "subscription_source", "text not null default 'manual'")
+    ensure_column(conn, "workspaces", "subscription_updated_at", "text")
     conn.commit()
     conn.close()
 
@@ -442,6 +603,8 @@ def _set_auth_context(user: sqlite3.Row | dict[str, Any], workspace: sqlite3.Row
 def require_api_auth() -> tuple[dict[str, str], int] | None:
     incoming_correlation_id = (request.headers.get("X-Correlation-ID") or "").strip()
     g.correlation_id = incoming_correlation_id or str(uuid4())
+    if request.path == "/api/billing/stripe/webhook":
+        return None
     if not request.path.startswith("/api/"):
         return None
     user = resolve_user_from_request()
@@ -503,6 +666,150 @@ def enforce_plan_limits(workspace_id: int, poll_interval_seconds: int) -> None:
         raise ValueError(
             f"Plan {workspace['plan']} minimum poll interval is {limits['min_poll_seconds']} seconds"
         )
+
+
+def _normalize_plan_hint(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def map_subscription_to_internal_plan(
+    *,
+    status: str,
+    plan_code: str | None,
+    plan_lookup_key: str | None,
+    cancel_at_period_end: bool,
+) -> str:
+    normalized_status = (status or "").strip().lower()
+    if normalized_status in {"canceled", "incomplete_expired", "unpaid"}:
+        return "basic"
+
+    if cancel_at_period_end and normalized_status in {"canceled"}:
+        return "basic"
+
+    lookup = PLAN_LOOKUP_TO_INTERNAL_PLAN.get(_normalize_plan_hint(plan_lookup_key))
+    if lookup:
+        return lookup
+
+    combined = f"{_normalize_plan_hint(plan_lookup_key)} {_normalize_plan_hint(plan_code)}"
+    if "team" in combined:
+        return "team"
+    if "pro" in combined:
+        return "pro"
+    return "basic"
+
+
+def sync_billing_subscription_event(payload: dict[str, Any]) -> dict[str, Any]:
+    provider = (payload.get("provider") or "stripe").strip().lower()
+    subscription_id = (payload.get("provider_subscription_id") or "").strip()
+    customer_id = (payload.get("provider_customer_id") or "").strip() or None
+    status = (payload.get("status") or "incomplete").strip().lower()
+    plan_code = payload.get("plan_code")
+    plan_lookup_key = payload.get("plan_lookup_key")
+    cancel_at_period_end = bool(payload.get("cancel_at_period_end", False))
+    current_period_end = payload.get("current_period_end")
+    source = (payload.get("source") or "billing_subscriptions").strip()
+
+    if not subscription_id:
+        raise ValueError("provider_subscription_id is required")
+
+    conn = db()
+    try:
+        conn.execute("begin")
+        existing = conn.execute(
+            """
+            select workspace_id, billing_customer_id
+            from billing_subscriptions
+            where provider = ? and provider_subscription_id = ?
+            """,
+            (provider, subscription_id),
+        ).fetchone()
+        customer = None
+        if customer_id:
+            customer = conn.execute(
+                """
+                select id, workspace_id
+                from billing_customers
+                where provider = ? and provider_customer_id = ?
+                """,
+                (provider, customer_id),
+            ).fetchone()
+
+        workspace_id: int | None = existing["workspace_id"] if existing else None
+        billing_customer_id: int | None = existing["billing_customer_id"] if existing else None
+
+        if customer:
+            workspace_id = customer["workspace_id"]
+            billing_customer_id = customer["id"]
+
+        if workspace_id is None:
+            raise ValueError("Unable to resolve workspace for subscription event")
+
+        now = utc_now()
+        conn.execute(
+            """
+            insert into billing_subscriptions(
+                workspace_id,
+                provider,
+                provider_subscription_id,
+                billing_customer_id,
+                status,
+                current_period_end,
+                cancel_at_period_end,
+                plan_code,
+                plan_interval,
+                plan_lookup_key,
+                created_at,
+                updated_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, null, ?, ?, ?)
+            on conflict(provider_subscription_id) do update set
+                workspace_id = excluded.workspace_id,
+                billing_customer_id = excluded.billing_customer_id,
+                status = excluded.status,
+                current_period_end = excluded.current_period_end,
+                cancel_at_period_end = excluded.cancel_at_period_end,
+                plan_code = excluded.plan_code,
+                plan_lookup_key = excluded.plan_lookup_key,
+                updated_at = excluded.updated_at
+            """,
+            (
+                workspace_id,
+                provider,
+                subscription_id,
+                billing_customer_id,
+                status,
+                current_period_end,
+                int(cancel_at_period_end),
+                plan_code,
+                plan_lookup_key,
+                now,
+                now,
+            ),
+        )
+
+        internal_plan = map_subscription_to_internal_plan(
+            status=status,
+            plan_code=plan_code,
+            plan_lookup_key=plan_lookup_key,
+            cancel_at_period_end=cancel_at_period_end,
+        )
+        conn.execute(
+            """
+            update workspaces
+            set plan = ?, subscription_status = ?, subscription_source = ?, subscription_updated_at = ?
+            where id = ?
+            """,
+            (internal_plan, status, source, now, workspace_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"workspace_id": workspace_id, "plan": internal_plan, "status": status}
 
 
 def extract_price_cents(text: str) -> int | None:
@@ -1116,6 +1423,60 @@ def api_meta_check_update():
     return jsonify(payload)
 
 
+@app.post("/api/billing/stripe/webhook")
+def api_billing_stripe_webhook():
+    payload = request.get_data(cache=False, as_text=False)
+    signature_header = request.headers.get("Stripe-Signature")
+    try:
+        verify_stripe_webhook_signature(payload, signature_header)
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+
+    try:
+        event = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return jsonify({"error": "Invalid JSON payload"}), 400
+
+    event_id = event.get("id")
+    event_type = event.get("type", "")
+    if not event_id:
+        return jsonify({"error": "Missing Stripe event id"}), 400
+
+    subscription = ((event.get("data") or {}).get("object") or {})
+    workspace_id = None
+    if isinstance(subscription, dict):
+        workspace_id = _workspace_id_from_subscription_object(subscription)
+
+    supported_types = {
+        "customer.subscription.created",
+        "customer.subscription.updated",
+        "customer.subscription.deleted",
+    }
+    conn = db()
+    try:
+        conn.execute("begin")
+        insert_result = conn.execute(
+            """
+            insert or ignore into billing_webhook_events(event_id, processed_at, event_type, workspace_id)
+            values (?, ?, ?, ?)
+            """,
+            (event_id, utc_now(), event_type, workspace_id),
+        )
+        if insert_result.rowcount == 0:
+            conn.rollback()
+            conn.close()
+            return jsonify({"ok": True, "noop": True}), 200
+        if event_type in supported_types:
+            sync_billing_subscription_event(conn, event)
+        conn.commit()
+    except sqlite3.DatabaseError as exc:
+        conn.rollback()
+        conn.close()
+        return jsonify({"error": f"Database error: {exc}"}), 400
+    conn.close()
+    return jsonify({"ok": True, "noop": False}), 200
+
+
 @app.get("/api/workspace")
 @require_auth
 def api_workspace():
@@ -1136,6 +1497,32 @@ def api_update_plan():
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "plan": plan})
+
+
+@app.post("/api/billing/subscription-events")
+@require_auth
+def api_sync_billing_subscription_event():
+    owner_error = ensure_workspace_owner()
+    if owner_error:
+        return owner_error
+    body = request.json or {}
+    subscription = body.get("subscription") if isinstance(body.get("subscription"), dict) else {}
+    payload = {
+        "provider": body.get("provider", "stripe"),
+        "provider_subscription_id": body.get("provider_subscription_id") or subscription.get("id"),
+        "provider_customer_id": body.get("provider_customer_id") or subscription.get("customer_id"),
+        "status": body.get("status") or subscription.get("status"),
+        "plan_code": body.get("plan_code") or subscription.get("plan_code"),
+        "plan_lookup_key": body.get("plan_lookup_key") or subscription.get("plan_lookup_key"),
+        "cancel_at_period_end": body.get("cancel_at_period_end", subscription.get("cancel_at_period_end")),
+        "current_period_end": body.get("current_period_end") or subscription.get("current_period_end"),
+        "source": body.get("source") or "billing_subscriptions",
+    }
+    try:
+        result = sync_billing_subscription_event(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
 
 
 @app.get("/api/monitors")
@@ -1338,11 +1725,6 @@ def api_create_monitor():
             raise ValueError(f"Unsupported retailer '{retailer}'")
         if not (url.startswith("http://") or url.startswith("https://")):
             raise ValueError("product_url must be http(s)")
-
-        if retailer not in SUPPORTED_RETAILERS:
-            raise ValueError(f"Unsupported retailer: {retailer}")
-        if not (url.startswith("http://") or url.startswith("https://")):
-            raise ValueError("product_url must start with http:// or https://")
 
         enforce_plan_limits(current_workspace_id(), poll_interval)
     except (KeyError, ValueError) as exc:

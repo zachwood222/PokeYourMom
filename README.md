@@ -24,6 +24,27 @@ python app.py
 
 Then open `http://localhost:5000`.
 
+## CI checks locally
+
+Run the same commands used in CI:
+
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+pip install pytest ruff
+ruff check tests
+python -m compileall -q app.py tests
+pytest -q tests
+pytest -q tests/test_billing_schema.py::test_init_db_creates_billing_tables_and_columns
+pytest -q tests/test_app.py::test_init_db_migrates_existing_monitors_table_with_msrp_column
+```
+
+The last two commands are explicit migration-safety checks for:
+
+- fresh database creation via `init_db()`,
+- legacy `monitors` schema upgrade behavior (including `msrp_cents` migration).
+
+
 ## API quick start
 
 - API authentication is required for all `/api/*` routes.
@@ -34,6 +55,7 @@ Then open `http://localhost:5000`.
 - `POST /api/monitors` to add product monitor.
 - `POST /api/start` to begin background checks.
 - `POST /api/monitors/:id/check` to run an immediate check.
+- `GET /api/workspace/usage-limits` to retrieve plan limits + current usage snapshot.
 
 Example:
 
@@ -41,15 +63,37 @@ Example:
 curl -H "Authorization: Bearer dev-token" http://localhost:5000/api/workspace
 ```
 
-## Configuration
+Usage limits snapshot example:
 
-- `APP_VERSION` (default: `0.1.0`): current running app version used by `/api/meta` and `/api/meta/check-update`.
-- `RELEASE_CHANNEL` (default: `stable`): metadata channel returned by meta endpoints.
-- `UPDATE_CHECK_URL` (default: empty): optional upstream URL used by `/api/meta/check-update` to resolve the latest available version.
-  - Supports JSON payloads with `latest_version`, `version`, or `tag_name`.
-  - Supports plain text payloads containing just the version string.
-  - If unset or if the upstream request fails/parsing fails, the endpoint returns a non-fatal fallback payload and includes `source_error`.
-- `UPDATE_CHECK_TIMEOUT_SECONDS` (default: `3.0`): timeout (seconds) for the update check request.
+```bash
+curl -H "Authorization: Bearer dev-token" http://localhost:5000/api/workspace/usage-limits
+```
+
+```json
+{
+  "plan": "basic",
+  "usage": {
+    "monitor_count": 3,
+    "min_poll_interval_seconds": 20
+  },
+  "limits": {
+    "max_monitors": 20,
+    "min_poll_seconds": 20
+  },
+  "derived": {
+    "monitor_slots_remaining": 17,
+    "monitor_limit_reached": false,
+    "poll_minimum_satisfied": true
+  }
+}
+```
+
+Schema notes:
+- `plan`: active workspace plan (`basic`, `pro`, `team`).
+- `usage.monitor_count`: current number of monitors in the workspace.
+- `usage.min_poll_interval_seconds`: smallest configured poll interval among workspace monitors (`null` when no monitors exist).
+- `limits.max_monitors` / `limits.min_poll_seconds`: enforced values from `PLAN_LIMITS`.
+- `derived.*`: convenience fields based on usage + limits.
 
 ## Notes
 
