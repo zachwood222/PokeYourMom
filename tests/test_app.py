@@ -8,6 +8,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+FIXTURES = Path(__file__).parent / "fixtures"
+
 
 def _load_app(tmp_path, monkeypatch):
     db_path = tmp_path / "test.db"
@@ -386,9 +388,13 @@ def test_parser_dispatch_uses_walmart_and_fallback(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
 
     walmart_parser = app_module.get_parser_for_retailer("walmart")
-    fallback_parser = app_module.get_parser_for_retailer("target")
+    target_parser = app_module.get_parser_for_retailer("target")
+    bestbuy_parser = app_module.get_parser_for_retailer("bestbuy")
+    fallback_parser = app_module.get_parser_for_retailer("unknown-retailer")
 
     assert walmart_parser.name == "walmart"
+    assert target_parser.name == "target"
+    assert bestbuy_parser.name == "bestbuy"
     assert fallback_parser.name == "default"
 
 
@@ -420,3 +426,49 @@ def test_walmart_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch
     assert in_stock.price_cents == 2488
     assert out_stock.in_stock is False
     assert out_stock.price_cents == 2488
+
+
+def test_target_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    in_stock_html = (FIXTURES / "target" / "in_stock.html").read_text()
+    out_stock_html = (FIXTURES / "target" / "out_of_stock.html").read_text()
+
+    in_stock = app_module.evaluate_page(in_stock_html, retailer="target")
+    out_stock = app_module.evaluate_page(out_stock_html, retailer="target")
+
+    assert in_stock.in_stock is True
+    assert in_stock.price_cents == 1999
+    assert out_stock.in_stock is False
+    assert out_stock.price_cents == 1999
+
+
+def test_bestbuy_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    in_stock_html = (FIXTURES / "bestbuy" / "in_stock.html").read_text()
+    out_stock_html = (FIXTURES / "bestbuy" / "out_of_stock.html").read_text()
+
+    in_stock = app_module.evaluate_page(in_stock_html, retailer="bestbuy")
+    out_stock = app_module.evaluate_page(out_stock_html, retailer="bestbuy")
+
+    assert in_stock.in_stock is True
+    assert in_stock.price_cents == 5499
+    assert out_stock.in_stock is False
+    assert out_stock.price_cents == 5499
+
+
+def test_target_and_bestbuy_parsers_keep_default_fallback_for_unknown_markup(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    target_unknown_html = (FIXTURES / "target" / "unknown_markup.html").read_text()
+    bestbuy_unknown_html = (FIXTURES / "bestbuy" / "unknown_markup.html").read_text()
+
+    target_result = app_module.evaluate_page(target_unknown_html, retailer="target")
+    target_default = app_module.default_parser(target_unknown_html)
+    bestbuy_result = app_module.evaluate_page(bestbuy_unknown_html, retailer="bestbuy")
+    bestbuy_default = app_module.default_parser(bestbuy_unknown_html)
+
+    assert target_result.in_stock == target_default.in_stock
+    assert target_result.status_text == target_default.status_text
+    assert target_result.price_cents == target_default.price_cents
+    assert bestbuy_result.in_stock == bestbuy_default.in_stock
+    assert bestbuy_result.status_text == bestbuy_default.status_text
+    assert bestbuy_result.price_cents == bestbuy_default.price_cents

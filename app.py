@@ -546,8 +546,75 @@ def walmart_parser(html: str, keyword: str | None = None) -> MonitorResult:
     return result
 
 
+def target_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
+    result = default_parser(html, keyword=keyword)
+
+    in_markers = [
+        '"availability":"instock"',
+        '"availability":"in_stock"',
+        "add to cart",
+        "ship it",
+        "pick up",
+    ]
+    out_markers = [
+        '"availability":"outofstock"',
+        '"availability":"out_of_stock"',
+        "out of stock",
+        "sold out",
+        "unavailable",
+    ]
+    has_in = any(marker in text for marker in in_markers)
+    has_out = any(marker in text for marker in out_markers)
+
+    if has_out:
+        result.in_stock = False
+        result.status_text = "out_or_unknown"
+    elif has_in:
+        result.in_stock = True
+        result.status_text = "in_stock"
+
+    result.price_cents = extract_price_cents(html)
+    result.title = title
+    return result
+
+
+def bestbuy_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
+    result = default_parser(html, keyword=keyword)
+
+    in_markers = [
+        '"buttonstate":"add to cart"',
+        '"shipping":"available"',
+        "add to cart",
+        "get it today",
+    ]
+    out_markers = [
+        '"buttonstate":"sold out"',
+        '"buttonstate":"coming soon"',
+        "sold out",
+        "coming soon",
+        "unavailable",
+    ]
+    has_in = any(marker in text for marker in in_markers)
+    has_out = any(marker in text for marker in out_markers)
+
+    if has_out:
+        result.in_stock = False
+        result.status_text = "out_or_unknown"
+    elif has_in:
+        result.in_stock = True
+        result.status_text = "in_stock"
+
+    result.price_cents = extract_price_cents(html)
+    result.title = title
+    return result
+
+
 PARSERS: dict[str, RetailerParser] = {
     "walmart": RetailerParser(name="walmart", parse=walmart_parser),
+    "target": RetailerParser(name="target", parse=target_parser),
+    "bestbuy": RetailerParser(name="bestbuy", parse=bestbuy_parser),
     "pokemoncenter": RetailerParser(name="pokemoncenter", parse=pokemoncenter_parser),
 }
 
