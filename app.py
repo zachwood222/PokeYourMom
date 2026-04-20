@@ -29,6 +29,12 @@ from retailers import (
 )
 
 from network.session_manager import RequestResult, SessionManager
+from discord_ingestion_worker import (
+    action_dedupe_key,
+    monitor_matches_alert,
+    normalize_discord_alert_event,
+    subscription_accepts_event,
+)
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
@@ -117,6 +123,9 @@ class Job:
     locked_by: str | None
     locked_at: str | None
     payload_json: str | None
+    last_error: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -711,6 +720,71 @@ def init_db() -> None:
             foreign key(retailer_account_id) references retailer_accounts(id),
             foreign key(payment_method_id) references payment_methods(id)
         );
+
+        create table if not exists alert_subscriptions (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            guild_id text not null,
+            channel_id text not null,
+            source text not null default 'discord',
+            source_name text,
+            retailer_filter text,
+            url_patterns text not null default '[]',
+            sku_patterns text not null default '[]',
+            keyword_patterns text not null default '[]',
+            enabled integer not null default 1,
+            last_ingested_at text,
+            created_at text not null,
+            updated_at text not null,
+            unique(workspace_id, guild_id, channel_id, source),
+            foreign key(workspace_id) references workspaces(id)
+        );
+
+        create table if not exists alert_events (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            subscription_id integer not null,
+            source_event_id text not null,
+            source text not null,
+            parse_status text not null,
+            event_time text not null,
+            retailer text,
+            product_url text,
+            sku text,
+            title text,
+            message text,
+            payload_json text not null,
+            normalized_json text not null,
+            parse_error text,
+            created_at text not null,
+            unique(subscription_id, source_event_id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(subscription_id) references alert_subscriptions(id)
+        );
+
+        create table if not exists alert_event_actions (
+            id integer primary key autoincrement,
+            event_id integer not null,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            action_type text not null,
+            status text not null,
+            dedupe_key text not null unique,
+            task_id integer,
+            job_id integer,
+            details text,
+            created_at text not null,
+            foreign key(event_id) references alert_events(id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id),
+            foreign key(task_id) references checkout_tasks(id),
+            foreign key(job_id) references jobs(id)
+        );
+
+        create index if not exists idx_alert_subscriptions_workspace_enabled
+            on alert_subscriptions(workspace_id, enabled);
+        create index if not exists idx_alert_events_workspace_created
+            on alert_events(workspace_id, created_at);
         """
     )
     existing = conn.execute("select id from workspaces limit 1").fetchone()
@@ -1695,6 +1769,197 @@ def record_task_log(
     )
 
 
+def _json_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            return [value.strip()]
+    return []
+
+
+def enqueue_alert_monitor_check_job(
+    conn: sqlite3.Connection,
+    *,
+    monitor_id: int,
+    reason: str,
+    source_event_id: str,
+    now_iso: str,
+) -> int:
+    payload = json.dumps({"step_attempts": {}, "reason": reason, "source_event_id": source_event_id})
+    cur = conn.execute(
+        """
+        insert into jobs(job_type, monitor_id, status, attempt_count, next_run_at, payload_json, created_at, updated_at)
+        values ('monitor_check', ?, 'queued', 0, ?, ?, ?, ?)
+        """,
+        (monitor_id, now_iso, payload, now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def create_checkout_task_for_alert(
+    conn: sqlite3.Connection,
+    *,
+    monitor: sqlite3.Row,
+    event_payload: dict[str, Any],
+    reason: str,
+) -> int:
+    task = create_checkout_task(
+        conn,
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+        task_name=f"Alert event checkout for monitor {monitor['id']}",
+        task_config={
+            "retailer": monitor["retailer"],
+            "product_url": monitor["product_url"],
+            "reason": reason,
+            "alert_event": event_payload,
+        },
+        initial_state="queued",
+    )
+    record_task_log(
+        conn,
+        task_id=task["id"],
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+        level="info",
+        event_type="discord_alert_match",
+        message=f"Discord alert matched monitor {monitor['id']}",
+        payload={"reason": reason, "source_event_id": event_payload.get("source_event_id")},
+    )
+    return int(task["id"])
+
+
+def process_discord_alert_job(queue: SQLiteJobQueue, job: Job, *, now_iso: str) -> None:
+    payload = json.loads(job.payload_json or "{}")
+    subscription_id = int(payload.get("subscription_id") or 0)
+    raw_event = payload.get("raw_event") if isinstance(payload.get("raw_event"), dict) else {}
+    source_name = str(payload.get("source_name") or "discord").strip() or "discord"
+    subscription = queue.conn.execute(
+        "select * from alert_subscriptions where id = ? and enabled = 1",
+        (subscription_id,),
+    ).fetchone()
+    if not subscription:
+        queue.fail_job(
+            job.id,
+            now_iso=now_iso,
+            status="failed",
+            next_run_at=now_iso,
+            payload_json=job.payload_json or "{}",
+            error_text=f"subscription_not_found:{subscription_id}",
+        )
+        return
+    workspace_id = int(subscription["workspace_id"])
+    try:
+        event = normalize_discord_alert_event(raw_event, fallback_source=source_name)
+        accepted = subscription_accepts_event(
+            event,
+            retailer_filter=subscription["retailer_filter"],
+            url_patterns=_json_list(subscription["url_patterns"]),
+            sku_patterns=_json_list(subscription["sku_patterns"]),
+            keyword_patterns=_json_list(subscription["keyword_patterns"]),
+        )
+        parse_status = "accepted" if accepted else "filtered"
+        parse_error = None
+    except Exception as exc:  # noqa: BLE001
+        parse_status = "parse_failed"
+        parse_error = str(exc)[:500]
+        event = normalize_discord_alert_event({}, fallback_source=source_name)
+        accepted = False
+
+    event_cur = queue.conn.execute(
+        """
+        insert into alert_events(
+            workspace_id, subscription_id, source_event_id, source, parse_status, event_time,
+            retailer, product_url, sku, title, message, payload_json, normalized_json, parse_error, created_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(subscription_id, source_event_id) do update set
+            parse_status = excluded.parse_status,
+            parse_error = excluded.parse_error
+        """,
+        (
+            workspace_id,
+            subscription_id,
+            event.source_event_id,
+            event.source,
+            parse_status,
+            event.event_time,
+            event.retailer,
+            event.product_url,
+            event.sku,
+            event.title,
+            event.message,
+            json.dumps(raw_event),
+            json.dumps(
+                {
+                    "retailer": event.retailer,
+                    "product_url": event.product_url,
+                    "sku": event.sku,
+                    "title": event.title,
+                    "message": event.message,
+                }
+            ),
+            parse_error,
+            now_iso,
+        ),
+    )
+    event_id = int(event_cur.lastrowid) if event_cur.lastrowid else int(
+        queue.conn.execute(
+            "select id from alert_events where subscription_id = ? and source_event_id = ?",
+            (subscription_id, event.source_event_id),
+        ).fetchone()["id"]
+    )
+    queue.conn.execute(
+        "update alert_subscriptions set last_ingested_at = ?, updated_at = ? where id = ?",
+        (now_iso, now_iso, subscription_id),
+    )
+    if not accepted:
+        queue.complete_job(job.id, now_iso=now_iso)
+        return
+
+    monitors = queue.conn.execute(
+        "select * from monitors where workspace_id = ? and enabled = 1",
+        (workspace_id,),
+    ).fetchall()
+    matched = [monitor for monitor in monitors if monitor_matches_alert(dict(monitor), event)]
+    for monitor in matched:
+        monitor_id = int(monitor["id"])
+        task_key = action_dedupe_key(
+            workspace_id=workspace_id, monitor_id=monitor_id, event_id=event_id, action_type="checkout"
+        )
+        existing_action = queue.conn.execute(
+            "select id from alert_event_actions where dedupe_key = ?",
+            (task_key,),
+        ).fetchone()
+        if existing_action:
+            continue
+        task_id = create_checkout_task_for_alert(
+            queue.conn,
+            monitor=monitor,
+            event_payload={"source_event_id": event.source_event_id, "title": event.title},
+            reason="discord_ingestion_match",
+        )
+        job_id = enqueue_alert_monitor_check_job(
+            queue.conn,
+            monitor_id=monitor_id,
+            reason="discord_ingestion_match",
+            source_event_id=event.source_event_id,
+            now_iso=now_iso,
+        )
+        queue.conn.execute(
+            """
+            insert into alert_event_actions(
+                event_id, workspace_id, monitor_id, action_type, status, dedupe_key, task_id, job_id, details, created_at
+            ) values (?, ?, ?, 'checkout_and_monitor', 'enqueued', ?, ?, ?, ?, ?)
+            """,
+            (event_id, workspace_id, monitor_id, task_key, task_id, job_id, json.dumps({"title": event.title}), now_iso),
+        )
+    queue.complete_job(job.id, now_iso=now_iso)
+
 def create_checkout_task(
     conn: sqlite3.Connection,
     *,
@@ -2382,7 +2647,19 @@ def worker_loop() -> None:
                 queue.enqueue_monitor_check_if_due(monitor, now_iso=now_iso)
             job = queue.claim_due_job(now_iso=now_iso)
             if job:
-                execute_monitor_job(queue, job, now_iso=now_iso)
+                if job.job_type == "monitor_check":
+                    execute_monitor_job(queue, job, now_iso=now_iso)
+                elif job.job_type == "discord_ingest_event":
+                    process_discord_alert_job(queue, job, now_iso=now_iso)
+                else:
+                    queue.fail_job(
+                        job.id,
+                        now_iso=now_iso,
+                        status="failed",
+                        next_run_at=now_iso,
+                        payload_json=job.payload_json or "{}",
+                        error_text=f"unsupported_job_type:{job.job_type}",
+                    )
             conn.commit()
             conn.close()
         if not job:
@@ -3343,6 +3620,116 @@ def api_events():
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@app.get("/api/alert-subscriptions")
+@require_auth
+def api_list_alert_subscriptions():
+    conn = db()
+    rows = conn.execute(
+        "select * from alert_subscriptions where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(row) for row in rows])
+
+
+@app.post("/api/alert-subscriptions")
+@require_auth
+def api_create_alert_subscription():
+    body = request.get_json(force=True) or {}
+    guild_id = str(body.get("guild_id") or "").strip()
+    channel_id = str(body.get("channel_id") or "").strip()
+    source = str(body.get("source") or "discord").strip().lower() or "discord"
+    if not guild_id or not channel_id:
+        return jsonify({"error": "guild_id and channel_id are required"}), 400
+    now_iso = utc_now()
+    conn = db()
+    cur = conn.execute(
+        """
+        insert into alert_subscriptions(
+            workspace_id, guild_id, channel_id, source, source_name, retailer_filter,
+            url_patterns, sku_patterns, keyword_patterns, enabled, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            current_workspace_id(),
+            guild_id,
+            channel_id,
+            source,
+            body.get("source_name"),
+            body.get("retailer_filter"),
+            json.dumps(_json_list(body.get("url_patterns"))),
+            json.dumps(_json_list(body.get("sku_patterns"))),
+            json.dumps(_json_list(body.get("keyword_patterns"))),
+            int(bool(body.get("enabled", True))),
+            now_iso,
+            now_iso,
+        ),
+    )
+    row = conn.execute("select * from alert_subscriptions where id = ?", (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(dict(row)), 201
+
+
+@app.post("/api/alerts/discord/ingest")
+@require_auth
+def api_ingest_discord_alert():
+    body = request.get_json(force=True) or {}
+    subscription_id = int(body.get("subscription_id") or 0)
+    raw_event = body.get("event") if isinstance(body.get("event"), dict) else {}
+    if not subscription_id or not raw_event:
+        return jsonify({"error": "subscription_id and event object are required"}), 400
+    conn = db()
+    subscription = conn.execute(
+        "select * from alert_subscriptions where id = ? and workspace_id = ?",
+        (subscription_id, current_workspace_id()),
+    ).fetchone()
+    if not subscription:
+        conn.close()
+        return jsonify({"error": "subscription not found"}), 404
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into jobs(job_type, monitor_id, status, attempt_count, next_run_at, payload_json, created_at, updated_at)
+        values ('discord_ingest_event', null, 'queued', 0, ?, ?, ?, ?)
+        """,
+        (
+            now_iso,
+            json.dumps(
+                {
+                    "subscription_id": subscription_id,
+                    "source_name": subscription["source_name"] or subscription["source"],
+                    "raw_event": raw_event,
+                }
+            ),
+            now_iso,
+            now_iso,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "job_id": cur.lastrowid}), 202
+
+
+@app.get("/api/alerts/events")
+@require_auth
+def api_list_alert_events():
+    conn = db()
+    rows = conn.execute(
+        """
+        select ae.*, s.guild_id, s.channel_id, s.source_name
+        from alert_events ae
+        join alert_subscriptions s on s.id = ae.subscription_id
+        where ae.workspace_id = ?
+        order by ae.id desc
+        limit 200
+        """,
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(row) for row in rows])
 
 
 @app.post("/api/webhooks")

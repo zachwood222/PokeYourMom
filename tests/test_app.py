@@ -171,10 +171,10 @@ def test_captcha_invalid_or_missing_token_rejects_protected_post(tmp_path, monke
         headers=_auth_headers(),
     )
 
-    assert missing_token.status_code == 400
+    assert missing_token.status_code == 403
     assert missing_token.get_json()["reason"] == "missing_token"
-    assert invalid_token.status_code == 400
-    assert invalid_token.get_json()["reason"] == "invalid_token"
+    assert invalid_token.status_code == 403
+    assert invalid_token.get_json()["reason"] == "provider_rejected"
 
 
 def test_captcha_provider_errors_fail_safely(tmp_path, monkeypatch):
@@ -1352,3 +1352,114 @@ def test_checkout_task_lifecycle_routes(tmp_path, monkeypatch):
     payload = state_resp.get_json()
     assert payload["current_state"] == "stopped"
     assert payload["last_error"] is None
+
+
+def test_discord_ingestion_matches_monitor_and_enqueues_actions(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    monitor_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://www.target.com/p/charizard",
+            "keyword": "charizard",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    assert monitor_resp.status_code == 201
+
+    sub_resp = client.post(
+        "/api/alert-subscriptions",
+        json={
+            "guild_id": "g-1",
+            "channel_id": "c-1",
+            "source_name": "cook-group",
+            "retailer_filter": "target",
+            "keyword_patterns": ["charizard"],
+        },
+        headers=_auth_headers(),
+    )
+    assert sub_resp.status_code == 201
+    subscription_id = sub_resp.get_json()["id"]
+
+    ingest_resp = client.post(
+        "/api/alerts/discord/ingest",
+        json={
+            "subscription_id": subscription_id,
+            "event": {
+                "id": "evt-1",
+                "retailer": "target",
+                "product_url": "https://www.target.com/p/charizard-elite-trainer-box",
+                "title": "Charizard ETB",
+                "message": "restock live",
+            },
+        },
+        headers=_auth_headers(),
+    )
+    assert ingest_resp.status_code == 202
+
+    conn = app_module.db()
+    job = conn.execute("select * from jobs where job_type = 'discord_ingest_event' order by id desc limit 1").fetchone()
+    queue = app_module.SQLiteJobQueue(conn, worker_id="test-worker")
+    app_module.process_discord_alert_job(queue, app_module.Job(**dict(job)), now_iso=app_module.utc_now())
+    conn.commit()
+
+    event = conn.execute("select * from alert_events where source_event_id = 'evt-1'").fetchone()
+    assert event is not None
+    assert event["parse_status"] == "accepted"
+
+    action = conn.execute("select * from alert_event_actions where event_id = ?", (event["id"],)).fetchone()
+    assert action is not None
+    assert action["status"] == "enqueued"
+
+    task_log = conn.execute("select * from task_logs where event_type = 'discord_alert_match' order by id desc limit 1").fetchone()
+    assert task_log is not None
+    conn.close()
+
+
+def test_discord_ingestion_filtered_event_persists_parse_status(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    sub_resp = client.post(
+        "/api/alert-subscriptions",
+        json={
+            "guild_id": "g-2",
+            "channel_id": "c-2",
+            "retailer_filter": "walmart",
+            "keyword_patterns": ["pikachu"],
+        },
+        headers=_auth_headers(),
+    )
+    assert sub_resp.status_code == 201
+    subscription_id = sub_resp.get_json()["id"]
+
+    ingest_resp = client.post(
+        "/api/alerts/discord/ingest",
+        json={
+            "subscription_id": subscription_id,
+            "event": {
+                "id": "evt-filtered",
+                "retailer": "target",
+                "title": "No match",
+                "message": "not relevant",
+            },
+        },
+        headers=_auth_headers(),
+    )
+    assert ingest_resp.status_code == 202
+
+    conn = app_module.db()
+    job = conn.execute("select * from jobs where job_type = 'discord_ingest_event' order by id desc limit 1").fetchone()
+    queue = app_module.SQLiteJobQueue(conn, worker_id="test-worker")
+    app_module.process_discord_alert_job(queue, app_module.Job(**dict(job)), now_iso=app_module.utc_now())
+    conn.commit()
+
+    event = conn.execute("select * from alert_events where source_event_id = 'evt-filtered'").fetchone()
+    assert event is not None
+    assert event["parse_status"] == "filtered"
+    actions = conn.execute("select count(*) as c from alert_event_actions where event_id = ?", (event["id"],)).fetchone()["c"]
+    assert actions == 0
+    conn.close()
