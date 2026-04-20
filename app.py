@@ -9,15 +9,21 @@ import threading
 import time
 import hashlib
 import hmac
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Any, Callable
+from typing import Any
 from uuid import uuid4
 
 import requests
 from flask import Flask, g, has_request_context, jsonify, render_template, request
 from flask_socketio import SocketIO
+from retailers import (
+    MonitorResult,
+    canonical_retailer,
+    default_parser,
+    resolve_retailer_adapter,
+    run_retailer_flow,
+)
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
@@ -44,13 +50,6 @@ PLAN_LOOKUP_TO_INTERNAL_PLAN = {
     "team": "team",
 }
 SUPPORTED_RETAILERS = {"walmart", "target", "bestbuy", "pokemoncenter"}
-RETAILER_ALIASES = {
-    "pokemon-center": "pokemoncenter",
-    "pokemon_center": "pokemoncenter",
-    "pokemon center": "pokemoncenter",
-    "pokemoncenter": "pokemoncenter",
-}
-
 DEFAULT_WORKSPACE = {
     "name": "My Workspace",
     "plan": DEFAULT_PLAN if DEFAULT_PLAN in PLAN_LIMITS else "basic",
@@ -82,24 +81,6 @@ CHECKOUT_TASK_STATES = {
     "stopped",
 }
 
-
-@dataclass
-class MonitorResult:
-    in_stock: bool
-    price_cents: int | None
-    title: str
-    status_text: str
-    availability_reason: str | None = None
-    parser_confidence: float | None = None
-    keyword_matched: bool | None = None
-    price_within_limit: bool | None = None
-    within_msrp_delta: bool | None = None
-
-
-@dataclass(frozen=True)
-class RetailerParser:
-    name: str
-    parse: Callable[[str, str | None], MonitorResult]
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -1142,8 +1123,8 @@ def get_parser_for_retailer(retailer: str | None) -> RetailerParser:
 def evaluate_page(
     html: str, keyword: str | None = None, retailer: str | None = None
 ) -> MonitorResult:
-    parser = get_parser_for_retailer(retailer)
-    return parser.parse(html, keyword)
+    adapter = get_adapter_for_retailer(retailer)
+    return run_retailer_flow(adapter, {"html": html, "keyword": keyword})
 
 
 def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
