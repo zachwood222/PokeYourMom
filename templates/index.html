@@ -687,17 +687,37 @@
     }
 
     async function createTask() {
-      const monitorId = Number(document.getElementById('task_monitor_id').value);
-      if (!monitorId) {
-        alert('Please choose a monitor first.');
+      const taskPayload = {
+        retailer: document.getElementById('task_retailer').value,
+        product_url: document.getElementById('task_url').value,
+        profile: document.getElementById('task_profile').value,
+        account: document.getElementById('task_account').value,
+        payment: document.getElementById('task_payment').value,
+      };
+
+      const monitorPayload = {
+        retailer: taskPayload.retailer,
+        product_url: taskPayload.product_url,
+        poll_interval_seconds: Number(document.getElementById('poll_interval').value),
+      };
+      const monitorRes = await apiFetch('/api/monitors', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(monitorPayload))
+      });
+      const monitor = await monitorRes.json();
+      if (monitor.error) {
+        alert(monitor.error);
         return;
       }
-      const payload = {
-        monitor_id: monitorId,
-        task_name: document.getElementById('task_name').value || null,
-      };
+
       const res = await apiFetch('/api/checkout/tasks', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          monitor_id: monitor.id,
+          task_name: `${taskPayload.retailer} task`,
+          task_config: taskPayload,
+          initial_state: 'queued',
+        })
       });
       const data = await res.json();
       if (data.error) {
@@ -766,15 +786,7 @@
       const logs = document.getElementById('task_logs');
       logs.textContent = '';
       for (const attempt of attempts.slice().reverse()) {
-        let details = '{}';
-        if (attempt.details) {
-          try {
-            details = JSON.stringify(JSON.parse(attempt.details));
-          } catch (_) {
-            details = String(attempt.details);
-          }
-        }
-        logs.textContent += `[${attempt.created_at}] status=${attempt.status} state=${attempt.state} err=${attempt.error_text || '-'} details=${details}\n`;
+        logs.textContent += `[${attempt.created_at}] state=${attempt.state} step=${attempt.step || '-'} err=${attempt.error || '-'}\n`;
       }
       logs.scrollTop = logs.scrollHeight;
     }
