@@ -1400,17 +1400,8 @@ def bestbuy_parser(html: str, keyword: str | None = None) -> MonitorResult:
     return result
 
 
-PARSERS: dict[str, RetailerParser] = {
-    "walmart": RetailerParser(name="walmart", parse=walmart_parser),
-    "target": RetailerParser(name="target", parse=target_parser),
-    "bestbuy": RetailerParser(name="bestbuy", parse=bestbuy_parser),
-    "pokemoncenter": RetailerParser(name="pokemoncenter", parse=pokemoncenter_parser),
-}
-
-
-def get_parser_for_retailer(retailer: str | None) -> RetailerParser:
-    normalized = canonical_retailer(retailer) if retailer else ""
-    return PARSERS.get(normalized, RetailerParser(name="default", parse=default_parser))
+def get_adapter_for_retailer(retailer: str | None):
+    return resolve_retailer_adapter(retailer)
 
 
 def evaluate_page(
