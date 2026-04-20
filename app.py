@@ -584,11 +584,15 @@ def init_db() -> None:
             task_id integer not null,
             workspace_id integer not null,
             monitor_id integer not null,
+            attempt_number integer,
             state text not null,
+            step text,
+            error text,
             status text not null,
             details text,
             error_text text,
             created_at text not null,
+            updated_at text,
             foreign key(task_id) references checkout_tasks(id),
             foreign key(workspace_id) references workspaces(id),
             foreign key(monitor_id) references monitors(id)
@@ -772,6 +776,10 @@ def init_db() -> None:
     ensure_column(conn, "jobs", "monitor_id", "integer")
     ensure_column(conn, "jobs", "payload_json", "text")
     ensure_column(conn, "jobs", "last_error", "text")
+    ensure_column(conn, "checkout_attempts", "attempt_number", "integer")
+    ensure_column(conn, "checkout_attempts", "step", "text")
+    ensure_column(conn, "checkout_attempts", "error", "text")
+    ensure_column(conn, "checkout_attempts", "updated_at", "text")
     conn.commit()
     conn.close()
 
@@ -1648,20 +1656,47 @@ def record_checkout_attempt(
     details: dict[str, Any] | None = None,
     error_text: str | None = None,
 ) -> None:
+    now_iso = utc_now()
+    next_attempt_number = conn.execute(
+        """
+        select coalesce(max(attempt_number), 0) + 1 as next_attempt_number
+        from checkout_attempts
+        where task_id = ? and workspace_id = ?
+        """,
+        (task_id, workspace_id),
+    ).fetchone()["next_attempt_number"]
+    truncated_error = (error_text or "")[:500] if error_text else None
     conn.execute(
         """
-        insert into checkout_attempts(task_id, workspace_id, monitor_id, state, status, details, error_text, created_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?)
+        insert into checkout_attempts(
+            task_id,
+            workspace_id,
+            monitor_id,
+            attempt_number,
+            state,
+            step,
+            error,
+            status,
+            details,
+            error_text,
+            created_at,
+            updated_at
+        )
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id,
             workspace_id,
             monitor_id,
+            next_attempt_number,
             state,
             status,
+            truncated_error,
+            status,
             json.dumps(details or {}),
-            (error_text or "")[:500] if error_text else None,
-            utc_now(),
+            truncated_error,
+            now_iso,
+            now_iso,
         ),
     )
 
@@ -2923,9 +2958,23 @@ def api_task_attempts(task_id: int):
         return jsonify({"error": "Task not found"}), 404
     attempts = conn.execute(
         """
-        select * from checkout_attempts
+        select
+            id,
+            task_id,
+            workspace_id,
+            monitor_id,
+            coalesce(attempt_number, id) as attempt_number,
+            state,
+            coalesce(step, status) as step,
+            coalesce(error, error_text) as error,
+            details,
+            status,
+            error_text,
+            created_at,
+            updated_at
+        from checkout_attempts
         where workspace_id = ? and task_id = ?
-          and status != 'created'
+          and coalesce(step, status) != 'created'
         order by id desc
         """,
         (workspace_id, task_id),
