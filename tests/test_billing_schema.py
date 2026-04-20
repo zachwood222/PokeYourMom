@@ -39,7 +39,7 @@ def test_init_db_creates_billing_tables_and_columns(tmp_path, monkeypatch):
     }
     conn.close()
 
-    assert tables == {"billing_customers", "billing_subscriptions"}
+    assert tables == {"billing_customers", "billing_subscriptions", "billing_webhook_events"}
     assert {
         "workspace_id",
         "user_id",
