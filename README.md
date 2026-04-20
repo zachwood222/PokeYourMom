@@ -34,12 +34,45 @@ Then open `http://localhost:5000`.
 - `POST /api/monitors` to add product monitor.
 - `POST /api/start` to begin background checks.
 - `POST /api/monitors/:id/check` to run an immediate check.
+- `GET /api/workspace/usage-limits` to retrieve plan limits + current usage snapshot.
 
 Example:
 
 ```bash
 curl -H "Authorization: Bearer dev-token" http://localhost:5000/api/workspace
 ```
+
+Usage limits snapshot example:
+
+```bash
+curl -H "Authorization: Bearer dev-token" http://localhost:5000/api/workspace/usage-limits
+```
+
+```json
+{
+  "plan": "basic",
+  "usage": {
+    "monitor_count": 3,
+    "min_poll_interval_seconds": 20
+  },
+  "limits": {
+    "max_monitors": 20,
+    "min_poll_seconds": 20
+  },
+  "derived": {
+    "monitor_slots_remaining": 17,
+    "monitor_limit_reached": false,
+    "poll_minimum_satisfied": true
+  }
+}
+```
+
+Schema notes:
+- `plan`: active workspace plan (`basic`, `pro`, `team`).
+- `usage.monitor_count`: current number of monitors in the workspace.
+- `usage.min_poll_interval_seconds`: smallest configured poll interval among workspace monitors (`null` when no monitors exist).
+- `limits.max_monitors` / `limits.min_poll_seconds`: enforced values from `PLAN_LIMITS`.
+- `derived.*`: convenience fields based on usage + limits.
 
 ## Notes
 

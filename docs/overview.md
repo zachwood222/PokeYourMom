@@ -42,6 +42,24 @@ Stock Sentinel is a Flask-based monitor and alert bot for retailer product avail
 4. Eligible checks are deduplicated and inserted into `events`.
 5. Event payloads are delivered to all enabled webhooks and logged in `deliveries`.
 
+## Workspace usage limits API
+
+Authenticated endpoint: `GET /api/workspace/usage-limits`
+
+Stable response shape:
+
+- `plan`: current workspace plan code.
+- `usage`
+  - `monitor_count`: total monitors in workspace.
+  - `min_poll_interval_seconds`: minimum configured monitor poll interval, or `null` for empty workspaces.
+- `limits`
+  - `max_monitors`: monitor cap for the current plan.
+  - `min_poll_seconds`: minimum allowed poll interval for the current plan.
+- `derived`
+  - `monitor_slots_remaining`: available monitor slots before hitting plan cap.
+  - `monitor_limit_reached`: whether monitor cap has been reached.
+  - `poll_minimum_satisfied`: whether current minimum poll interval respects the plan minimum.
+
 ## Where to start
 
 - Task setup: `docs/task-creation.md`
