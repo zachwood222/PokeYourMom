@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import traceback
 import hashlib
 import hmac
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from functools import wraps
 from typing import Any
 from uuid import uuid4
