@@ -21,6 +21,12 @@ from uuid import uuid4
 import requests
 from flask import Flask, g, has_request_context, jsonify, render_template, request
 from flask_socketio import SocketIO
+from captcha_middleware import CaptchaVerifier
+from checkout_captcha import (
+    CaptchaChallengeService,
+    ManualFallbackSolveProvider,
+    serialize_challenge,
+)
 from retailers import (
     MonitorResult,
     canonical_retailer,
@@ -60,14 +66,16 @@ CAPTCHA_PROVIDER = os.getenv("CAPTCHA_PROVIDER", "turnstile")
 CAPTCHA_SITE_KEY = os.getenv("CAPTCHA_SITE_KEY", "")
 CAPTCHA_SCRIPT_URL = os.getenv("CAPTCHA_SCRIPT_URL", "https://challenges.cloudflare.com/turnstile/v0/api.js")
 CAPTCHA_SECRET_KEY = os.getenv("CAPTCHA_SECRET_KEY", "")
+DEFAULT_CAPTCHA_VERIFY_URL = "https://www.google.com/recaptcha/api/siteverify"
 CAPTCHA_VERIFY_URL = os.getenv(
     "CAPTCHA_VERIFY_URL",
-    "https://www.google.com/recaptcha/api/siteverify",
+    DEFAULT_CAPTCHA_VERIFY_URL,
 )
 CAPTCHA_VERIFY_TIMEOUT_SECONDS = float(os.getenv("CAPTCHA_VERIFY_TIMEOUT_SECONDS", "2.0"))
 TASK_STEP_DELAY_SECONDS = float(os.getenv("TASK_STEP_DELAY_SECONDS", "0.5"))
 QUEUE_ENQUEUE_JITTER_SECONDS = float(os.getenv("QUEUE_ENQUEUE_JITTER_SECONDS", "1.25"))
 STRICT_API_AUTH_TOKEN = (os.getenv("STRICT_API_AUTH_TOKEN", "1") or "").strip().lower() not in {"0", "false", "no", "off"}
+CHECKOUT_CAPTCHA_SOLVE_PROVIDER = os.getenv("CHECKOUT_CAPTCHA_SOLVE_PROVIDER", "manual")
 
 PLAN_LIMITS = {
     "basic": {"max_monitors": 20, "min_poll_seconds": 20},
@@ -413,6 +421,16 @@ def log(
     )
     print(json.dumps(entry, sort_keys=True))
     socketio.emit("log", entry)
+
+
+captcha_verifier = CaptchaVerifier(
+    secret_key=CAPTCHA_SECRET_KEY,
+    verify_url=CAPTCHA_VERIFY_URL,
+    timeout_seconds=CAPTCHA_VERIFY_TIMEOUT_SECONDS,
+    logger=log,
+)
+checkout_captcha_service = CaptchaChallengeService(now_fn=utc_now)
+checkout_solve_provider = ManualFallbackSolveProvider()
 
 
 def db() -> sqlite3.Connection:
@@ -801,6 +819,29 @@ def init_db() -> None:
             foreign key(monitor_id) references monitors(id)
         );
 
+        create table if not exists captcha_challenges (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            task_id integer not null,
+            retailer_account_id integer,
+            provider text not null,
+            status text not null default 'pending',
+            provider_payload text,
+            manual_payload text,
+            solved_token text,
+            worker_handoff_token_hash text,
+            handoff_issued_at text,
+            handoff_expires_at text,
+            handoff_used_at text,
+            expires_at text,
+            created_at text not null,
+            updated_at text not null,
+            solved_at text,
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(task_id) references checkout_tasks(id),
+            foreign key(retailer_account_id) references retailer_accounts(id)
+        );
+
         create table if not exists task_logs (
             id integer primary key autoincrement,
             task_id integer not null,
@@ -1136,105 +1177,20 @@ def _set_auth_context(user: sqlite3.Row | dict[str, Any], workspace: sqlite3.Row
 
 
 def _extract_captcha_token() -> str | None:
-    header_token = (request.headers.get("X-Captcha-Token") or "").strip()
-    if header_token:
-        return header_token
-    body = request.get_json(silent=True)
-    if isinstance(body, dict):
-        for key in ("captcha_token", "cf-turnstile-response", "g-recaptcha-response"):
-            token = body.get(key)
-            if isinstance(token, str) and token.strip():
-                return token.strip()
-    for key in ("captcha_token", "cf-turnstile-response", "g-recaptcha-response"):
-        token = (request.form.get(key) or "").strip()
-        if token:
-            return token
-    return None
+    token = captcha_verifier.extract_token(request)
+    return token or None
 
 
 def verify_captcha_token(token: str) -> tuple[bool, str | None]:
-    if not CAPTCHA_SECRET_KEY or not CAPTCHA_VERIFY_URL:
-        return True, None
-    if not token:
-        return False, "missing_token"
-    payload = {"secret": CAPTCHA_SECRET_KEY, "response": token}
-    remote_ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()
-    if remote_ip:
-        payload["remoteip"] = remote_ip
-    try:
-        response = requests.post(CAPTCHA_VERIFY_URL, data=payload, timeout=CAPTCHA_TIMEOUT_SECONDS)
-    except Exception as exc:  # noqa: BLE001
-        log(f"CAPTCHA verification request failed: {exc}", level="warning")
-        return False, "provider_unreachable"
-    if response.status_code >= 500:
-        log(
-            f"CAPTCHA verification provider returned {response.status_code}",
-            level="warning",
-        )
-        return False, "provider_error"
-    if response.status_code >= 400:
-        return False, "provider_rejected"
-    try:
-        result = response.json()
-    except ValueError:
-        log("CAPTCHA verification provider returned non-JSON response", level="warning")
-        return False, "provider_invalid_response"
-    if not bool(result.get("success")):
-        return False, "invalid_token"
-    return True, None
+    return captcha_verifier.verify_token(token, request)
 
 
 def _is_captcha_protected_request() -> bool:
-    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
-        return False
-    if request.path == "/api/billing/stripe/webhook":
-        return False
-    return request.path.startswith("/api/")
+    return captcha_verifier.is_captcha_protected_request(request)
 
 
 def _captcha_token_from_request() -> str:
-    header_token = (request.headers.get("X-CAPTCHA-Token") or "").strip()
-    if header_token:
-        return header_token
-    payload = request.get_json(silent=True)
-    if isinstance(payload, dict):
-        for key in ("captcha_token", "captchaToken", "captcha-response", "captchaResponse"):
-            candidate = payload.get(key)
-            if isinstance(candidate, str) and candidate.strip():
-                return candidate.strip()
-    form_token = (request.form.get("captcha_token") or "").strip()
-    if form_token:
-        return form_token
-    return ""
-
-
-def verify_captcha_token(token: str) -> tuple[bool, str]:
-    if not CAPTCHA_SECRET_KEY:
-        return True, "skipped_not_configured"
-    if not token:
-        return False, "missing_token"
-    try:
-        response = requests.post(
-            CAPTCHA_VERIFY_URL,
-            data={
-                "secret": CAPTCHA_SECRET_KEY,
-                "response": token,
-                "remoteip": request.remote_addr,
-            },
-            timeout=CAPTCHA_VERIFY_TIMEOUT_SECONDS,
-        )
-    except requests.RequestException:
-        return False, "provider_request_failed"
-    if response.status_code != 200:
-        return False, "provider_http_error"
-    try:
-        payload = response.json()
-    except ValueError:
-        return False, "provider_invalid_json"
-    success = bool(payload.get("success"))
-    if success:
-        return True, "ok"
-    return False, "provider_rejected"
+    return captcha_verifier.extract_token(request)
 
 
 @app.before_request
@@ -1258,28 +1214,23 @@ def require_api_auth() -> tuple[dict[str, str], int] | None:
         else:
             return jsonify({"error": "Unauthorized"}), 401
 
-    if _is_captcha_protected_request():
-        captcha_token = _captcha_token_from_request()
-        is_valid, failure_reason = verify_captcha_token(captcha_token)
-        if not is_valid:
-            log(
-                "captcha_verification_failed",
-                level="warning",
-                workspace_id=getattr(g, "workspace_id", None),
-            )
-            return (
-                jsonify({"error": "CAPTCHA verification failed", "reason": failure_reason}),
-                403,
-            )
-    if request.method in {"POST", "PATCH", "PUT", "DELETE"}:
-        captcha_token = _extract_captcha_token()
-        captcha_ok, reason = verify_captcha_token(captcha_token or "")
-        if not captcha_ok:
-            log(
-                f"Blocked request due to failed CAPTCHA verification ({reason})",
-                level="warning",
-            )
-            return jsonify({"error": "CAPTCHA verification failed", "reason": reason}), 400
+    captcha_ok, reason = captcha_verifier.enforce_or_error(request)
+    if not captcha_ok:
+        header_token_present = bool((request.headers.get("X-CAPTCHA-Token") or "").strip())
+        reason_out = reason
+        if header_token_present:
+            if reason == "invalid_token":
+                reason_out = "provider_rejected"
+            elif reason == "provider_unreachable":
+                reason_out = "provider_request_failed"
+        log(
+            f"Blocked request due to failed CAPTCHA verification ({reason_out})",
+            level="warning",
+            workspace_id=getattr(g, "workspace_id", None),
+        )
+        strict_status = CAPTCHA_VERIFY_URL == DEFAULT_CAPTCHA_VERIFY_URL
+        status_code = 403 if (header_token_present or strict_status) else 400
+        return jsonify({"error": "CAPTCHA verification failed", "reason": reason_out}), status_code
     return None
 
 
@@ -4001,6 +3952,143 @@ def api_checkout_task_state(task_id: int):
             "last_attempt": dict(last_attempt) if last_attempt else None,
         }
     )
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/captcha-challenges")
+@require_auth
+def api_create_checkout_captcha_challenge(task_id: int):
+    conn = db()
+    workspace_id = current_workspace_id()
+    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+    if not task:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+
+    checkout_captcha_service.expire_stale_challenges(conn)
+    retailer_account_id = get_retailer_account_id_for_task(
+        conn,
+        workspace_id=workspace_id,
+        monitor_id=task["monitor_id"],
+    )
+    challenge = checkout_captcha_service.create_challenge(
+        conn,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        retailer_account_id=retailer_account_id,
+        provider_name=checkout_solve_provider.name,
+    )
+    attempt = checkout_solve_provider.attempt_solve(dict(challenge))
+    checkout_captcha_service.mark_attempt_result(conn, challenge_id=challenge["id"], attempt=attempt)
+    updated = conn.execute("select * from captcha_challenges where id = ?", (challenge["id"],)).fetchone()
+    conn.commit()
+    conn.close()
+    assert updated is not None
+    emit_captcha_challenge_update(updated)
+    return jsonify(serialize_challenge(updated)), 201
+
+
+@app.get("/api/checkout/tasks/<int:task_id>/captcha-challenges")
+@require_auth
+def api_list_checkout_captcha_challenges(task_id: int):
+    conn = db()
+    workspace_id = current_workspace_id()
+    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+    if not task:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    checkout_captcha_service.expire_stale_challenges(conn)
+    rows = conn.execute(
+        """
+        select * from captcha_challenges
+        where workspace_id = ? and task_id = ?
+        order by id desc
+        """,
+        (workspace_id, task_id),
+    ).fetchall()
+    conn.commit()
+    conn.close()
+    return jsonify([serialize_challenge(row) for row in rows])
+
+
+@app.post("/api/checkout/captcha-challenges/<int:challenge_id>/manual-solve")
+@require_auth
+def api_submit_manual_captcha_solution(challenge_id: int):
+    body = request.json or {}
+    solved_token = (body.get("solved_token") or "").strip()
+    if not solved_token:
+        return jsonify({"error": "solved_token is required"}), 400
+
+    conn = db()
+    row = conn.execute(
+        """
+        select cc.* from captcha_challenges cc
+        where cc.id = ? and cc.workspace_id = ?
+        """,
+        (challenge_id, current_workspace_id()),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "Captcha challenge not found"}), 404
+    checkout_captcha_service.mark_manual_solution(
+        conn,
+        challenge_id=challenge_id,
+        solved_token=solved_token,
+        operator_note=(body.get("operator_note") or "").strip() or None,
+    )
+    updated = conn.execute("select * from captcha_challenges where id = ?", (challenge_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    assert updated is not None
+    emit_captcha_challenge_update(updated)
+    return jsonify({"ok": True, "challenge": serialize_challenge(updated)})
+
+
+@app.post("/api/checkout/captcha-challenges/<int:challenge_id>/handoff-token")
+@require_auth
+def api_issue_captcha_handoff_token(challenge_id: int):
+    conn = db()
+    row = conn.execute(
+        """
+        select * from captcha_challenges
+        where id = ? and workspace_id = ?
+        """,
+        (challenge_id, current_workspace_id()),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "Captcha challenge not found"}), 404
+    try:
+        token = checkout_captcha_service.issue_worker_handoff_token(conn, challenge_id=challenge_id)
+    except ValueError as exc:
+        conn.close()
+        return jsonify({"error": str(exc)}), 400
+    updated = conn.execute("select * from captcha_challenges where id = ?", (challenge_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    if updated:
+        emit_captcha_challenge_update(updated)
+    return jsonify({"ok": True, "challenge_id": challenge_id, "handoff_token": token})
+
+
+@app.post("/api/internal/checkout/captcha-handoffs/consume")
+@require_auth
+def api_consume_captcha_handoff_token():
+    body = request.json or {}
+    token = (body.get("handoff_token") or "").strip()
+    if not token:
+        return jsonify({"error": "handoff_token is required"}), 400
+    conn = db()
+    try:
+        payload = checkout_captcha_service.consume_worker_handoff_token(conn, token=token)
+    except ValueError as exc:
+        conn.close()
+        return jsonify({"error": str(exc)}), 400
+    updated = conn.execute("select * from captcha_challenges where id = ?", (payload["challenge_id"],)).fetchone()
+    conn.commit()
+    conn.close()
+    if updated:
+        emit_captcha_challenge_update(updated)
+    return jsonify({"ok": True, **payload})
 
 
 @app.get("/api/events")
