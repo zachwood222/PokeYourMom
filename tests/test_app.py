@@ -98,6 +98,111 @@ def test_create_monitor_accepts_pokemon_center_alias(tmp_path, monkeypatch):
     assert payload["retailer"] == "pokemoncenter"
 
 
+def test_captcha_valid_token_allows_protected_post(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPTCHA_SECRET_KEY", "captcha-secret")
+    monkeypatch.setenv("CAPTCHA_VERIFY_URL", "https://captcha.local/verify")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    class DummyResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"success": True}
+
+    def fake_post(url, data, timeout):
+        assert url == "https://captcha.local/verify"
+        assert data["secret"] == "captcha-secret"
+        assert data["response"] == "token-ok"
+        return DummyResponse()
+
+    monkeypatch.setattr(app_module.requests, "post", fake_post)
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+            "captcha_token": "token-ok",
+        },
+        headers=_auth_headers(),
+    )
+
+    assert resp.status_code == 201
+
+
+def test_captcha_invalid_or_missing_token_rejects_protected_post(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPTCHA_SECRET_KEY", "captcha-secret")
+    monkeypatch.setenv("CAPTCHA_VERIFY_URL", "https://captcha.local/verify")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    def fake_post(url, data, timeout):
+        class DummyResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"success": False}
+
+        return DummyResponse()
+
+    monkeypatch.setattr(app_module.requests, "post", fake_post)
+
+    missing_token = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    invalid_token = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+            "captcha_token": "bad-token",
+        },
+        headers=_auth_headers(),
+    )
+
+    assert missing_token.status_code == 400
+    assert missing_token.get_json()["reason"] == "missing_token"
+    assert invalid_token.status_code == 400
+    assert invalid_token.get_json()["reason"] == "invalid_token"
+
+
+def test_captcha_provider_errors_fail_safely(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPTCHA_SECRET_KEY", "captcha-secret")
+    monkeypatch.setenv("CAPTCHA_VERIFY_URL", "https://captcha.local/verify")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    def fake_post(url, data, timeout):
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(app_module.requests, "post", fake_post)
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+            "captcha_token": "token-any",
+        },
+        headers=_auth_headers(),
+    )
+
+    assert resp.status_code == 400
+    assert resp.get_json()["reason"] == "provider_unreachable"
+
+
 def test_authenticated_user_only_sees_own_workspace_data(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()

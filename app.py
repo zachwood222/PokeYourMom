@@ -32,6 +32,9 @@ API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "dev-token")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
 UPDATE_CHECK_TIMEOUT_SECONDS = float(os.getenv("UPDATE_CHECK_TIMEOUT_SECONDS", "2.0"))
+CAPTCHA_SECRET_KEY = os.getenv("CAPTCHA_SECRET_KEY", "")
+CAPTCHA_VERIFY_URL = os.getenv("CAPTCHA_VERIFY_URL", "")
+CAPTCHA_TIMEOUT_SECONDS = float(os.getenv("CAPTCHA_TIMEOUT_SECONDS", "4.0"))
 
 PLAN_LIMITS = {
     "basic": {"max_monitors": 20, "min_poll_seconds": 20},
@@ -601,6 +604,55 @@ def _set_auth_context(user: sqlite3.Row | dict[str, Any], workspace: sqlite3.Row
     g.current_workspace = workspace
 
 
+def _extract_captcha_token() -> str | None:
+    header_token = (request.headers.get("X-Captcha-Token") or "").strip()
+    if header_token:
+        return header_token
+    body = request.get_json(silent=True)
+    if isinstance(body, dict):
+        for key in ("captcha_token", "cf-turnstile-response", "g-recaptcha-response"):
+            token = body.get(key)
+            if isinstance(token, str) and token.strip():
+                return token.strip()
+    for key in ("captcha_token", "cf-turnstile-response", "g-recaptcha-response"):
+        token = (request.form.get(key) or "").strip()
+        if token:
+            return token
+    return None
+
+
+def verify_captcha_token(token: str) -> tuple[bool, str | None]:
+    if not CAPTCHA_SECRET_KEY or not CAPTCHA_VERIFY_URL:
+        return True, None
+    if not token:
+        return False, "missing_token"
+    payload = {"secret": CAPTCHA_SECRET_KEY, "response": token}
+    remote_ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()
+    if remote_ip:
+        payload["remoteip"] = remote_ip
+    try:
+        response = requests.post(CAPTCHA_VERIFY_URL, data=payload, timeout=CAPTCHA_TIMEOUT_SECONDS)
+    except Exception as exc:  # noqa: BLE001
+        log(f"CAPTCHA verification request failed: {exc}", level="warning")
+        return False, "provider_unreachable"
+    if response.status_code >= 500:
+        log(
+            f"CAPTCHA verification provider returned {response.status_code}",
+            level="warning",
+        )
+        return False, "provider_error"
+    if response.status_code >= 400:
+        return False, "provider_rejected"
+    try:
+        result = response.json()
+    except ValueError:
+        log("CAPTCHA verification provider returned non-JSON response", level="warning")
+        return False, "provider_invalid_response"
+    if not bool(result.get("success")):
+        return False, "invalid_token"
+    return True, None
+
+
 @app.before_request
 def require_api_auth() -> tuple[dict[str, str], int] | None:
     incoming_correlation_id = (request.headers.get("X-Correlation-ID") or "").strip()
@@ -615,13 +667,23 @@ def require_api_auth() -> tuple[dict[str, str], int] | None:
         if not workspace:
             return jsonify({"error": "No workspace membership found"}), 403
         _set_auth_context(user, workspace)
-        return None
+    else:
+        token = _token_from_request()
+        if token and token == API_AUTH_TOKEN:
+            _set_auth_context(DEFAULT_USER, get_workspace(1))
+        else:
+            return jsonify({"error": "Unauthorized"}), 401
 
-    token = _token_from_request()
-    if token and token == API_AUTH_TOKEN:
-        _set_auth_context(DEFAULT_USER, get_workspace(1))
-        return None
-    return jsonify({"error": "Unauthorized"}), 401
+    if request.method in {"POST", "PATCH", "PUT", "DELETE"}:
+        captcha_token = _extract_captcha_token()
+        captcha_ok, reason = verify_captcha_token(captcha_token or "")
+        if not captcha_ok:
+            log(
+                f"Blocked request due to failed CAPTCHA verification ({reason})",
+                level="warning",
+            )
+            return jsonify({"error": "CAPTCHA verification failed", "reason": reason}), 400
+    return None
 
 
 @app.after_request
@@ -703,6 +765,9 @@ def map_subscription_to_internal_plan(
 
 
 def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return sync_manual_billing_subscription_event(payload)
+
+
 def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str, Any]:
     provider = (payload.get("provider") or "stripe").strip().lower()
     subscription_id = (payload.get("provider_subscription_id") or "").strip()
