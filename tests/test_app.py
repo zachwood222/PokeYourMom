@@ -272,6 +272,65 @@ def test_api_routes_require_auth(tmp_path, monkeypatch):
     assert resp.get_json() == {"error": "Unauthorized"}
 
 
+def test_create_list_task_and_attempts_endpoint(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_resp = client.post(
+        "/api/tasks",
+        json={
+            "retailer": "walmart",
+            "url": "https://www.walmart.com/ip/sku",
+            "profile": "profile-main",
+            "account": "acc-primary",
+            "payment": "visa-4242",
+        },
+        headers=_auth_headers(),
+    )
+    assert create_resp.status_code == 201
+    created = create_resp.get_json()
+    assert created["state"] == "idle"
+    task_id = created["id"]
+
+    list_resp = client.get("/api/tasks", headers=_auth_headers())
+    assert list_resp.status_code == 200
+    tasks = list_resp.get_json()
+    assert len(tasks) == 1
+    assert tasks[0]["id"] == task_id
+
+    attempts_resp = client.get(f"/api/tasks/{task_id}/attempts", headers=_auth_headers())
+    assert attempts_resp.status_code == 200
+    assert attempts_resp.get_json() == []
+
+
+def test_start_and_stop_task(tmp_path, monkeypatch):
+    monkeypatch.setenv("TASK_STEP_DELAY_SECONDS", "0.01")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_resp = client.post(
+        "/api/tasks",
+        json={
+            "retailer": "target",
+            "url": "https://www.target.com/p/abc",
+            "profile": "default",
+            "account": "acct-1",
+            "payment": "amex",
+        },
+        headers=_auth_headers(),
+    )
+    task_id = create_resp.get_json()["id"]
+
+    start_resp = client.post(f"/api/tasks/{task_id}/start", headers=_auth_headers())
+    assert start_resp.status_code == 200
+    started_task = start_resp.get_json()["task"]
+    assert started_task["state"] in {"queued", "running"}
+
+    stop_resp = client.post(f"/api/tasks/{task_id}/stop", headers=_auth_headers())
+    assert stop_resp.status_code == 200
+    assert stop_resp.get_json()["task"]["state"] == "stopped"
+
+
 def test_stripe_webhook_valid_signature_accepted(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()

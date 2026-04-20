@@ -32,6 +32,7 @@ API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "dev-token")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
 UPDATE_CHECK_TIMEOUT_SECONDS = float(os.getenv("UPDATE_CHECK_TIMEOUT_SECONDS", "2.0"))
+TASK_STEP_DELAY_SECONDS = float(os.getenv("TASK_STEP_DELAY_SECONDS", "0.5"))
 
 PLAN_LIMITS = {
     "basic": {"max_monitors": 20, "min_poll_seconds": 20},
@@ -68,6 +69,9 @@ DEFAULT_USER = {
 running = False
 monitor_thread: threading.Thread | None = None
 lock = threading.Lock()
+task_runtime_lock = threading.Lock()
+task_threads: dict[int, threading.Thread] = {}
+task_stop_events: dict[int, threading.Event] = {}
 
 
 @dataclass
@@ -458,6 +462,38 @@ def init_db() -> None:
             workspace_id integer,
             foreign key(workspace_id) references workspaces(id)
         );
+
+        create table if not exists tasks (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            retailer text not null,
+            product_url text not null,
+            profile text not null,
+            account text not null,
+            payment text not null,
+            state text not null default 'idle',
+            retries integer not null default 0,
+            last_step text,
+            last_error text,
+            created_at text not null,
+            updated_at text not null,
+            started_at text,
+            stopped_at text,
+            foreign key(workspace_id) references workspaces(id)
+        );
+
+        create table if not exists task_attempts (
+            id integer primary key autoincrement,
+            task_id integer not null,
+            workspace_id integer not null,
+            attempt_number integer not null,
+            state text not null,
+            step text,
+            error text,
+            created_at text not null,
+            foreign key(task_id) references tasks(id),
+            foreign key(workspace_id) references workspaces(id)
+        );
         """
     )
     existing = conn.execute("select id from workspaces limit 1").fetchone()
@@ -703,6 +739,9 @@ def map_subscription_to_internal_plan(
 
 
 def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return sync_manual_billing_subscription_event(payload)
+
+
 def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str, Any]:
     provider = (payload.get("provider") or "stripe").strip().lower()
     subscription_id = (payload.get("provider_subscription_id") or "").strip()
@@ -1168,6 +1207,83 @@ def cents_to_dollars(cents: int | None) -> str:
     return f"${cents / 100:.2f}"
 
 
+def serialize_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return dict(row)
+
+
+def get_task_for_workspace(conn: sqlite3.Connection, task_id: int, workspace_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from tasks where id = ? and workspace_id = ?",
+        (task_id, workspace_id),
+    ).fetchone()
+
+
+def emit_task_update(task_id: int) -> None:
+    conn = db()
+    row = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
+    conn.close()
+    if row:
+        socketio.emit("task_update", dict(row))
+
+
+def emit_task_attempt(task_id: int, attempt_id: int) -> None:
+    conn = db()
+    row = conn.execute("select * from task_attempts where id = ?", (attempt_id,)).fetchone()
+    conn.close()
+    if row:
+        socketio.emit("task_attempt", dict(row))
+
+
+def set_task_state(
+    conn: sqlite3.Connection,
+    task_id: int,
+    *,
+    state: str,
+    retries: int | None = None,
+    last_step: str | None = None,
+    last_error: str | None = None,
+    started_at: str | None = None,
+    stopped_at: str | None = None,
+) -> None:
+    now_iso = utc_now()
+    conn.execute(
+        """
+        update tasks
+        set state = ?,
+            retries = coalesce(?, retries),
+            last_step = ?,
+            last_error = ?,
+            updated_at = ?,
+            started_at = coalesce(?, started_at),
+            stopped_at = ?
+        where id = ?
+        """,
+        (state, retries, last_step, last_error, now_iso, started_at, stopped_at, task_id),
+    )
+
+
+def insert_task_attempt(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    workspace_id: int,
+    attempt_number: int,
+    state: str,
+    step: str | None,
+    error: str | None,
+) -> int:
+    cur = conn.execute(
+        """
+        insert into task_attempts(task_id, workspace_id, attempt_number, state, step, error, created_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (task_id, workspace_id, attempt_number, state, step, error, utc_now()),
+    )
+    return int(cur.lastrowid)
+
+
 def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
@@ -1338,6 +1454,124 @@ def monitor_loop() -> None:
 
         time.sleep(POLL_LOOP_SECONDS)
     log("Monitor loop stopped")
+
+
+def run_task_worker(task_id: int, workspace_id: int, stop_event: threading.Event) -> None:
+    steps = ["session_init", "profile_submit", "account_submit", "payment_submit"]
+    max_attempts = 4
+    try:
+        for attempt_number in range(1, max_attempts + 1):
+            if stop_event.is_set():
+                break
+
+            conn = db()
+            set_task_state(
+                conn,
+                task_id,
+                state="running",
+                retries=attempt_number - 1,
+                last_step="session_init",
+                last_error=None,
+                started_at=utc_now(),
+                stopped_at=None,
+            )
+            conn.commit()
+            conn.close()
+            emit_task_update(task_id)
+            log(f"Task {task_id}: started attempt {attempt_number}", workspace_id=workspace_id)
+
+            attempt_failed = False
+            attempt_error = None
+            for step in steps:
+                if stop_event.is_set():
+                    break
+                conn = db()
+                set_task_state(conn, task_id, state="running", retries=attempt_number - 1, last_step=step, last_error=None)
+                conn.commit()
+                conn.close()
+                emit_task_update(task_id)
+                time.sleep(TASK_STEP_DELAY_SECONDS)
+
+            if stop_event.is_set():
+                break
+
+            if attempt_number < 3:
+                attempt_failed = True
+                attempt_error = f"Transient checkout failure at attempt {attempt_number}"
+
+            conn = db()
+            if attempt_failed:
+                set_task_state(
+                    conn,
+                    task_id,
+                    state="retrying",
+                    retries=attempt_number,
+                    last_step="retry_backoff",
+                    last_error=attempt_error,
+                )
+                attempt_id = insert_task_attempt(
+                    conn,
+                    task_id=task_id,
+                    workspace_id=workspace_id,
+                    attempt_number=attempt_number,
+                    state="failed",
+                    step="payment_submit",
+                    error=attempt_error,
+                )
+                conn.commit()
+                conn.close()
+                emit_task_attempt(task_id, attempt_id)
+                emit_task_update(task_id)
+                log(f"Task {task_id}: attempt {attempt_number} failed ({attempt_error})", level="warning", workspace_id=workspace_id)
+                time.sleep(TASK_STEP_DELAY_SECONDS)
+                continue
+
+            set_task_state(
+                conn,
+                task_id,
+                state="completed",
+                retries=attempt_number - 1,
+                last_step="completed",
+                last_error=None,
+            )
+            attempt_id = insert_task_attempt(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                attempt_number=attempt_number,
+                state="success",
+                step="completed",
+                error=None,
+            )
+            conn.commit()
+            conn.close()
+            emit_task_attempt(task_id, attempt_id)
+            emit_task_update(task_id)
+            log(f"Task {task_id}: completed successfully on attempt {attempt_number}", workspace_id=workspace_id)
+            return
+
+        conn = db()
+        stop_reason = "stopped" if stop_event.is_set() else "failed"
+        stop_error = None if stop_event.is_set() else "Max retries exhausted"
+        set_task_state(
+            conn,
+            task_id,
+            state=stop_reason,
+            last_step="stopped" if stop_event.is_set() else "failed",
+            last_error=stop_error,
+            stopped_at=utc_now() if stop_event.is_set() else None,
+        )
+        conn.commit()
+        conn.close()
+        emit_task_update(task_id)
+        if stop_event.is_set():
+            log(f"Task {task_id}: stopped", workspace_id=workspace_id)
+        else:
+            log(f"Task {task_id}: max retries exhausted", level="error", workspace_id=workspace_id)
+    finally:
+        with task_runtime_lock:
+            task_threads.pop(task_id, None)
+            task_stop_events.pop(task_id, None)
 
 
 @app.route("/")
@@ -1539,6 +1773,139 @@ def api_list_monitors():
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/tasks")
+@require_auth
+def api_create_task():
+    body = request.json or {}
+    try:
+        retailer = canonical_retailer((body.get("retailer") or "").strip())
+        product_url = (body.get("url") or body.get("product_url") or "").strip()
+        profile = (body.get("profile") or "").strip()
+        account = (body.get("account") or "").strip()
+        payment = (body.get("payment") or "").strip()
+        if retailer not in SUPPORTED_RETAILERS:
+            raise ValueError(f"Unsupported retailer '{retailer}'")
+        if not (product_url.startswith("http://") or product_url.startswith("https://")):
+            raise ValueError("url must be http(s)")
+        if not profile:
+            raise ValueError("profile is required")
+        if not account:
+            raise ValueError("account is required")
+        if not payment:
+            raise ValueError("payment is required")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    now_iso = utc_now()
+    conn = db()
+    cur = conn.execute(
+        """
+        insert into tasks(workspace_id, retailer, product_url, profile, account, payment, state, retries, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, 'idle', 0, ?, ?)
+        """,
+        (current_workspace_id(), retailer, product_url, profile, account, payment, now_iso, now_iso),
+    )
+    conn.commit()
+    row = conn.execute("select * from tasks where id = ?", (cur.lastrowid,)).fetchone()
+    conn.close()
+    payload = serialize_task(row)
+    socketio.emit("task_update", payload)
+    return jsonify(payload), 201
+
+
+@app.get("/api/tasks")
+@require_auth
+def api_list_tasks():
+    conn = db()
+    rows = conn.execute(
+        "select * from tasks where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_task(row) for row in rows])
+
+
+@app.post("/api/tasks/<int:task_id>/start")
+@require_auth
+def api_start_task(task_id: int):
+    workspace_id = current_workspace_id()
+    conn = db()
+    task = get_task_for_workspace(conn, task_id, workspace_id)
+    if not task:
+        conn.close()
+        return jsonify({"error": "Task not found"}), 404
+
+    with task_runtime_lock:
+        already_running = task_id in task_threads and task_threads[task_id].is_alive()
+        if already_running:
+            conn.close()
+            return jsonify({"ok": True, "task": dict(task), "already_running": True})
+        stop_event = threading.Event()
+        task_stop_events[task_id] = stop_event
+        thread = threading.Thread(
+            target=run_task_worker,
+            args=(task_id, workspace_id, stop_event),
+            daemon=True,
+        )
+        task_threads[task_id] = thread
+
+    set_task_state(conn, task_id, state="queued", last_step="queued", last_error=None, started_at=utc_now(), stopped_at=None)
+    conn.commit()
+    updated_task = get_task_for_workspace(conn, task_id, workspace_id)
+    conn.close()
+    emit_task_update(task_id)
+    log(f"Task {task_id}: queued to start", workspace_id=workspace_id)
+    thread.start()
+    return jsonify({"ok": True, "task": dict(updated_task), "already_running": False})
+
+
+@app.post("/api/tasks/<int:task_id>/stop")
+@require_auth
+def api_stop_task(task_id: int):
+    workspace_id = current_workspace_id()
+    conn = db()
+    task = get_task_for_workspace(conn, task_id, workspace_id)
+    if not task:
+        conn.close()
+        return jsonify({"error": "Task not found"}), 404
+
+    with task_runtime_lock:
+        stop_event = task_stop_events.get(task_id)
+        thread = task_threads.get(task_id)
+        if stop_event:
+            stop_event.set()
+    if thread and thread.is_alive():
+        thread.join(timeout=1.0)
+    set_task_state(conn, task_id, state="stopped", last_step="stopped", stopped_at=utc_now())
+    conn.commit()
+    updated_task = get_task_for_workspace(conn, task_id, workspace_id)
+    conn.close()
+    emit_task_update(task_id)
+    log(f"Task {task_id}: stop requested", workspace_id=workspace_id)
+    return jsonify({"ok": True, "task": dict(updated_task)})
+
+
+@app.get("/api/tasks/<int:task_id>/attempts")
+@require_auth
+def api_task_attempts(task_id: int):
+    workspace_id = current_workspace_id()
+    conn = db()
+    task = get_task_for_workspace(conn, task_id, workspace_id)
+    if not task:
+        conn.close()
+        return jsonify({"error": "Task not found"}), 404
+    attempts = conn.execute(
+        """
+        select * from task_attempts
+        where workspace_id = ? and task_id = ?
+        order by id desc
+        """,
+        (workspace_id, task_id),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(row) for row in attempts])
 
 
 @app.get("/api/dashboard/summary")
