@@ -413,6 +413,192 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -
         conn.execute(f"alter table {table} add column {column} {ddl}")
 
 
+def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "select 1 from sqlite_master where type = 'table' and name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def normalize_legacy_task_state(raw_state: Any) -> str:
+    state = str(raw_state or "").strip().lower()
+    compat_map = {
+        "idle": "queued",
+        "running": "monitoring",
+        "complete": "success",
+        "completed": "success",
+        "error": "failed",
+        "cancelled": "stopped",
+        "canceled": "stopped",
+    }
+    state = compat_map.get(state, state or "queued")
+    if state not in CHECKOUT_TASK_STATES:
+        return "queued"
+    return state
+
+
+def run_legacy_tasks_migration(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        create table if not exists schema_migrations (
+            key text primary key,
+            applied_at text not null
+        )
+        """
+    )
+    migration_key = "2026_04_20_legacy_tasks_to_checkout_tasks"
+    already_applied = conn.execute(
+        "select 1 from schema_migrations where key = ?",
+        (migration_key,),
+    ).fetchone()
+    if already_applied:
+        return
+
+    if not table_exists(conn, "tasks"):
+        conn.execute(
+            "insert into schema_migrations(key, applied_at) values (?, ?)",
+            (migration_key, utc_now()),
+        )
+        return
+
+    task_columns = {row["name"] for row in conn.execute("pragma table_info(tasks)").fetchall()}
+    if "id" not in task_columns:
+        conn.execute(
+            "insert into schema_migrations(key, applied_at) values (?, ?)",
+            (migration_key, utc_now()),
+        )
+        return
+
+    ensure_column(conn, "checkout_tasks", "legacy_task_id", "integer")
+    conn.execute(
+        """
+        create unique index if not exists idx_checkout_tasks_legacy_task_id
+        on checkout_tasks(legacy_task_id)
+        where legacy_task_id is not null
+        """
+    )
+
+    legacy_tasks = conn.execute("select * from tasks order by id asc").fetchall()
+    migrated_count = 0
+    for row in legacy_tasks:
+        legacy_task_id = int(row["id"])
+        existing = conn.execute(
+            "select id from checkout_tasks where legacy_task_id = ?",
+            (legacy_task_id,),
+        ).fetchone()
+        if existing:
+            continue
+
+        workspace_id = int(row["workspace_id"]) if "workspace_id" in task_columns and row["workspace_id"] else 1
+        retailer = (row["retailer"] if "retailer" in task_columns else None) or "walmart"
+        product_url = (
+            (row["product_url"] if "product_url" in task_columns else None)
+            or (row["url"] if "url" in task_columns else None)
+            or ""
+        )
+        profile = (row["profile"] if "profile" in task_columns else None) or ""
+        account = (row["account"] if "account" in task_columns else None) or ""
+        payment = (row["payment"] if "payment" in task_columns else None) or ""
+        normalized_state = normalize_legacy_task_state(row["state"] if "state" in task_columns else None)
+        last_error = (row["last_error"] if "last_error" in task_columns else None) or None
+        created_at = (row["created_at"] if "created_at" in task_columns else None) or utc_now()
+        updated_at = (row["updated_at"] if "updated_at" in task_columns else None) or created_at
+        last_step = (row["last_step"] if "last_step" in task_columns else None) or normalized_state
+        retries = int(row["retries"]) if "retries" in task_columns and row["retries"] is not None else 0
+
+        monitor_row = conn.execute(
+            """
+            select id from monitors
+            where workspace_id = ? and retailer = ? and product_url = ?
+            order by id asc
+            limit 1
+            """,
+            (workspace_id, retailer, product_url),
+        ).fetchone()
+        if monitor_row:
+            monitor_id = int(monitor_row["id"])
+        else:
+            cur = conn.execute(
+                """
+                insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, enabled, created_at)
+                values (?, ?, ?, 20, ?, ?)
+                """,
+                (workspace_id, retailer, product_url, int(normalized_state == "monitoring"), created_at),
+            )
+            monitor_id = int(cur.lastrowid)
+
+        task_config = json.dumps(
+            {
+                "retailer": retailer,
+                "product_url": product_url,
+                "profile": profile,
+                "account": account,
+                "payment": payment,
+            }
+        )
+        enabled = int(normalized_state not in {"stopped", "success", "failed"})
+        is_paused = int(normalized_state == "paused")
+        cur = conn.execute(
+            """
+            insert into checkout_tasks(
+                workspace_id,
+                monitor_id,
+                task_name,
+                task_config,
+                current_state,
+                enabled,
+                is_paused,
+                last_error,
+                created_at,
+                updated_at,
+                last_transition_at,
+                legacy_task_id
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                workspace_id,
+                monitor_id,
+                f"{retailer} task",
+                task_config,
+                normalized_state,
+                enabled,
+                is_paused,
+                last_error,
+                created_at,
+                updated_at,
+                updated_at,
+                legacy_task_id,
+            ),
+        )
+        new_task_id = int(cur.lastrowid)
+        conn.execute(
+            """
+            insert into checkout_attempts(task_id, workspace_id, monitor_id, state, status, details, error_text, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_task_id,
+                workspace_id,
+                monitor_id,
+                normalized_state,
+                "migrated",
+                json.dumps({"legacy_task_id": legacy_task_id, "last_step": last_step, "retries": retries}),
+                last_error,
+                updated_at,
+            ),
+        )
+        migrated_count += 1
+
+    conn.execute(
+        "insert into schema_migrations(key, applied_at) values (?, ?)",
+        (migration_key, utc_now()),
+    )
+    if migrated_count:
+        log(f"✅ Migrated {migrated_count} legacy rows from tasks to checkout_tasks")
+
+
 def init_db() -> None:
     conn = db()
     conn.executescript(
@@ -772,6 +958,7 @@ def init_db() -> None:
     ensure_column(conn, "jobs", "monitor_id", "integer")
     ensure_column(conn, "jobs", "payload_json", "text")
     ensure_column(conn, "jobs", "last_error", "text")
+    run_legacy_tasks_migration(conn)
     conn.commit()
     conn.close()
 
