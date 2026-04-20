@@ -45,6 +45,9 @@ SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY", "local-dev-secret-key
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
 UPDATE_CHECK_TIMEOUT_SECONDS = float(os.getenv("UPDATE_CHECK_TIMEOUT_SECONDS", "2.0"))
+CAPTCHA_PROVIDER = os.getenv("CAPTCHA_PROVIDER", "turnstile")
+CAPTCHA_SITE_KEY = os.getenv("CAPTCHA_SITE_KEY", "")
+CAPTCHA_SCRIPT_URL = os.getenv("CAPTCHA_SCRIPT_URL", "https://challenges.cloudflare.com/turnstile/v0/api.js")
 CAPTCHA_SECRET_KEY = os.getenv("CAPTCHA_SECRET_KEY", "")
 CAPTCHA_VERIFY_URL = os.getenv(
     "CAPTCHA_VERIFY_URL",
@@ -2363,7 +2366,12 @@ def run_task_worker(task_id: int, workspace_id: int, stop_event: threading.Event
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template(
+        "index.html",
+        captcha_provider=CAPTCHA_PROVIDER,
+        captcha_site_key=CAPTCHA_SITE_KEY,
+        captcha_script_url=CAPTCHA_SCRIPT_URL,
+    )
 
 
 @app.get("/healthz")

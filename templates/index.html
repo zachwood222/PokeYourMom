@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Stock Sentinel</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+  {% if captcha_site_key %}<script src="{{ captcha_script_url }}" async defer></script>{% endif %}
   <style>
     :root {
       color-scheme: dark;
@@ -354,6 +355,13 @@
               <label class="small">Original MSRP Cents (Pokemon only)</label>
               <input id="msrp_cents" type="number" placeholder="499" />
             </div>
+            <input id="captcha_token" type="hidden" value="" />
+            {% if captcha_site_key %}
+            <div style="margin-top:10px;">
+              <label class="small">CAPTCHA Verification</label>
+              <div id="captcha_widget" class="cf-turnstile" data-sitekey="{{ captcha_site_key }}" data-theme="dark" data-callback="onCaptchaSuccess" data-expired-callback="onCaptchaExpired" data-error-callback="onCaptchaError"></div>
+            </div>
+            {% endif %}
             <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
           </div>
 
@@ -469,6 +477,46 @@
     let selectedTaskId = null;
     let taskMap = new Map();
     const toArray = (value, key) => Array.isArray(value) ? value : (value && Array.isArray(value[key]) ? value[key] : []);
+    function getCaptchaToken() {
+      return (document.getElementById('captcha_token')?.value || "").trim();
+    }
+
+    function onCaptchaSuccess(token) {
+      const el = document.getElementById('captcha_token');
+      if (el) el.value = token || '';
+    }
+
+    function onCaptchaExpired() {
+      const el = document.getElementById('captcha_token');
+      if (el) el.value = '';
+    }
+
+    function onCaptchaError() {
+      const el = document.getElementById('captcha_token');
+      if (el) el.value = '';
+    }
+
+    async function apiFetch(url, options = {}) {
+      const opts = {...options};
+      const method = (opts.method || 'GET').toUpperCase();
+      const headers = new Headers(opts.headers || {});
+      const token = getCaptchaToken();
+      if (token) {
+        headers.set('X-Captcha-Token', token);
+      }
+      if (method !== 'GET' && method !== 'HEAD' && token && !opts.body) {
+        opts.body = JSON.stringify({captcha_token: token});
+        headers.set('Content-Type', headers.get('Content-Type') || 'application/json');
+      }
+      opts.headers = headers;
+      const response = await fetch(url, opts);
+      return response;
+    }
+
+    function appendCaptchaToken(payload = {}) {
+      const token = getCaptchaToken();
+      return token ? {...payload, captcha_token: token} : payload;
+    }
 
     function setTab(tab) {
       document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
@@ -561,7 +609,7 @@
     async function savePlan() {
       const plan = document.getElementById('plan').value;
       const res = await apiFetch('/api/workspace/plan', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({plan})
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken({plan}))
       });
       const data = await res.json();
       alert(data.error || `Plan updated to ${data.plan}`);
@@ -576,7 +624,7 @@
         notify_restock_only: document.getElementById('notify_restock_only').checked,
       };
       const res = await apiFetch('/api/webhooks', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))
       });
       const data = await res.json();
       alert(data.error || `Webhook added (id=${data.id})`);
@@ -605,7 +653,7 @@
       };
 
       const res = await apiFetch('/api/monitors', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))
       });
       const data = await res.json();
       alert(data.error || `Monitor added (id=${data.id})`);
@@ -806,7 +854,7 @@
         new_poll_interval_seconds: Number(document.getElementById('schedule_poll').value),
       };
       const res = await apiFetch('/api/schedules', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))
       });
       const data = await res.json();
       alert(data.error || `Created ${data.created?.length || 0} schedule(s)`);
