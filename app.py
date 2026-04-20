@@ -73,6 +73,13 @@ PLAN_LOOKUP_TO_INTERNAL_PLAN = {
     "team": "team",
 }
 SUPPORTED_RETAILERS = {"walmart", "target", "bestbuy", "pokemoncenter"}
+SUPPORTED_MONITOR_CATEGORIES = {"pokemon", "sports_cards", "one_piece", "lorcana"}
+RETAILER_CATEGORY_SUPPORT = {
+    "target": SUPPORTED_MONITOR_CATEGORIES,
+    "pokemoncenter": SUPPORTED_MONITOR_CATEGORIES,
+    "walmart": {"pokemon"},
+    "bestbuy": {"pokemon"},
+}
 DEFAULT_WORKSPACE = {
     "name": "My Workspace",
     "plan": DEFAULT_PLAN if DEFAULT_PLAN in PLAN_LIMITS else "basic",
@@ -638,6 +645,7 @@ def init_db() -> None:
             id integer primary key autoincrement,
             workspace_id integer not null,
             retailer text not null,
+            category text not null default 'pokemon',
             product_url text not null,
             keyword text,
             max_price_cents integer,
@@ -958,6 +966,7 @@ def init_db() -> None:
     ensure_column(conn, "monitors", "proxy_url", "text")
     ensure_column(conn, "monitors", "session_task_key", "text")
     ensure_column(conn, "monitors", "session_metadata", "text")
+    ensure_column(conn, "monitors", "category", "text not null default 'pokemon'")
     ensure_column(conn, "jobs", "job_type", "text not null default 'monitor_check'")
     ensure_column(conn, "jobs", "monitor_id", "integer")
     ensure_column(conn, "jobs", "payload_json", "text")
@@ -1648,10 +1657,13 @@ def get_adapter_for_retailer(retailer: str | None):
 
 
 def evaluate_page(
-    html: str, keyword: str | None = None, retailer: str | None = None
+    html: str,
+    keyword: str | None = None,
+    retailer: str | None = None,
+    category: str | None = None,
 ) -> MonitorResult:
     adapter = get_adapter_for_retailer(retailer)
-    return run_retailer_flow(adapter, {"html": html, "keyword": keyword})
+    return run_retailer_flow(adapter, {"html": html, "keyword": keyword, "category": category})
 
 
 def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
@@ -1681,7 +1693,8 @@ def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
     r = req.response
     r.raise_for_status()
     keyword = (monitor["keyword"] or "").strip() or None
-    return evaluate_page(r.text, keyword=keyword, retailer=monitor["retailer"])
+    category = (monitor["category"] or "").strip() or "pokemon"
+    return evaluate_page(r.text, keyword=keyword, retailer=monitor["retailer"], category=category)
 
 
 def alert_eligibility(monitor: sqlite3.Row, result: MonitorResult) -> bool:
@@ -2082,7 +2095,11 @@ def enqueue_checkout_for_monitor(
         workspace_id=monitor["workspace_id"],
         monitor_id=monitor["id"],
         task_name=f"Monitor {monitor['id']} checkout",
-        task_config={"retailer": monitor["retailer"], "product_url": monitor["product_url"]},
+        task_config={
+            "retailer": monitor["retailer"],
+            "category": monitor["category"],
+            "product_url": monitor["product_url"],
+        },
         initial_state="queued",
     )
     record_checkout_attempt(
@@ -2863,6 +2880,218 @@ def api_list_monitors():
     return jsonify([dict(r) for r in rows])
 
 
+@app.post("/api/tasks")
+@require_auth
+def api_create_task():
+    body = request.json or {}
+    try:
+        retailer = canonical_retailer((body.get("retailer") or "").strip())
+        category = (body.get("category") or "pokemon").strip().lower()
+        product_url = (body.get("url") or body.get("product_url") or "").strip()
+        profile = (body.get("profile") or "").strip()
+        account = (body.get("account") or "").strip()
+        payment = (body.get("payment") or "").strip()
+        if retailer not in SUPPORTED_RETAILERS:
+            raise ValueError(f"Unsupported retailer '{retailer}'")
+        if category not in SUPPORTED_MONITOR_CATEGORIES:
+            raise ValueError(f"Unsupported category '{category}'")
+        if category not in RETAILER_CATEGORY_SUPPORT.get(retailer, set()):
+            raise ValueError(f"Retailer '{retailer}' does not support category '{category}'")
+        if not (product_url.startswith("http://") or product_url.startswith("https://")):
+            raise ValueError("url must be http(s)")
+        if not profile:
+            raise ValueError("profile is required")
+        if not account:
+            raise ValueError("account is required")
+        if not payment:
+            raise ValueError("payment is required")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    workspace_id = current_workspace_id()
+    conn = db()
+    enforce_plan_limits(workspace_id, 20)
+    monitor_cur = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, category, product_url, poll_interval_seconds, enabled, created_at)
+        values (?, ?, ?, ?, 20, 0, ?)
+        """,
+        (workspace_id, retailer, category, product_url, utc_now()),
+    )
+    monitor_id = int(monitor_cur.lastrowid)
+    task = create_checkout_task(
+        conn,
+        workspace_id=workspace_id,
+        monitor_id=monitor_id,
+        task_name=f"{retailer} task",
+        task_config={
+            "retailer": retailer,
+            "category": category,
+            "product_url": product_url,
+            "profile": profile,
+            "account": account,
+            "payment": payment,
+        },
+        initial_state="queued",
+    )
+    conn.commit()
+    conn.close()
+
+    payload = {
+        "id": task["id"],
+        "workspace_id": workspace_id,
+        "retailer": retailer,
+        "category": category,
+        "product_url": product_url,
+        "profile": profile,
+        "account": account,
+        "payment": payment,
+        "state": "idle",
+        "retries": 0,
+        "last_step": None,
+        "last_error": None,
+    }
+    socketio.emit("task_update", payload)
+    return jsonify(payload), 201
+
+
+@app.get("/api/tasks")
+@require_auth
+def api_list_tasks():
+    conn = db()
+    rows = conn.execute(
+        "select * from checkout_tasks where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    payloads = []
+    for row in rows:
+        config = {}
+        raw = row["task_config"]
+        if raw:
+            try:
+                config = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                config = {}
+        state = row["current_state"]
+        compat_state = "idle" if state == "queued" and not row["enabled"] else ("running" if state == "monitoring" else state)
+        payloads.append(
+            {
+                "id": row["id"],
+                "workspace_id": row["workspace_id"],
+                "retailer": config.get("retailer"),
+                "category": config.get("category"),
+                "product_url": config.get("product_url"),
+                "profile": config.get("profile"),
+                "account": config.get("account"),
+                "payment": config.get("payment"),
+                "state": compat_state,
+                "retries": 0,
+                "last_step": row["current_state"],
+                "last_error": row["last_error"],
+            }
+        )
+    conn.close()
+    return jsonify(payloads)
+
+
+@app.post("/api/tasks/<int:task_id>/start")
+@require_auth
+def api_start_task(task_id: int):
+    workspace_id = current_workspace_id()
+    conn = db()
+    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+    if not task:
+        conn.close()
+        return jsonify({"error": "Task not found"}), 404
+    transitioned = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        requested_state="monitoring",
+        reason="compat_api_start_task",
+    )
+    conn.commit()
+    conn.close()
+    assert transitioned is not None
+    config = json.loads(transitioned["task_config"] or "{}")
+    payload = {
+        "id": transitioned["id"],
+        "workspace_id": workspace_id,
+        "retailer": config.get("retailer"),
+        "category": config.get("category"),
+        "product_url": config.get("product_url"),
+        "profile": config.get("profile"),
+        "account": config.get("account"),
+        "payment": config.get("payment"),
+        "state": "running",
+        "retries": 0,
+        "last_step": transitioned["current_state"],
+        "last_error": transitioned["last_error"],
+    }
+    socketio.emit("task_update", payload)
+    return jsonify({"ok": True, "task": payload, "already_running": False})
+
+
+@app.post("/api/tasks/<int:task_id>/stop")
+@require_auth
+def api_stop_task(task_id: int):
+    workspace_id = current_workspace_id()
+    conn = db()
+    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+    if not task:
+        conn.close()
+        return jsonify({"error": "Task not found"}), 404
+    transitioned = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        requested_state="stopped",
+        reason="compat_api_stop_task",
+    )
+    conn.commit()
+    conn.close()
+    assert transitioned is not None
+    config = json.loads(transitioned["task_config"] or "{}")
+    payload = {
+        "id": transitioned["id"],
+        "workspace_id": workspace_id,
+        "retailer": config.get("retailer"),
+        "category": config.get("category"),
+        "product_url": config.get("product_url"),
+        "profile": config.get("profile"),
+        "account": config.get("account"),
+        "payment": config.get("payment"),
+        "state": "stopped",
+        "retries": 0,
+        "last_step": transitioned["current_state"],
+        "last_error": transitioned["last_error"],
+    }
+    socketio.emit("task_update", payload)
+    return jsonify({"ok": True, "task": payload})
+
+
+@app.get("/api/tasks/<int:task_id>/attempts")
+@require_auth
+def api_task_attempts(task_id: int):
+    workspace_id = current_workspace_id()
+    conn = db()
+    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+    if not task:
+        conn.close()
+        return jsonify({"error": "Task not found"}), 404
+    attempts = conn.execute(
+        """
+        select * from checkout_attempts
+        where workspace_id = ? and task_id = ?
+          and status != 'created'
+        order by id desc
+        """,
+        (workspace_id, task_id),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(row) for row in attempts])
+
+
 @app.get("/api/dashboard/summary")
 @require_auth
 def api_dashboard_summary():
@@ -3047,6 +3276,7 @@ def api_create_monitor():
     body = request.json or {}
     try:
         retailer = canonical_retailer(body["retailer"])
+        category = (body.get("category") or "pokemon").strip().lower()
         url = body["product_url"].strip()
         poll_interval = int(body.get("poll_interval_seconds", 20))
         keyword = (body.get("keyword") or "").strip() or None
@@ -3058,6 +3288,10 @@ def api_create_monitor():
             msrp_cents = int(msrp_cents)
         if retailer not in SUPPORTED_RETAILERS:
             raise ValueError(f"Unsupported retailer '{retailer}'")
+        if category not in SUPPORTED_MONITOR_CATEGORIES:
+            raise ValueError(f"Unsupported category '{category}'")
+        if category not in RETAILER_CATEGORY_SUPPORT.get(retailer, set()):
+            raise ValueError(f"Retailer '{retailer}' does not support category '{category}'")
         if not (url.startswith("http://") or url.startswith("https://")):
             raise ValueError("product_url must be http(s)")
 
@@ -3068,10 +3302,20 @@ def api_create_monitor():
     conn = db()
     cur = conn.execute(
         """
-        insert into monitors(workspace_id, retailer, product_url, keyword, max_price_cents, msrp_cents, poll_interval_seconds, created_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?)
+        insert into monitors(workspace_id, retailer, category, product_url, keyword, max_price_cents, msrp_cents, poll_interval_seconds, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (current_workspace_id(), retailer, url, keyword, max_price_cents, msrp_cents, poll_interval, utc_now()),
+        (
+            current_workspace_id(),
+            retailer,
+            category,
+            url,
+            keyword,
+            max_price_cents,
+            msrp_cents,
+            poll_interval,
+            utc_now(),
+        ),
     )
     conn.commit()
     monitor_id = cur.lastrowid
