@@ -473,6 +473,7 @@
 
   <script>
     const socket = io();
+    const API_AUTH_TOKEN = {{ api_auth_token|tojson }};
     let loopRunning = false;
     let selectedTaskId = null;
     let taskMap = new Map();
@@ -500,6 +501,9 @@
       const opts = {...options};
       const method = (opts.method || 'GET').toUpperCase();
       const headers = new Headers(opts.headers || {});
+      if (API_AUTH_TOKEN && !headers.has('Authorization')) {
+        headers.set('Authorization', `Bearer ${API_AUTH_TOKEN}`);
+      }
       const token = getCaptchaToken();
       if (token) {
         headers.set('X-Captcha-Token', token);
@@ -552,7 +556,7 @@
     });
 
     async function loadWorkspace() {
-      const data = await fetch('/api/workspace').then(r => r.json());
+      const data = await apiFetch('/api/workspace').then(r => r.json());
       if (data.workspace) {
         document.getElementById('plan').value = data.workspace.plan;
       }
@@ -578,8 +582,8 @@
     }
 
     async function loadOpsTrends() {
-      const monitorData = await fetch('/api/ops/monitor-failure-trends').then(r => r.json()).catch(() => ({trends: []}));
-      const webhookData = await fetch('/api/ops/webhook-health-trends').then(r => r.json()).catch(() => ({webhooks: []}));
+      const monitorData = await apiFetch('/api/ops/monitor-failure-trends').then(r => r.json()).catch(() => ({trends: []}));
+      const webhookData = await apiFetch('/api/ops/webhook-health-trends').then(r => r.json()).catch(() => ({webhooks: []}));
 
       const monitorRows = toArray(monitorData, 'trends');
       const monitorBody = document.getElementById('ops_monitor_failure_trends');
@@ -632,7 +636,7 @@
     }
 
     async function testFirstWebhook() {
-      const hooks = await fetch('/api/webhooks').then(r => r.json());
+      const hooks = await apiFetch('/api/webhooks').then(r => r.json());
       if (!hooks.length) {
         alert('No webhooks configured yet.');
         return;
