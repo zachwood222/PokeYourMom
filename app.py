@@ -491,6 +491,46 @@ def enforce_plan_limits(workspace_id: int, poll_interval_seconds: int) -> None:
         )
 
 
+def workspace_usage_limits_snapshot(workspace_id: int) -> dict[str, Any]:
+    workspace = get_workspace(workspace_id)
+    plan = workspace["plan"]
+    limits = PLAN_LIMITS[plan]
+    conn = db()
+    monitor_count = conn.execute(
+        "select count(*) as c from monitors where workspace_id = ?", (workspace_id,)
+    ).fetchone()["c"]
+    min_poll_row = conn.execute(
+        """
+        select min(poll_interval_seconds) as min_poll_interval_seconds
+        from monitors
+        where workspace_id = ?
+        """,
+        (workspace_id,),
+    ).fetchone()
+    conn.close()
+
+    min_poll_interval_seconds = min_poll_row["min_poll_interval_seconds"]
+    monitor_slots_remaining = max(limits["max_monitors"] - monitor_count, 0)
+
+    return {
+        "plan": plan,
+        "usage": {
+            "monitor_count": monitor_count,
+            "min_poll_interval_seconds": min_poll_interval_seconds,
+        },
+        "limits": {
+            "max_monitors": limits["max_monitors"],
+            "min_poll_seconds": limits["min_poll_seconds"],
+        },
+        "derived": {
+            "monitor_slots_remaining": monitor_slots_remaining,
+            "monitor_limit_reached": monitor_count >= limits["max_monitors"],
+            "poll_minimum_satisfied": min_poll_interval_seconds is None
+            or min_poll_interval_seconds >= limits["min_poll_seconds"],
+        },
+    }
+
+
 def extract_price_cents(text: str) -> int | None:
     matches = re.findall(r"\$\s*(\d{1,4}(?:\.\d{2})?)", text)
     if not matches:
@@ -1072,6 +1112,13 @@ def api_update_plan():
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "plan": plan})
+
+
+@app.get("/api/workspace/usage-limits")
+@require_auth
+def api_workspace_usage_limits():
+    workspace_id = get_workspace_id_for_request()
+    return jsonify(workspace_usage_limits_snapshot(workspace_id))
 
 
 @app.get("/api/monitors")

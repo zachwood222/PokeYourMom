@@ -4,6 +4,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from parser_fixture_harness import load_fixture_html
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -257,6 +258,61 @@ def test_api_routes_require_auth(tmp_path, monkeypatch):
 
     assert resp.status_code == 401
     assert resp.get_json() == {"error": "Unauthorized"}
+
+
+@pytest.mark.parametrize(
+    ("plan", "monitor_count", "poll_intervals", "expected_remaining", "expected_limit_reached"),
+    [
+        ("basic", 0, [], 20, False),
+        ("basic", 19, [20] * 19, 1, False),
+        ("basic", 20, [20] * 20, 0, True),
+        ("pro", 0, [], 100, False),
+        ("pro", 99, [10] * 99, 1, False),
+        ("pro", 100, [10] * 100, 0, True),
+        ("team", 0, [], 500, False),
+        ("team", 499, [5] * 499, 1, False),
+        ("team", 500, [5] * 500, 0, True),
+    ],
+)
+def test_workspace_usage_limits_endpoint_by_plan_and_usage_state(
+    tmp_path,
+    monkeypatch,
+    plan,
+    monitor_count,
+    poll_intervals,
+    expected_remaining,
+    expected_limit_reached,
+):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute("update workspaces set plan = ? where id = 1", (plan,))
+    for index in range(monitor_count):
+        poll_interval = poll_intervals[index] if poll_intervals else app_module.PLAN_LIMITS[plan][
+            "min_poll_seconds"
+        ]
+        conn.execute(
+            """
+            insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+            values (1, 'target', ?, ?, ?)
+            """,
+            (f"https://example.com/{plan}/{index}", poll_interval, app_module.utc_now()),
+        )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/workspace/usage-limits", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["plan"] == plan
+    assert payload["usage"]["monitor_count"] == monitor_count
+    assert payload["usage"]["min_poll_interval_seconds"] == (min(poll_intervals) if poll_intervals else None)
+    assert payload["limits"] == app_module.PLAN_LIMITS[plan]
+    assert payload["derived"]["monitor_slots_remaining"] == expected_remaining
+    assert payload["derived"]["monitor_limit_reached"] is expected_limit_reached
+    assert payload["derived"]["poll_minimum_satisfied"] is True
 
 
 def test_api_routes_allow_authenticated_requests_and_include_context(tmp_path, monkeypatch):
