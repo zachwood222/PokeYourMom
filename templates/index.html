@@ -407,6 +407,11 @@
           <input id="webhook_name" value="Main Discord" />
           <label>Webhook URL</label>
           <input id="webhook_url" placeholder="https://discord.com/api/webhooks/..." />
+          <div style="margin-top:10px;">
+            <label style="display:flex; align-items:center; gap:8px;"><input id="notify_success" type="checkbox" style="width:auto;" checked /> Notify on success events</label>
+            <label style="display:flex; align-items:center; gap:8px;"><input id="notify_failures" type="checkbox" style="width:auto;" /> Notify on failures</label>
+            <label style="display:flex; align-items:center; gap:8px;"><input id="notify_restock_only" type="checkbox" style="width:auto;" checked /> Restock-only alerts</label>
+          </div>
           <div class="actions" style="margin-top:10px;">
             <button onclick="addWebhook()">Add Webhook</button>
             <button onclick="testFirstWebhook()">Test First Webhook</button>
@@ -621,17 +626,23 @@
 
     async function addWebhook() {
       const payload = {
-        name: document.getElementById('webhook_name').value,
-        webhook_url: document.getElementById('webhook_url').value,
-        notify_success: document.getElementById('notify_success').checked,
-        notify_failures: document.getElementById('notify_failures').checked,
-        notify_restock_only: document.getElementById('notify_restock_only').checked,
+        name: document.getElementById('webhook_name')?.value || '',
+        webhook_url: document.getElementById('webhook_url')?.value || '',
+        notify_success: document.getElementById('notify_success')?.checked ?? true,
+        notify_failures: document.getElementById('notify_failures')?.checked ?? false,
+        notify_restock_only: document.getElementById('notify_restock_only')?.checked ?? true,
       };
       const res = await apiFetch('/api/webhooks', {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))
       });
       const data = await res.json();
       alert(data.error || `Webhook added (id=${data.id})`);
+      const webhookName = document.getElementById('webhook_name');
+      const webhookUrl = document.getElementById('webhook_url');
+      if (!data.error) {
+        if (webhookName) webhookName.value = 'Main Discord';
+        if (webhookUrl) webhookUrl.value = '';
+      }
       await loadWebhooks();
     }
 
