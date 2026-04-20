@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import traceback
 import hashlib
 import hmac
 from dataclasses import dataclass
@@ -24,6 +25,11 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 POLL_LOOP_SECONDS = int(os.getenv("POLL_LOOP_SECONDS", "15"))
+WORKER_IDLE_SLEEP_SECONDS = float(os.getenv("WORKER_IDLE_SLEEP_SECONDS", "2.0"))
+WORKER_LOCK_TIMEOUT_SECONDS = int(os.getenv("WORKER_LOCK_TIMEOUT_SECONDS", "60"))
+WORKER_ID = os.getenv("WORKER_ID", f"worker-{uuid4()}")
+APP_ROLE = os.getenv("APP_ROLE", "api").lower()
+ENABLE_EMBEDDED_WORKER = os.getenv("ENABLE_EMBEDDED_WORKER", "0") == "1"
 DEFAULT_PLAN = os.getenv("DEFAULT_PLAN", "basic")
 POKEMON_MSRP_BUFFER_CENTS = int(os.getenv("POKEMON_MSRP_BUFFER_CENTS", "1000"))
 APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
@@ -65,9 +71,9 @@ DEFAULT_USER = {
     "name": "Local Developer",
 }
 
-running = False
-monitor_thread: threading.Thread | None = None
-lock = threading.Lock()
+worker_running = False
+worker_thread: threading.Thread | None = None
+worker_lock = threading.Lock()
 
 
 @dataclass
@@ -87,6 +93,19 @@ class MonitorResult:
 class RetailerParser:
     name: str
     parse: Callable[[str, str | None], MonitorResult]
+
+
+@dataclass
+class Job:
+    id: int
+    job_type: str
+    monitor_id: int | None
+    status: str
+    attempt_count: int
+    next_run_at: str
+    locked_by: str | None
+    locked_at: str | None
+    payload_json: str | None
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -458,6 +477,28 @@ def init_db() -> None:
             workspace_id integer,
             foreign key(workspace_id) references workspaces(id)
         );
+
+        create table if not exists jobs (
+            id integer primary key autoincrement,
+            job_type text not null,
+            monitor_id integer,
+            status text not null,
+            attempt_count integer not null default 0,
+            next_run_at text not null,
+            locked_by text,
+            locked_at text,
+            payload_json text,
+            last_error text,
+            created_at text not null,
+            updated_at text not null,
+            foreign key(monitor_id) references monitors(id)
+        );
+
+        create index if not exists idx_jobs_due
+            on jobs(status, next_run_at);
+
+        create index if not exists idx_jobs_monitor_pending
+            on jobs(monitor_id, status);
         """
     )
     existing = conn.execute("select id from workspaces limit 1").fetchone()
@@ -509,6 +550,10 @@ def init_db() -> None:
     ensure_column(conn, "workspaces", "subscription_status", "text not null default 'inactive'")
     ensure_column(conn, "workspaces", "subscription_source", "text not null default 'manual'")
     ensure_column(conn, "workspaces", "subscription_updated_at", "text")
+    ensure_column(conn, "jobs", "job_type", "text not null default 'monitor_check'")
+    ensure_column(conn, "jobs", "monitor_id", "integer")
+    ensure_column(conn, "jobs", "payload_json", "text")
+    ensure_column(conn, "jobs", "last_error", "text")
     conn.commit()
     conn.close()
 
@@ -702,7 +747,6 @@ def map_subscription_to_internal_plan(
     return "basic"
 
 
-def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str, Any]:
     provider = (payload.get("provider") or "stripe").strip().lower()
     subscription_id = (payload.get("provider_subscription_id") or "").strip()
@@ -813,6 +857,10 @@ def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str,
     finally:
         conn.close()
     return {"workspace_id": workspace_id, "plan": internal_plan, "status": status}
+
+
+def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return sync_manual_billing_subscription_event(payload)
 
 
 def extract_price_cents(text: str) -> int | None:
@@ -1230,9 +1278,73 @@ def create_monitor_error_events(monitor: sqlite3.Row, error_text: str) -> None:
     )
 
 
+STEP_RETRY_POLICY = {
+    "fetch": {"max_attempts": 5, "base_seconds": 5},
+    "persist": {"max_attempts": 4, "base_seconds": 2},
+    "notify": {"max_attempts": 4, "base_seconds": 3},
+}
+RETRYABLE_EXCEPTIONS = (requests.RequestException, TimeoutError, ConnectionError, sqlite3.OperationalError)
+
+
+def _exponential_backoff_seconds(base_seconds: int, attempt_count: int) -> int:
+    return base_seconds * (2 ** max(attempt_count - 1, 0))
+
+
+def _classify_step_failure(step: str, exc: Exception, step_attempts: int) -> tuple[bool, str]:
+    if isinstance(exc, (PermissionError, ValueError)):
+        return False, "terminal_non_retryable_error"
+    policy = STEP_RETRY_POLICY[step]
+    if step_attempts >= policy["max_attempts"]:
+        return False, "terminal_max_attempts_exceeded"
+    return isinstance(exc, RETRYABLE_EXCEPTIONS), "retryable_exception" if isinstance(exc, RETRYABLE_EXCEPTIONS) else "terminal_unclassified"
+
+
+def persist_monitor_state(monitor: sqlite3.Row, result: MonitorResult, eligible: bool) -> None:
+    conn = db()
+    conn.execute(
+        """
+        update monitors
+        set last_checked_at = ?, last_in_stock = ?, last_price_cents = ?, failure_streak = 0, last_error = NULL
+        where id = ?
+        """,
+        (utc_now(), int(eligible), result.price_cents, monitor["id"]),
+    )
+    conn.commit()
+    conn.close()
+
+
+def emit_monitor_events(monitor: sqlite3.Row, result: MonitorResult, eligible: bool) -> None:
+    create_event_and_deliver(monitor, result, eligible)
+
+
+def run_monitor_pipeline_once(monitor: sqlite3.Row) -> dict[str, Any]:
+    result = fetch_monitor(monitor)
+    eligible = alert_eligibility(monitor, result)
+    persist_monitor_state(monitor, result, eligible)
+    emit_monitor_events(monitor, result, eligible)
+
+    log(
+        f"Checked monitor {monitor['id']} | {monitor['retailer']} | {result.status_text} | {cents_to_dollars(result.price_cents)}",
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+    )
+    return {
+        "ok": True,
+        "in_stock": result.in_stock,
+        "eligible_for_alert": eligible,
+        "price_cents": result.price_cents,
+        "availability_reason": result.availability_reason,
+        "parser_confidence": result.parser_confidence,
+        "keyword_matched": result.keyword_matched,
+        "price_within_limit": result.price_within_limit,
+        "within_msrp_delta": result.within_msrp_delta,
+        "title": result.title,
+    }
+
+
 def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
     try:
-        result = fetch_monitor(monitor)
+        return run_monitor_pipeline_once(monitor)
     except Exception as exc:  # noqa: BLE001
         conn = db()
         conn.execute(
@@ -1261,40 +1373,6 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
         )
         return {"ok": False, "error": str(exc)}
 
-    eligible = alert_eligibility(monitor, result)
-
-    conn = db()
-    conn.execute(
-        """
-        update monitors
-        set last_checked_at = ?, last_in_stock = ?, last_price_cents = ?, failure_streak = 0, last_error = NULL
-        where id = ?
-        """,
-        (utc_now(), int(eligible), result.price_cents, monitor["id"]),
-    )
-    conn.commit()
-    conn.close()
-
-    create_event_and_deliver(monitor, result, eligible)
-
-    log(
-        f"Checked monitor {monitor['id']} | {monitor['retailer']} | {result.status_text} | {cents_to_dollars(result.price_cents)}",
-        workspace_id=monitor["workspace_id"],
-        monitor_id=monitor["id"],
-    )
-    return {
-        "ok": True,
-        "in_stock": result.in_stock,
-        "eligible_for_alert": eligible,
-        "price_cents": result.price_cents,
-        "availability_reason": result.availability_reason,
-        "parser_confidence": result.parser_confidence,
-        "keyword_matched": result.keyword_matched,
-        "price_within_limit": result.price_within_limit,
-        "within_msrp_delta": result.within_msrp_delta,
-        "title": result.title,
-    }
-
 
 def apply_due_schedules(conn: sqlite3.Connection) -> None:
     now_iso = utc_now()
@@ -1317,27 +1395,225 @@ def apply_due_schedules(conn: sqlite3.Connection) -> None:
         )
 
 
-def monitor_loop() -> None:
-    log("Monitor loop started")
-    while running:
-        with lock:
+class SQLiteJobQueue:
+    def __init__(self, conn: sqlite3.Connection, worker_id: str):
+        self.conn = conn
+        self.worker_id = worker_id
+
+    def enqueue_monitor_check_if_due(self, monitor: sqlite3.Row, *, now_iso: str) -> None:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if monitor["last_checked_at"]:
+            elapsed = now_ts - datetime.fromisoformat(monitor["last_checked_at"]).timestamp()
+            if elapsed < monitor["poll_interval_seconds"]:
+                return
+        exists = self.conn.execute(
+            """
+            select id
+            from jobs
+            where monitor_id = ?
+              and job_type = 'monitor_check'
+              and status in ('queued', 'retrying', 'running')
+            limit 1
+            """,
+            (monitor["id"],),
+        ).fetchone()
+        if exists:
+            return
+        payload = json.dumps({"step_attempts": {}})
+        self.conn.execute(
+            """
+            insert into jobs(job_type, monitor_id, status, attempt_count, next_run_at, payload_json, created_at, updated_at)
+            values ('monitor_check', ?, 'queued', 0, ?, ?, ?, ?)
+            """,
+            (monitor["id"], now_iso, payload, now_iso, now_iso),
+        )
+
+    def claim_due_job(self, *, now_iso: str) -> Job | None:
+        stale_cutoff = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() - WORKER_LOCK_TIMEOUT_SECONDS, tz=timezone.utc
+        ).isoformat()
+        self.conn.execute("begin immediate")
+        row = self.conn.execute(
+            """
+            select *
+            from jobs
+            where status in ('queued', 'retrying')
+              and next_run_at <= ?
+              and (
+                locked_at is null
+                or locked_at < ?
+              )
+            order by next_run_at asc, id asc
+            limit 1
+            """,
+            (now_iso, stale_cutoff),
+        ).fetchone()
+        if not row:
+            self.conn.commit()
+            return None
+        self.conn.execute(
+            """
+            update jobs
+            set status = 'running', locked_by = ?, locked_at = ?, updated_at = ?
+            where id = ?
+            """,
+            (self.worker_id, now_iso, now_iso, row["id"]),
+        )
+        self.conn.commit()
+        return Job(**dict(row))
+
+    def complete_job(self, job_id: int, *, now_iso: str) -> None:
+        self.conn.execute(
+            """
+            update jobs
+            set status = 'completed', locked_by = null, locked_at = null, updated_at = ?
+            where id = ?
+            """,
+            (now_iso, job_id),
+        )
+
+    def fail_job(self, job_id: int, *, now_iso: str, status: str, next_run_at: str, payload_json: str, error_text: str) -> None:
+        self.conn.execute(
+            """
+            update jobs
+            set status = ?,
+                attempt_count = attempt_count + 1,
+                next_run_at = ?,
+                payload_json = ?,
+                last_error = ?,
+                locked_by = null,
+                locked_at = null,
+                updated_at = ?
+            where id = ?
+            """,
+            (status, next_run_at, payload_json, error_text[:500], now_iso, job_id),
+        )
+
+
+def execute_monitor_job(queue: SQLiteJobQueue, job: Job, *, now_iso: str) -> None:
+    monitor = queue.conn.execute("select * from monitors where id = ?", (job.monitor_id,)).fetchone()
+    if not monitor:
+        queue.fail_job(
+            job.id,
+            now_iso=now_iso,
+            status="failed",
+            next_run_at=now_iso,
+            payload_json=job.payload_json or "{}",
+            error_text=f"monitor_not_found:{job.monitor_id}",
+        )
+        return
+    payload = json.loads(job.payload_json or "{}")
+    step_attempts: dict[str, int] = payload.get("step_attempts") or {}
+    result: MonitorResult | None = None
+    eligible: bool | None = None
+    try:
+        result = fetch_monitor(monitor)
+    except Exception as exc:  # noqa: BLE001
+        step = "fetch"
+        step_attempts[step] = int(step_attempts.get(step, 0)) + 1
+        retryable, reason = _classify_step_failure(step, exc, step_attempts[step])
+        if retryable:
+            delay = _exponential_backoff_seconds(STEP_RETRY_POLICY[step]["base_seconds"], step_attempts[step])
+            next_run = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + delay, tz=timezone.utc).isoformat()
+            queue.fail_job(
+                job.id,
+                now_iso=now_iso,
+                status="retrying",
+                next_run_at=next_run,
+                payload_json=json.dumps({"step_attempts": step_attempts}),
+                error_text=f"{step}:{reason}:{exc}",
+            )
+            return
+        queue.fail_job(
+            job.id,
+            now_iso=now_iso,
+            status="failed",
+            next_run_at=now_iso,
+            payload_json=json.dumps({"step_attempts": step_attempts}),
+            error_text=f"{step}:{reason}:{exc}",
+        )
+        return
+    try:
+        eligible = alert_eligibility(monitor, result)
+        persist_monitor_state(monitor, result, eligible)
+    except Exception as exc:  # noqa: BLE001
+        step = "persist"
+        step_attempts[step] = int(step_attempts.get(step, 0)) + 1
+        retryable, reason = _classify_step_failure(step, exc, step_attempts[step])
+        if retryable:
+            delay = _exponential_backoff_seconds(STEP_RETRY_POLICY[step]["base_seconds"], step_attempts[step])
+            next_run = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + delay, tz=timezone.utc).isoformat()
+            queue.fail_job(
+                job.id,
+                now_iso=now_iso,
+                status="retrying",
+                next_run_at=next_run,
+                payload_json=json.dumps({"step_attempts": step_attempts}),
+                error_text=f"{step}:{reason}:{exc}",
+            )
+            return
+        queue.fail_job(
+            job.id,
+            now_iso=now_iso,
+            status="failed",
+            next_run_at=now_iso,
+            payload_json=json.dumps({"step_attempts": step_attempts}),
+            error_text=f"{step}:{reason}:{exc}\n{traceback.format_exc()}",
+        )
+        return
+    try:
+        emit_monitor_events(monitor, result, eligible)
+        log(
+            f"Checked monitor {monitor['id']} | {monitor['retailer']} | {result.status_text} | {cents_to_dollars(result.price_cents)}",
+            workspace_id=monitor["workspace_id"],
+            monitor_id=monitor["id"],
+        )
+        queue.complete_job(job.id, now_iso=now_iso)
+    except Exception as exc:  # noqa: BLE001
+        step = "notify"
+        step_attempts[step] = int(step_attempts.get(step, 0)) + 1
+        retryable, reason = _classify_step_failure(step, exc, step_attempts[step])
+        if retryable:
+            delay = _exponential_backoff_seconds(STEP_RETRY_POLICY[step]["base_seconds"], step_attempts[step])
+            next_run = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + delay, tz=timezone.utc).isoformat()
+            queue.fail_job(
+                job.id,
+                now_iso=now_iso,
+                status="retrying",
+                next_run_at=next_run,
+                payload_json=json.dumps({"step_attempts": step_attempts}),
+                error_text=f"{step}:{reason}:{exc}",
+            )
+            return
+        queue.fail_job(
+            job.id,
+            now_iso=now_iso,
+            status="failed",
+            next_run_at=now_iso,
+            payload_json=json.dumps({"step_attempts": step_attempts}),
+            error_text=f"{step}:{reason}:{exc}\n{traceback.format_exc()}",
+        )
+
+
+def worker_loop() -> None:
+    log(f"Worker loop started ({WORKER_ID})")
+    while worker_running:
+        with worker_lock:
             conn = db()
+            now_iso = utc_now()
+            queue = SQLiteJobQueue(conn, worker_id=WORKER_ID)
             apply_due_schedules(conn)
             monitors = conn.execute("select * from monitors where enabled = 1").fetchall()
+            for monitor in monitors:
+                queue.enqueue_monitor_check_if_due(monitor, now_iso=now_iso)
+            job = queue.claim_due_job(now_iso=now_iso)
+            if job:
+                execute_monitor_job(queue, job, now_iso=now_iso)
+            conn.commit()
             conn.close()
-
-            now_ts = time.time()
-            for m in monitors:
-                if not running:
-                    break
-                if m["last_checked_at"]:
-                    elapsed = now_ts - datetime.fromisoformat(m["last_checked_at"]).timestamp()
-                    if elapsed < m["poll_interval_seconds"]:
-                        continue
-                check_monitor_once(m)
-
-        time.sleep(POLL_LOOP_SECONDS)
-    log("Monitor loop stopped")
+        if not job:
+            time.sleep(WORKER_IDLE_SLEEP_SECONDS)
+    log(f"Worker loop stopped ({WORKER_ID})")
 
 
 @app.route("/")
@@ -1347,7 +1623,7 @@ def index():
 
 @app.get("/healthz")
 def healthz():
-    return jsonify({"ok": True, "running": running})
+    return jsonify({"ok": True, "worker_running": worker_running, "app_role": APP_ROLE})
 
 
 @app.get("/api/meta")
@@ -1357,6 +1633,8 @@ def api_meta():
             "app_version": APP_VERSION,
             "release_channel": RELEASE_CHANNEL,
             "python_version": os.sys.version.split()[0],
+            "app_role": APP_ROLE,
+            "embedded_worker_enabled": ENABLE_EMBEDDED_WORKER,
         }
     )
 
@@ -1613,7 +1891,8 @@ def api_dashboard_summary():
             "events_last_24h": events_24h,
             "events_last_7d": events_7d,
             "delivery_success_rate": round(success_rate, 4),
-            "running": running,
+            "worker_running": worker_running,
+            "app_role": APP_ROLE,
         }
     )
 
@@ -2054,21 +2333,41 @@ def api_delete_schedule(schedule_id: int):
 @app.post("/api/start")
 @require_auth
 def api_start():
-    global running, monitor_thread
-    if running:
-        return jsonify({"ok": True, "running": True})
-    running = True
-    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-    monitor_thread.start()
-    return jsonify({"ok": True, "running": True})
+    global worker_running, worker_thread
+    if not ENABLE_EMBEDDED_WORKER:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Embedded worker disabled. Use APP_ROLE=worker and external process management.",
+                }
+            ),
+            409,
+        )
+    if worker_running:
+        return jsonify({"ok": True, "worker_running": True, "mode": "embedded"})
+    worker_running = True
+    worker_thread = threading.Thread(target=worker_loop, daemon=True)
+    worker_thread.start()
+    return jsonify({"ok": True, "worker_running": True, "mode": "embedded"})
 
 
 @app.post("/api/stop")
 @require_auth
 def api_stop():
-    global running
-    running = False
-    return jsonify({"ok": True, "running": False})
+    global worker_running
+    if not ENABLE_EMBEDDED_WORKER:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Embedded worker disabled. Stop worker process via external supervisor.",
+                }
+            ),
+            409,
+        )
+    worker_running = False
+    return jsonify({"ok": True, "worker_running": False, "mode": "embedded"})
 
 
 if __name__ == "__main__":
@@ -2077,4 +2376,14 @@ if __name__ == "__main__":
         "Legal/ethical note: this project provides stock monitoring + alerts only. Auto-checkout is intentionally not implemented.",
         level="warning",
     )
-    socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
+    if APP_ROLE == "worker":
+        worker_running = True
+        worker_loop()
+    elif APP_ROLE == "all":
+        if ENABLE_EMBEDDED_WORKER:
+            worker_running = True
+            worker_thread = threading.Thread(target=worker_loop, daemon=True)
+            worker_thread.start()
+        socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
+    else:
+        socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
