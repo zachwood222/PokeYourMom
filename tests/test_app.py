@@ -1431,6 +1431,24 @@ def test_init_db_creates_checkout_tables(tmp_path, monkeypatch):
     assert tables == {"checkout_tasks", "checkout_attempts", "task_logs"}
 
 
+def test_init_db_creates_proxy_tables(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    conn = app_module.db()
+    tables = {
+        row["name"]
+        for row in conn.execute(
+            "select name from sqlite_master where type = 'table' and name in ('proxies', 'proxy_leases')"
+        ).fetchall()
+    }
+    monitor_columns = {row["name"] for row in conn.execute("pragma table_info(monitors)").fetchall()}
+    conn.close()
+
+    assert tables == {"proxies", "proxy_leases"}
+    assert {"proxy_type", "proxy_region", "proxy_residential_only", "proxy_sticky_session_seconds"}.issubset(
+        monitor_columns
+    )
+
+
 def test_check_monitor_enqueues_checkout_task_for_eligible_stock(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
