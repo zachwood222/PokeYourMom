@@ -24,6 +24,27 @@ python app.py
 
 Then open `http://localhost:5000`.
 
+## CI checks locally
+
+Run the same commands used in CI:
+
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+pip install pytest ruff
+ruff check tests
+python -m compileall -q app.py tests
+pytest -q tests
+pytest -q tests/test_billing_schema.py::test_init_db_creates_billing_tables_and_columns
+pytest -q tests/test_app.py::test_init_db_migrates_existing_monitors_table_with_msrp_column
+```
+
+The last two commands are explicit migration-safety checks for:
+
+- fresh database creation via `init_db()`,
+- legacy `monitors` schema upgrade behavior (including `msrp_cents` migration).
+
+
 ## API quick start
 
 - API authentication is required for all `/api/*` routes.
