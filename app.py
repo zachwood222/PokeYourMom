@@ -9,15 +9,21 @@ import threading
 import time
 import hashlib
 import hmac
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Any, Callable
+from typing import Any
 from uuid import uuid4
 
 import requests
 from flask import Flask, g, has_request_context, jsonify, render_template, request
 from flask_socketio import SocketIO
+from retailers import (
+    MonitorResult,
+    canonical_retailer,
+    default_parser,
+    resolve_retailer_adapter,
+    run_retailer_flow,
+)
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
@@ -44,13 +50,6 @@ PLAN_LOOKUP_TO_INTERNAL_PLAN = {
     "team": "team",
 }
 SUPPORTED_RETAILERS = {"walmart", "target", "bestbuy", "pokemoncenter"}
-RETAILER_ALIASES = {
-    "pokemon-center": "pokemoncenter",
-    "pokemon_center": "pokemoncenter",
-    "pokemon center": "pokemoncenter",
-    "pokemoncenter": "pokemoncenter",
-}
-
 DEFAULT_WORKSPACE = {
     "name": "My Workspace",
     "plan": DEFAULT_PLAN if DEFAULT_PLAN in PLAN_LIMITS else "basic",
@@ -69,24 +68,6 @@ running = False
 monitor_thread: threading.Thread | None = None
 lock = threading.Lock()
 
-
-@dataclass
-class MonitorResult:
-    in_stock: bool
-    price_cents: int | None
-    title: str
-    status_text: str
-    availability_reason: str | None = None
-    parser_confidence: float | None = None
-    keyword_matched: bool | None = None
-    price_within_limit: bool | None = None
-    within_msrp_delta: bool | None = None
-
-
-@dataclass(frozen=True)
-class RetailerParser:
-    name: str
-    parse: Callable[[str, str | None], MonitorResult]
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -703,6 +684,9 @@ def map_subscription_to_internal_plan(
 
 
 def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return sync_manual_billing_subscription_event(payload)
+
+
 def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str, Any]:
     provider = (payload.get("provider") or "stripe").strip().lower()
     subscription_id = (payload.get("provider_subscription_id") or "").strip()
@@ -815,212 +799,15 @@ def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str,
     return {"workspace_id": workspace_id, "plan": internal_plan, "status": status}
 
 
-def extract_price_cents(text: str) -> int | None:
-    matches = re.findall(r"\$\s*(\d{1,4}(?:\.\d{2})?)", text)
-    if not matches:
-        return None
-    values = []
-    for m in matches:
-        try:
-            v = float(m)
-            if 1.0 <= v <= 2000.0:
-                values.append(int(round(v * 100)))
-        except ValueError:
-            continue
-    return min(values) if values else None
-
-
-def canonical_retailer(retailer: str) -> str:
-    value = retailer.strip().lower()
-    return RETAILER_ALIASES.get(value, value)
-
-
-def _parse_common_title_and_text(html: str) -> tuple[str, str]:
-    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
-    title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "Product"
-    text = re.sub(r"<[^>]+>", " ", html).lower()
-    return title[:180], text
-
-
-def default_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-
-    out_markers = [
-        "out of stock",
-        "sold out",
-        "unavailable",
-        "not available",
-        "coming soon",
-        "temporarily out of stock",
-    ]
-    in_markers = [
-        "in stock",
-        "add to cart",
-        "buy now",
-        "pickup",
-        "ship it",
-    ]
-
-    has_out = any(m in text for m in out_markers)
-    has_in = any(m in text for m in in_markers)
-
-    in_stock = has_in and not has_out
-    availability_reason = "fallback_unknown"
-    parser_confidence = 0.2
-    if has_out and not has_in:
-        availability_reason = "marker_out_of_stock"
-        parser_confidence = 0.9
-    elif has_in and not has_out:
-        availability_reason = "marker_in_stock"
-        parser_confidence = 0.9
-    elif has_in and has_out:
-        availability_reason = "marker_conflict"
-        parser_confidence = 0.35
-    keyword_matched: bool | None = None
-    if keyword:
-        keyword_matched = keyword.lower() in text
-    price_cents = extract_price_cents(re.sub(r"<[^>]+>", " ", html))
-    status_text = "in_stock" if in_stock else "out_or_unknown"
-    return MonitorResult(
-        in_stock=in_stock,
-        price_cents=price_cents,
-        title=title[:180],
-        status_text=status_text,
-        availability_reason=availability_reason,
-        parser_confidence=parser_confidence,
-        keyword_matched=keyword_matched,
-    )
-
-
-def pokemoncenter_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-    result = default_parser(html, keyword=keyword)
-    out_markers = ["notify me when available", "currently unavailable"]
-    in_markers = ["add to bag"]
-    has_out = any(m in text for m in out_markers)
-    has_in = any(m in text for m in in_markers)
-    if has_out:
-        result.in_stock = False
-        result.status_text = "out_or_unknown"
-        result.availability_reason = "pokemoncenter_marker_out_of_stock"
-        result.parser_confidence = 0.98
-    elif has_in:
-        result.in_stock = True
-        result.status_text = "in_stock"
-        result.availability_reason = "pokemoncenter_marker_in_stock"
-        result.parser_confidence = 0.98
-    result.title = title
-    return result
-
-
-def walmart_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-    result = default_parser(html, keyword=keyword)
-    if '"availability":"instock"' in text or "fulfillmentoptions" in text:
-        result.in_stock = True
-        result.status_text = "in_stock"
-        result.availability_reason = "walmart_marker_in_stock"
-        result.parser_confidence = 0.98
-    if '"availability":"outofstock"' in text or "out of stock" in text:
-        result.in_stock = False
-        result.status_text = "out_or_unknown"
-        result.availability_reason = "walmart_marker_out_of_stock"
-        result.parser_confidence = 0.98
-    result.price_cents = extract_price_cents(html)
-    result.title = title
-    return result
-
-
-def target_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-    result = default_parser(html, keyword=keyword)
-
-    in_markers = [
-        '"availability":"instock"',
-        '"availability":"in_stock"',
-        "add to cart",
-        "ship it",
-        "pick up",
-    ]
-    out_markers = [
-        '"availability":"outofstock"',
-        '"availability":"out_of_stock"',
-        "out of stock",
-        "sold out",
-        "unavailable",
-    ]
-    has_in = any(marker in text for marker in in_markers)
-    has_out = any(marker in text for marker in out_markers)
-
-    if has_out:
-        result.in_stock = False
-        result.status_text = "out_or_unknown"
-        result.availability_reason = "target_marker_out_of_stock"
-        result.parser_confidence = 0.98
-    elif has_in:
-        result.in_stock = True
-        result.status_text = "in_stock"
-        result.availability_reason = "target_marker_in_stock"
-        result.parser_confidence = 0.98
-
-    result.price_cents = extract_price_cents(html)
-    result.title = title
-    return result
-
-
-def bestbuy_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-    result = default_parser(html, keyword=keyword)
-
-    in_markers = [
-        '"buttonstate":"add to cart"',
-        '"shipping":"available"',
-        "ready for pickup today",
-    ]
-    out_markers = [
-        '"buttonstate":"sold out"',
-        '"buttonstate":"coming soon"',
-        '"shipping":"unavailable"',
-        "sold out",
-        "coming soon",
-    ]
-    has_in = any(marker in text for marker in in_markers)
-    has_out = any(marker in text for marker in out_markers)
-
-    if has_out:
-        result.in_stock = False
-        result.status_text = "out_or_unknown"
-        result.availability_reason = "bestbuy_marker_out_of_stock"
-        result.parser_confidence = 0.98
-    elif has_in:
-        result.in_stock = True
-        result.status_text = "in_stock"
-        result.availability_reason = "bestbuy_marker_in_stock"
-        result.parser_confidence = 0.98
-
-    result.price_cents = extract_price_cents(html)
-    result.title = title
-    return result
-
-
-PARSERS: dict[str, RetailerParser] = {
-    "walmart": RetailerParser(name="walmart", parse=walmart_parser),
-    "target": RetailerParser(name="target", parse=target_parser),
-    "bestbuy": RetailerParser(name="bestbuy", parse=bestbuy_parser),
-    "pokemoncenter": RetailerParser(name="pokemoncenter", parse=pokemoncenter_parser),
-}
-
-
-def get_parser_for_retailer(retailer: str | None) -> RetailerParser:
-    normalized = canonical_retailer(retailer) if retailer else ""
-    return PARSERS.get(normalized, RetailerParser(name="default", parse=default_parser))
+def get_adapter_for_retailer(retailer: str | None):
+    return resolve_retailer_adapter(retailer)
 
 
 def evaluate_page(
     html: str, keyword: str | None = None, retailer: str | None = None
 ) -> MonitorResult:
-    parser = get_parser_for_retailer(retailer)
-    return parser.parse(html, keyword)
+    adapter = get_adapter_for_retailer(retailer)
+    return run_retailer_flow(adapter, {"html": html, "keyword": keyword})
 
 
 def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:

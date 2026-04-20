@@ -593,18 +593,18 @@ def test_webhook_health_trends_scoped_to_workspace(tmp_path, monkeypatch):
     assert payload["webhooks"][0]["recent_failures_7d"] == 1
 
 
-def test_parser_dispatch_uses_walmart_and_fallback(tmp_path, monkeypatch):
+def test_adapter_dispatch_uses_walmart_and_fallback(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
 
-    walmart_parser = app_module.get_parser_for_retailer("walmart")
-    target_parser = app_module.get_parser_for_retailer("target")
-    bestbuy_parser = app_module.get_parser_for_retailer("bestbuy")
-    fallback_parser = app_module.get_parser_for_retailer("unknown-retailer")
+    walmart_adapter = app_module.get_adapter_for_retailer("walmart")
+    target_adapter = app_module.get_adapter_for_retailer("target")
+    bestbuy_adapter = app_module.get_adapter_for_retailer("bestbuy")
+    fallback_adapter = app_module.get_adapter_for_retailer("unknown-retailer")
 
-    assert walmart_parser.name == "walmart"
-    assert target_parser.name == "target"
-    assert bestbuy_parser.name == "bestbuy"
-    assert fallback_parser.name == "default"
+    assert walmart_adapter.name == "walmart"
+    assert target_adapter.name == "target"
+    assert bestbuy_adapter.name == "bestbuy"
+    assert fallback_adapter.name == "default"
 
 
 def test_walmart_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch):
