@@ -19,6 +19,8 @@ import requests
 from flask import Flask, g, has_request_context, jsonify, render_template, request
 from flask_socketio import SocketIO
 
+from network.session_manager import RequestResult, SessionManager
+
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
@@ -68,6 +70,7 @@ DEFAULT_USER = {
 running = False
 monitor_thread: threading.Thread | None = None
 lock = threading.Lock()
+session_manager = SessionManager()
 
 
 @dataclass
@@ -306,6 +309,8 @@ def init_db() -> None:
             id integer primary key autoincrement,
             name text not null,
             plan text not null,
+            proxy_url text,
+            session_metadata text,
             subscription_status text not null default 'inactive',
             subscription_source text not null default 'manual',
             subscription_updated_at text,
@@ -343,6 +348,9 @@ def init_db() -> None:
             last_checked_at text,
             last_in_stock integer,
             last_price_cents integer,
+            proxy_url text,
+            session_task_key text,
+            session_metadata text,
             created_at text not null,
             foreign key(workspace_id) references workspaces(id)
         );
@@ -509,8 +517,47 @@ def init_db() -> None:
     ensure_column(conn, "workspaces", "subscription_status", "text not null default 'inactive'")
     ensure_column(conn, "workspaces", "subscription_source", "text not null default 'manual'")
     ensure_column(conn, "workspaces", "subscription_updated_at", "text")
+    ensure_column(conn, "workspaces", "proxy_url", "text")
+    ensure_column(conn, "workspaces", "session_metadata", "text")
+    ensure_column(conn, "monitors", "proxy_url", "text")
+    ensure_column(conn, "monitors", "session_task_key", "text")
+    ensure_column(conn, "monitors", "session_metadata", "text")
     conn.commit()
     conn.close()
+
+
+def perform_request(
+    *,
+    task_key: str,
+    method: str,
+    url: str,
+    workspace_id: int | None,
+    proxy_url: str | None,
+    timeout: float,
+    retry_total: int,
+    backoff_factor: float,
+    **kwargs: Any,
+) -> RequestResult:
+    result = session_manager.request(
+        task_key=task_key,
+        method=method,
+        url=url,
+        workspace_id=workspace_id,
+        proxy_url=proxy_url,
+        timeout=timeout,
+        retry_total=retry_total,
+        backoff_factor=backoff_factor,
+        **kwargs,
+    )
+    telemetry = result.telemetry
+    level = "warning" if not telemetry.ok else "info"
+    log(
+        f"http_request task={telemetry.task_key} method={method.upper()} status={telemetry.status_code} "
+        f"latency_ms={telemetry.latency_ms} error_class={telemetry.error_class}",
+        level=level,
+        workspace_id=workspace_id,
+    )
+    return result
 
 
 def current_workspace_id() -> int:
@@ -703,7 +750,6 @@ def map_subscription_to_internal_plan(
 
 
 def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
-def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str, Any]:
     provider = (payload.get("provider") or "stripe").strip().lower()
     subscription_id = (payload.get("provider_subscription_id") or "").strip()
     customer_id = (payload.get("provider_customer_id") or "").strip() or None
@@ -1028,7 +1074,26 @@ def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
         "User-Agent": "Mozilla/5.0 (compatible; StockSentinel/1.0; +https://example.com)",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    r = requests.get(monitor["product_url"], headers=headers, timeout=15)
+    conn = db()
+    workspace = conn.execute("select proxy_url from workspaces where id = ?", (monitor["workspace_id"],)).fetchone()
+    conn.close()
+    proxy_url = monitor["proxy_url"] or (workspace["proxy_url"] if workspace else None)
+    task_key = monitor["session_task_key"] or f"monitor-{monitor['id']}"
+    req = perform_request(
+        task_key=task_key,
+        method="GET",
+        url=monitor["product_url"],
+        workspace_id=monitor["workspace_id"],
+        proxy_url=proxy_url,
+        timeout=15,
+        retry_total=2,
+        backoff_factor=0.35,
+        headers=headers,
+    )
+    if req.error:
+        raise req.error
+    assert req.response is not None
+    r = req.response
     r.raise_for_status()
     keyword = (monitor["keyword"] or "").strip() or None
     return evaluate_page(r.text, keyword=keyword, retailer=monitor["retailer"])
@@ -1135,7 +1200,21 @@ def create_event_and_deliver(
             continue
         status, code, body = "queued", None, ""
         try:
-            resp = requests.post(hook["webhook_url"], json=payload, timeout=8)
+            req = perform_request(
+                task_key=f"webhook-{hook['id']}",
+                method="POST",
+                url=hook["webhook_url"],
+                workspace_id=monitor["workspace_id"],
+                proxy_url=None,
+                timeout=8,
+                retry_total=1,
+                backoff_factor=0.2,
+                json=payload,
+            )
+            if req.error:
+                raise req.error
+            assert req.response is not None
+            resp = req.response
             code = resp.status_code
             body = (resp.text or "")[:1000]
             status = "sent" if 200 <= resp.status_code < 300 else "failed"
@@ -1401,7 +1480,20 @@ def resolve_latest_version() -> tuple[str, str | None]:
         return fallback_version, "update_check_url_not_configured"
 
     try:
-        resp = requests.get(UPDATE_CHECK_URL, timeout=UPDATE_CHECK_TIMEOUT_SECONDS)
+        req = perform_request(
+            task_key="meta-update-check",
+            method="GET",
+            url=UPDATE_CHECK_URL,
+            workspace_id=None,
+            proxy_url=None,
+            timeout=UPDATE_CHECK_TIMEOUT_SECONDS,
+            retry_total=1,
+            backoff_factor=0.1,
+        )
+        if req.error:
+            raise req.error
+        assert req.response is not None
+        resp = req.response
         resp.raise_for_status()
         latest = parse_latest_version_from_response(resp)
         return latest, None
@@ -1522,7 +1614,6 @@ def api_sync_billing_subscription_event():
     }
     try:
         result = sync_billing_subscription_payload(payload)
-        result = sync_manual_billing_subscription_event(payload)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"ok": True, **result})
@@ -1894,7 +1985,21 @@ def api_test_webhook(webhook_id: int):
     started = time.perf_counter()
     conn = db()
     try:
-        resp = requests.post(hook["webhook_url"], json=payload, timeout=8)
+        req = perform_request(
+            task_key=f"webhook-test-{webhook_id}",
+            method="POST",
+            url=hook["webhook_url"],
+            workspace_id=current_workspace_id(),
+            proxy_url=None,
+            timeout=8,
+            retry_total=1,
+            backoff_factor=0.2,
+            json=payload,
+        )
+        if req.error:
+            raise req.error
+        assert req.response is not None
+        resp = req.response
         ok = 200 <= resp.status_code < 300
         status = "sent" if ok else "failed"
         body = (resp.text or "")[:500]
