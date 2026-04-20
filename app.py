@@ -7,23 +7,35 @@ import secrets
 import sqlite3
 import threading
 import time
+import traceback
 import hashlib
 import hmac
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Any, Callable
+from typing import Any
 from uuid import uuid4
 
 import requests
 from flask import Flask, g, has_request_context, jsonify, render_template, request
 from flask_socketio import SocketIO
+from retailers import (
+    MonitorResult,
+    canonical_retailer,
+    default_parser,
+    resolve_retailer_adapter,
+    run_retailer_flow,
+)
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 POLL_LOOP_SECONDS = int(os.getenv("POLL_LOOP_SECONDS", "15"))
+WORKER_IDLE_SLEEP_SECONDS = float(os.getenv("WORKER_IDLE_SLEEP_SECONDS", "2.0"))
+WORKER_LOCK_TIMEOUT_SECONDS = int(os.getenv("WORKER_LOCK_TIMEOUT_SECONDS", "60"))
+WORKER_ID = os.getenv("WORKER_ID", f"worker-{uuid4()}")
+APP_ROLE = os.getenv("APP_ROLE", "api").lower()
+ENABLE_EMBEDDED_WORKER = os.getenv("ENABLE_EMBEDDED_WORKER", "0") == "1"
 DEFAULT_PLAN = os.getenv("DEFAULT_PLAN", "basic")
 POKEMON_MSRP_BUFFER_CENTS = int(os.getenv("POKEMON_MSRP_BUFFER_CENTS", "1000"))
 APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
@@ -45,13 +57,6 @@ PLAN_LOOKUP_TO_INTERNAL_PLAN = {
     "team": "team",
 }
 SUPPORTED_RETAILERS = {"walmart", "target", "bestbuy", "pokemoncenter"}
-RETAILER_ALIASES = {
-    "pokemon-center": "pokemoncenter",
-    "pokemon_center": "pokemoncenter",
-    "pokemon center": "pokemoncenter",
-    "pokemoncenter": "pokemoncenter",
-}
-
 DEFAULT_WORKSPACE = {
     "name": "My Workspace",
     "plan": DEFAULT_PLAN if DEFAULT_PLAN in PLAN_LIMITS else "basic",
@@ -66,31 +71,36 @@ DEFAULT_USER = {
     "name": "Local Developer",
 }
 
-running = False
-monitor_thread: threading.Thread | None = None
-lock = threading.Lock()
-task_runtime_lock = threading.Lock()
-task_threads: dict[int, threading.Thread] = {}
-task_stop_events: dict[int, threading.Event] = {}
+worker_running = False
+worker_thread: threading.Thread | None = None
+worker_lock = threading.Lock()
+
+CHECKOUT_TASK_STATES = {
+    "queued",
+    "monitoring",
+    "carting",
+    "shipping",
+    "payment",
+    "submitting",
+    "success",
+    "failed",
+    "paused",
+    "stopped",
+}
+
 
 
 @dataclass
-class MonitorResult:
-    in_stock: bool
-    price_cents: int | None
-    title: str
-    status_text: str
-    availability_reason: str | None = None
-    parser_confidence: float | None = None
-    keyword_matched: bool | None = None
-    price_within_limit: bool | None = None
-    within_msrp_delta: bool | None = None
-
-
-@dataclass(frozen=True)
-class RetailerParser:
-    name: str
-    parse: Callable[[str, str | None], MonitorResult]
+class Job:
+    id: int
+    job_type: str
+    monitor_id: int | None
+    status: str
+    attempt_count: int
+    next_run_at: str
+    locked_by: str | None
+    locked_at: str | None
+    payload_json: str | None
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -416,6 +426,53 @@ def init_db() -> None:
             foreign key(workspace_id) references workspaces(id)
         );
 
+        create table if not exists checkout_tasks (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            task_name text,
+            task_config text,
+            current_state text not null default 'queued',
+            enabled integer not null default 0,
+            is_paused integer not null default 0,
+            last_error text,
+            created_at text not null,
+            updated_at text not null,
+            last_transition_at text,
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id)
+        );
+
+        create table if not exists checkout_attempts (
+            id integer primary key autoincrement,
+            task_id integer not null,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            state text not null,
+            status text not null,
+            details text,
+            error_text text,
+            created_at text not null,
+            foreign key(task_id) references checkout_tasks(id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id)
+        );
+
+        create table if not exists task_logs (
+            id integer primary key autoincrement,
+            task_id integer not null,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            level text not null,
+            event_type text not null,
+            message text not null,
+            payload text,
+            created_at text not null,
+            foreign key(task_id) references checkout_tasks(id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id)
+        );
+
         create table if not exists billing_customers (
             id integer primary key autoincrement,
             workspace_id integer not null,
@@ -463,36 +520,60 @@ def init_db() -> None:
             foreign key(workspace_id) references workspaces(id)
         );
 
-        create table if not exists tasks (
+        create table if not exists checkout_profiles (
             id integer primary key autoincrement,
             workspace_id integer not null,
-            retailer text not null,
-            product_url text not null,
-            profile text not null,
-            account text not null,
-            payment text not null,
-            state text not null default 'idle',
-            retries integer not null default 0,
-            last_step text,
-            last_error text,
+            name text not null,
+            email text not null,
+            phone text,
+            shipping_address_json text not null,
+            billing_address_json text not null,
             created_at text not null,
             updated_at text not null,
-            started_at text,
-            stopped_at text,
             foreign key(workspace_id) references workspaces(id)
         );
 
-        create table if not exists task_attempts (
+        create table if not exists payment_methods (
             id integer primary key autoincrement,
-            task_id integer not null,
             workspace_id integer not null,
-            attempt_number integer not null,
-            state text not null,
-            step text,
-            error text,
+            label text not null,
+            provider text,
+            token_reference text not null,
+            billing_profile_id integer,
             created_at text not null,
-            foreign key(task_id) references tasks(id),
+            updated_at text not null,
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(billing_profile_id) references checkout_profiles(id)
+        );
+
+        create table if not exists retailer_accounts (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            retailer text not null,
+            username text,
+            email text,
+            encrypted_credential_ref text not null,
+            session_status text not null default 'logged_out',
+            created_at text not null,
+            updated_at text not null,
             foreign key(workspace_id) references workspaces(id)
+        );
+
+        create table if not exists task_profile_bindings (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            checkout_profile_id integer,
+            retailer_account_id integer,
+            payment_method_id integer,
+            created_at text not null,
+            updated_at text not null,
+            unique(workspace_id, monitor_id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id),
+            foreign key(checkout_profile_id) references checkout_profiles(id),
+            foreign key(retailer_account_id) references retailer_accounts(id),
+            foreign key(payment_method_id) references payment_methods(id)
         );
         """
     )
@@ -545,6 +626,10 @@ def init_db() -> None:
     ensure_column(conn, "workspaces", "subscription_status", "text not null default 'inactive'")
     ensure_column(conn, "workspaces", "subscription_source", "text not null default 'manual'")
     ensure_column(conn, "workspaces", "subscription_updated_at", "text")
+    ensure_column(conn, "jobs", "job_type", "text not null default 'monitor_check'")
+    ensure_column(conn, "jobs", "monitor_id", "integer")
+    ensure_column(conn, "jobs", "payload_json", "text")
+    ensure_column(conn, "jobs", "last_error", "text")
     conn.commit()
     conn.close()
 
@@ -854,6 +939,10 @@ def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str,
     return {"workspace_id": workspace_id, "plan": internal_plan, "status": status}
 
 
+def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return sync_manual_billing_subscription_event(payload)
+
+
 def extract_price_cents(text: str) -> int | None:
     matches = re.findall(r"\$\s*(\d{1,4}(?:\.\d{2})?)", text)
     if not matches:
@@ -1058,8 +1147,8 @@ def get_parser_for_retailer(retailer: str | None) -> RetailerParser:
 def evaluate_page(
     html: str, keyword: str | None = None, retailer: str | None = None
 ) -> MonitorResult:
-    parser = get_parser_for_retailer(retailer)
-    return parser.parse(html, keyword)
+    adapter = get_adapter_for_retailer(retailer)
+    return run_retailer_flow(adapter, {"html": html, "keyword": keyword})
 
 
 def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
@@ -1201,93 +1290,341 @@ def create_event_and_deliver(
     )
 
 
+def normalize_checkout_state(raw_state: Any, *, allow_control_states: bool = True) -> str:
+    state = str(raw_state or "").strip().lower()
+    valid_states = CHECKOUT_TASK_STATES if allow_control_states else CHECKOUT_TASK_STATES - {"paused", "stopped"}
+    if state not in valid_states:
+        raise ValueError(
+            "Invalid checkout state. Expected one of: queued, monitoring, carting, shipping, payment, submitting, success, failed"
+        )
+    return state
+
+
+def record_checkout_attempt(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    workspace_id: int,
+    monitor_id: int,
+    state: str,
+    status: str,
+    details: dict[str, Any] | None = None,
+    error_text: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        insert into checkout_attempts(task_id, workspace_id, monitor_id, state, status, details, error_text, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            workspace_id,
+            monitor_id,
+            state,
+            status,
+            json.dumps(details or {}),
+            (error_text or "")[:500] if error_text else None,
+            utc_now(),
+        ),
+    )
+
+
+def record_task_log(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    workspace_id: int,
+    monitor_id: int,
+    level: str,
+    event_type: str,
+    message: str,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    conn.execute(
+        """
+        insert into task_logs(task_id, workspace_id, monitor_id, level, event_type, message, payload, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            workspace_id,
+            monitor_id,
+            level.lower(),
+            event_type,
+            message,
+            json.dumps(payload or {}),
+            utc_now(),
+        ),
+    )
+
+
+def create_checkout_task(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: int,
+    monitor_id: int,
+    task_name: str | None = None,
+    task_config: dict[str, Any] | None = None,
+    initial_state: str = "queued",
+) -> sqlite3.Row:
+    normalized_state = normalize_checkout_state(initial_state, allow_control_states=False)
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into checkout_tasks(
+            workspace_id,
+            monitor_id,
+            task_name,
+            task_config,
+            current_state,
+            enabled,
+            is_paused,
+            created_at,
+            updated_at,
+            last_transition_at
+        )
+        values (?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+        """,
+        (workspace_id, monitor_id, task_name, json.dumps(task_config or {}), normalized_state, now_iso, now_iso, now_iso),
+    )
+    task_id = cur.lastrowid
+    record_checkout_attempt(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        monitor_id=monitor_id,
+        state=normalized_state,
+        status="created",
+        details={"reason": "api_create"},
+    )
+    record_task_log(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        monitor_id=monitor_id,
+        level="info",
+        event_type="task_created",
+        message=f"Checkout task {task_id} created",
+        payload={"initial_state": normalized_state},
+    )
+    return conn.execute("select * from checkout_tasks where id = ?", (task_id,)).fetchone()
+
+
+def get_checkout_task_for_workspace(
+    conn: sqlite3.Connection, task_id: int, workspace_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from checkout_tasks where id = ? and workspace_id = ?",
+        (task_id, workspace_id),
+    ).fetchone()
+
+
+def transition_checkout_task(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    workspace_id: int,
+    requested_state: str,
+    reason: str,
+    error_text: str | None = None,
+) -> sqlite3.Row | None:
+    row = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+    if not row:
+        return None
+
+    normalized_state = normalize_checkout_state(requested_state)
+    enabled = int(normalized_state not in {"stopped", "success", "failed"})
+    is_paused = int(normalized_state == "paused")
+    now_iso = utc_now()
+    conn.execute(
+        """
+        update checkout_tasks
+        set current_state = ?,
+            enabled = ?,
+            is_paused = ?,
+            last_error = ?,
+            updated_at = ?,
+            last_transition_at = ?
+        where id = ? and workspace_id = ?
+        """,
+        (
+            normalized_state,
+            enabled,
+            is_paused,
+            (error_text or "")[:500] if error_text else None,
+            now_iso,
+            now_iso,
+            task_id,
+            workspace_id,
+        ),
+    )
+    record_checkout_attempt(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        monitor_id=row["monitor_id"],
+        state=normalized_state,
+        status="transition",
+        details={"reason": reason},
+        error_text=error_text,
+    )
+    record_task_log(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        monitor_id=row["monitor_id"],
+        level="info" if not error_text else "error",
+        event_type="state_transition",
+        message=f"Task transitioned to {normalized_state}",
+        payload={"reason": reason},
+    )
+    return get_checkout_task_for_workspace(conn, task_id, workspace_id)
+
+
+def enqueue_checkout_for_monitor(
+    monitor: sqlite3.Row, result: MonitorResult, *, reason: str = "in_stock_detected"
+) -> int | None:
+    if not result.in_stock:
+        return None
+    conn = db()
+    existing = conn.execute(
+        """
+        select * from checkout_tasks
+        where workspace_id = ? and monitor_id = ?
+          and current_state not in ('success', 'failed', 'stopped')
+        order by id desc
+        limit 1
+        """,
+        (monitor["workspace_id"], monitor["id"]),
+    ).fetchone()
+    if existing:
+        record_task_log(
+            conn,
+            task_id=existing["id"],
+            workspace_id=monitor["workspace_id"],
+            monitor_id=monitor["id"],
+            level="info",
+            event_type="enqueue_skipped_existing",
+            message=f"Existing active checkout task {existing['id']} detected",
+            payload={"reason": reason},
+        )
+        conn.commit()
+        conn.close()
+        return existing["id"]
+
+    task = create_checkout_task(
+        conn,
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+        task_name=f"Monitor {monitor['id']} checkout",
+        task_config={"retailer": monitor["retailer"], "product_url": monitor["product_url"]},
+        initial_state="queued",
+    )
+    record_checkout_attempt(
+        conn,
+        task_id=task["id"],
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+        state="queued",
+        status="enqueued",
+        details={
+            "reason": reason,
+            "title": result.title,
+            "price_cents": result.price_cents,
+        },
+    )
+    record_task_log(
+        conn,
+        task_id=task["id"],
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+        level="warning",
+        event_type="task_enqueued",
+        message=f"Checkout task {task['id']} enqueued from monitor {monitor['id']}",
+        payload={"price_cents": result.price_cents, "title": result.title},
+    )
+    conn.commit()
+    conn.close()
+    return int(task["id"])
+
+
 def cents_to_dollars(cents: int | None) -> str:
     if cents is None:
         return "unknown"
     return f"${cents / 100:.2f}"
 
 
-def serialize_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
+def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
-    return dict(row)
-
-
-def get_task_for_workspace(conn: sqlite3.Connection, task_id: int, workspace_id: int) -> sqlite3.Row | None:
-    return conn.execute(
-        "select * from tasks where id = ? and workspace_id = ?",
-        (task_id, workspace_id),
-    ).fetchone()
-
-
-def emit_task_update(task_id: int) -> None:
-    conn = db()
-    row = conn.execute("select * from tasks where id = ?", (task_id,)).fetchone()
-    conn.close()
-    if row:
-        socketio.emit("task_update", dict(row))
-
-
-def emit_task_attempt(task_id: int, attempt_id: int) -> None:
-    conn = db()
-    row = conn.execute("select * from task_attempts where id = ?", (attempt_id,)).fetchone()
-    conn.close()
-    if row:
-        socketio.emit("task_attempt", dict(row))
-
-
-def set_task_state(
-    conn: sqlite3.Connection,
-    task_id: int,
-    *,
-    state: str,
-    retries: int | None = None,
-    last_step: str | None = None,
-    last_error: str | None = None,
-    started_at: str | None = None,
-    stopped_at: str | None = None,
-) -> None:
-    now_iso = utc_now()
-    conn.execute(
-        """
-        update tasks
-        set state = ?,
-            retries = coalesce(?, retries),
-            last_step = ?,
-            last_error = ?,
-            updated_at = ?,
-            started_at = coalesce(?, started_at),
-            stopped_at = ?
-        where id = ?
-        """,
-        (state, retries, last_step, last_error, now_iso, started_at, stopped_at, task_id),
-    )
-
-
-def insert_task_attempt(
-    conn: sqlite3.Connection,
-    *,
-    task_id: int,
-    workspace_id: int,
-    attempt_number: int,
-    state: str,
-    step: str | None,
-    error: str | None,
-) -> int:
-    cur = conn.execute(
-        """
-        insert into task_attempts(task_id, workspace_id, attempt_number, state, step, error, created_at)
-        values (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (task_id, workspace_id, attempt_number, state, step, error, utc_now()),
-    )
-    return int(cur.lastrowid)
+    payload = dict(row)
+    config_raw = payload.get("task_config")
+    try:
+        payload["task_config"] = json.loads(config_raw) if config_raw else {}
+    except (TypeError, json.JSONDecodeError):
+        payload["task_config"] = {}
+    return payload
 
 
 def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     return dict(row)
+
+
+def serialize_checkout_profile(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    payload["shipping_address"] = json.loads(payload.pop("shipping_address_json"))
+    payload["billing_address"] = json.loads(payload.pop("billing_address_json"))
+    return payload
+
+
+def serialize_payment_method(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return dict(row)
+
+
+def serialize_retailer_account(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return dict(row)
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PHONE_RE = re.compile(r"^[0-9+\-().\s]{7,24}$")
+SESSION_STATUSES = {"active", "expired", "locked", "logged_out"}
+
+
+def _validate_email(email: str) -> str:
+    normalized = email.strip().lower()
+    if not EMAIL_RE.match(normalized):
+        raise ValueError("Invalid email")
+    return normalized
+
+
+def _validate_phone(phone: str | None) -> str | None:
+    if phone is None:
+        return None
+    normalized = phone.strip()
+    if not normalized:
+        return None
+    if not PHONE_RE.match(normalized):
+        raise ValueError("Invalid phone")
+    return normalized
+
+
+def _validate_address(value: Any, field_name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be an object")
+    required = ("line1", "city", "state", "postal_code", "country")
+    for key in required:
+        raw = value.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError(f"{field_name}.{key} is required")
+    return {k: (v.strip() if isinstance(v, str) else v) for k, v in value.items()}
 
 
 def should_send_to_webhook(monitor: sqlite3.Row, hook: sqlite3.Row, eligible: bool) -> bool:
@@ -1346,9 +1683,73 @@ def create_monitor_error_events(monitor: sqlite3.Row, error_text: str) -> None:
     )
 
 
+STEP_RETRY_POLICY = {
+    "fetch": {"max_attempts": 5, "base_seconds": 5},
+    "persist": {"max_attempts": 4, "base_seconds": 2},
+    "notify": {"max_attempts": 4, "base_seconds": 3},
+}
+RETRYABLE_EXCEPTIONS = (requests.RequestException, TimeoutError, ConnectionError, sqlite3.OperationalError)
+
+
+def _exponential_backoff_seconds(base_seconds: int, attempt_count: int) -> int:
+    return base_seconds * (2 ** max(attempt_count - 1, 0))
+
+
+def _classify_step_failure(step: str, exc: Exception, step_attempts: int) -> tuple[bool, str]:
+    if isinstance(exc, (PermissionError, ValueError)):
+        return False, "terminal_non_retryable_error"
+    policy = STEP_RETRY_POLICY[step]
+    if step_attempts >= policy["max_attempts"]:
+        return False, "terminal_max_attempts_exceeded"
+    return isinstance(exc, RETRYABLE_EXCEPTIONS), "retryable_exception" if isinstance(exc, RETRYABLE_EXCEPTIONS) else "terminal_unclassified"
+
+
+def persist_monitor_state(monitor: sqlite3.Row, result: MonitorResult, eligible: bool) -> None:
+    conn = db()
+    conn.execute(
+        """
+        update monitors
+        set last_checked_at = ?, last_in_stock = ?, last_price_cents = ?, failure_streak = 0, last_error = NULL
+        where id = ?
+        """,
+        (utc_now(), int(eligible), result.price_cents, monitor["id"]),
+    )
+    conn.commit()
+    conn.close()
+
+    if eligible:
+        enqueue_checkout_for_monitor(monitor, result)
+    create_event_and_deliver(monitor, result, eligible)
+
+
+def run_monitor_pipeline_once(monitor: sqlite3.Row) -> dict[str, Any]:
+    result = fetch_monitor(monitor)
+    eligible = alert_eligibility(monitor, result)
+    persist_monitor_state(monitor, result, eligible)
+    emit_monitor_events(monitor, result, eligible)
+
+    log(
+        f"Checked monitor {monitor['id']} | {monitor['retailer']} | {result.status_text} | {cents_to_dollars(result.price_cents)}",
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+    )
+    return {
+        "ok": True,
+        "in_stock": result.in_stock,
+        "eligible_for_alert": eligible,
+        "price_cents": result.price_cents,
+        "availability_reason": result.availability_reason,
+        "parser_confidence": result.parser_confidence,
+        "keyword_matched": result.keyword_matched,
+        "price_within_limit": result.price_within_limit,
+        "within_msrp_delta": result.within_msrp_delta,
+        "title": result.title,
+    }
+
+
 def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
     try:
-        result = fetch_monitor(monitor)
+        return run_monitor_pipeline_once(monitor)
     except Exception as exc:  # noqa: BLE001
         conn = db()
         conn.execute(
@@ -1377,40 +1778,6 @@ def check_monitor_once(monitor: sqlite3.Row) -> dict[str, Any]:
         )
         return {"ok": False, "error": str(exc)}
 
-    eligible = alert_eligibility(monitor, result)
-
-    conn = db()
-    conn.execute(
-        """
-        update monitors
-        set last_checked_at = ?, last_in_stock = ?, last_price_cents = ?, failure_streak = 0, last_error = NULL
-        where id = ?
-        """,
-        (utc_now(), int(eligible), result.price_cents, monitor["id"]),
-    )
-    conn.commit()
-    conn.close()
-
-    create_event_and_deliver(monitor, result, eligible)
-
-    log(
-        f"Checked monitor {monitor['id']} | {monitor['retailer']} | {result.status_text} | {cents_to_dollars(result.price_cents)}",
-        workspace_id=monitor["workspace_id"],
-        monitor_id=monitor["id"],
-    )
-    return {
-        "ok": True,
-        "in_stock": result.in_stock,
-        "eligible_for_alert": eligible,
-        "price_cents": result.price_cents,
-        "availability_reason": result.availability_reason,
-        "parser_confidence": result.parser_confidence,
-        "keyword_matched": result.keyword_matched,
-        "price_within_limit": result.price_within_limit,
-        "within_msrp_delta": result.within_msrp_delta,
-        "title": result.title,
-    }
-
 
 def apply_due_schedules(conn: sqlite3.Connection) -> None:
     now_iso = utc_now()
@@ -1433,27 +1800,225 @@ def apply_due_schedules(conn: sqlite3.Connection) -> None:
         )
 
 
-def monitor_loop() -> None:
-    log("Monitor loop started")
-    while running:
-        with lock:
+class SQLiteJobQueue:
+    def __init__(self, conn: sqlite3.Connection, worker_id: str):
+        self.conn = conn
+        self.worker_id = worker_id
+
+    def enqueue_monitor_check_if_due(self, monitor: sqlite3.Row, *, now_iso: str) -> None:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if monitor["last_checked_at"]:
+            elapsed = now_ts - datetime.fromisoformat(monitor["last_checked_at"]).timestamp()
+            if elapsed < monitor["poll_interval_seconds"]:
+                return
+        exists = self.conn.execute(
+            """
+            select id
+            from jobs
+            where monitor_id = ?
+              and job_type = 'monitor_check'
+              and status in ('queued', 'retrying', 'running')
+            limit 1
+            """,
+            (monitor["id"],),
+        ).fetchone()
+        if exists:
+            return
+        payload = json.dumps({"step_attempts": {}})
+        self.conn.execute(
+            """
+            insert into jobs(job_type, monitor_id, status, attempt_count, next_run_at, payload_json, created_at, updated_at)
+            values ('monitor_check', ?, 'queued', 0, ?, ?, ?, ?)
+            """,
+            (monitor["id"], now_iso, payload, now_iso, now_iso),
+        )
+
+    def claim_due_job(self, *, now_iso: str) -> Job | None:
+        stale_cutoff = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() - WORKER_LOCK_TIMEOUT_SECONDS, tz=timezone.utc
+        ).isoformat()
+        self.conn.execute("begin immediate")
+        row = self.conn.execute(
+            """
+            select *
+            from jobs
+            where status in ('queued', 'retrying')
+              and next_run_at <= ?
+              and (
+                locked_at is null
+                or locked_at < ?
+              )
+            order by next_run_at asc, id asc
+            limit 1
+            """,
+            (now_iso, stale_cutoff),
+        ).fetchone()
+        if not row:
+            self.conn.commit()
+            return None
+        self.conn.execute(
+            """
+            update jobs
+            set status = 'running', locked_by = ?, locked_at = ?, updated_at = ?
+            where id = ?
+            """,
+            (self.worker_id, now_iso, now_iso, row["id"]),
+        )
+        self.conn.commit()
+        return Job(**dict(row))
+
+    def complete_job(self, job_id: int, *, now_iso: str) -> None:
+        self.conn.execute(
+            """
+            update jobs
+            set status = 'completed', locked_by = null, locked_at = null, updated_at = ?
+            where id = ?
+            """,
+            (now_iso, job_id),
+        )
+
+    def fail_job(self, job_id: int, *, now_iso: str, status: str, next_run_at: str, payload_json: str, error_text: str) -> None:
+        self.conn.execute(
+            """
+            update jobs
+            set status = ?,
+                attempt_count = attempt_count + 1,
+                next_run_at = ?,
+                payload_json = ?,
+                last_error = ?,
+                locked_by = null,
+                locked_at = null,
+                updated_at = ?
+            where id = ?
+            """,
+            (status, next_run_at, payload_json, error_text[:500], now_iso, job_id),
+        )
+
+
+def execute_monitor_job(queue: SQLiteJobQueue, job: Job, *, now_iso: str) -> None:
+    monitor = queue.conn.execute("select * from monitors where id = ?", (job.monitor_id,)).fetchone()
+    if not monitor:
+        queue.fail_job(
+            job.id,
+            now_iso=now_iso,
+            status="failed",
+            next_run_at=now_iso,
+            payload_json=job.payload_json or "{}",
+            error_text=f"monitor_not_found:{job.monitor_id}",
+        )
+        return
+    payload = json.loads(job.payload_json or "{}")
+    step_attempts: dict[str, int] = payload.get("step_attempts") or {}
+    result: MonitorResult | None = None
+    eligible: bool | None = None
+    try:
+        result = fetch_monitor(monitor)
+    except Exception as exc:  # noqa: BLE001
+        step = "fetch"
+        step_attempts[step] = int(step_attempts.get(step, 0)) + 1
+        retryable, reason = _classify_step_failure(step, exc, step_attempts[step])
+        if retryable:
+            delay = _exponential_backoff_seconds(STEP_RETRY_POLICY[step]["base_seconds"], step_attempts[step])
+            next_run = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + delay, tz=timezone.utc).isoformat()
+            queue.fail_job(
+                job.id,
+                now_iso=now_iso,
+                status="retrying",
+                next_run_at=next_run,
+                payload_json=json.dumps({"step_attempts": step_attempts}),
+                error_text=f"{step}:{reason}:{exc}",
+            )
+            return
+        queue.fail_job(
+            job.id,
+            now_iso=now_iso,
+            status="failed",
+            next_run_at=now_iso,
+            payload_json=json.dumps({"step_attempts": step_attempts}),
+            error_text=f"{step}:{reason}:{exc}",
+        )
+        return
+    try:
+        eligible = alert_eligibility(monitor, result)
+        persist_monitor_state(monitor, result, eligible)
+    except Exception as exc:  # noqa: BLE001
+        step = "persist"
+        step_attempts[step] = int(step_attempts.get(step, 0)) + 1
+        retryable, reason = _classify_step_failure(step, exc, step_attempts[step])
+        if retryable:
+            delay = _exponential_backoff_seconds(STEP_RETRY_POLICY[step]["base_seconds"], step_attempts[step])
+            next_run = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + delay, tz=timezone.utc).isoformat()
+            queue.fail_job(
+                job.id,
+                now_iso=now_iso,
+                status="retrying",
+                next_run_at=next_run,
+                payload_json=json.dumps({"step_attempts": step_attempts}),
+                error_text=f"{step}:{reason}:{exc}",
+            )
+            return
+        queue.fail_job(
+            job.id,
+            now_iso=now_iso,
+            status="failed",
+            next_run_at=now_iso,
+            payload_json=json.dumps({"step_attempts": step_attempts}),
+            error_text=f"{step}:{reason}:{exc}\n{traceback.format_exc()}",
+        )
+        return
+    try:
+        emit_monitor_events(monitor, result, eligible)
+        log(
+            f"Checked monitor {monitor['id']} | {monitor['retailer']} | {result.status_text} | {cents_to_dollars(result.price_cents)}",
+            workspace_id=monitor["workspace_id"],
+            monitor_id=monitor["id"],
+        )
+        queue.complete_job(job.id, now_iso=now_iso)
+    except Exception as exc:  # noqa: BLE001
+        step = "notify"
+        step_attempts[step] = int(step_attempts.get(step, 0)) + 1
+        retryable, reason = _classify_step_failure(step, exc, step_attempts[step])
+        if retryable:
+            delay = _exponential_backoff_seconds(STEP_RETRY_POLICY[step]["base_seconds"], step_attempts[step])
+            next_run = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + delay, tz=timezone.utc).isoformat()
+            queue.fail_job(
+                job.id,
+                now_iso=now_iso,
+                status="retrying",
+                next_run_at=next_run,
+                payload_json=json.dumps({"step_attempts": step_attempts}),
+                error_text=f"{step}:{reason}:{exc}",
+            )
+            return
+        queue.fail_job(
+            job.id,
+            now_iso=now_iso,
+            status="failed",
+            next_run_at=now_iso,
+            payload_json=json.dumps({"step_attempts": step_attempts}),
+            error_text=f"{step}:{reason}:{exc}\n{traceback.format_exc()}",
+        )
+
+
+def worker_loop() -> None:
+    log(f"Worker loop started ({WORKER_ID})")
+    while worker_running:
+        with worker_lock:
             conn = db()
+            now_iso = utc_now()
+            queue = SQLiteJobQueue(conn, worker_id=WORKER_ID)
             apply_due_schedules(conn)
             monitors = conn.execute("select * from monitors where enabled = 1").fetchall()
+            for monitor in monitors:
+                queue.enqueue_monitor_check_if_due(monitor, now_iso=now_iso)
+            job = queue.claim_due_job(now_iso=now_iso)
+            if job:
+                execute_monitor_job(queue, job, now_iso=now_iso)
+            conn.commit()
             conn.close()
-
-            now_ts = time.time()
-            for m in monitors:
-                if not running:
-                    break
-                if m["last_checked_at"]:
-                    elapsed = now_ts - datetime.fromisoformat(m["last_checked_at"]).timestamp()
-                    if elapsed < m["poll_interval_seconds"]:
-                        continue
-                check_monitor_once(m)
-
-        time.sleep(POLL_LOOP_SECONDS)
-    log("Monitor loop stopped")
+        if not job:
+            time.sleep(WORKER_IDLE_SLEEP_SECONDS)
+    log(f"Worker loop stopped ({WORKER_ID})")
 
 
 def run_task_worker(task_id: int, workspace_id: int, stop_event: threading.Event) -> None:
@@ -1581,7 +2146,7 @@ def index():
 
 @app.get("/healthz")
 def healthz():
-    return jsonify({"ok": True, "running": running})
+    return jsonify({"ok": True, "worker_running": worker_running, "app_role": APP_ROLE})
 
 
 @app.get("/api/meta")
@@ -1591,6 +2156,8 @@ def api_meta():
             "app_version": APP_VERSION,
             "release_channel": RELEASE_CHANNEL,
             "python_version": os.sys.version.split()[0],
+            "app_role": APP_ROLE,
+            "embedded_worker_enabled": ENABLE_EMBEDDED_WORKER,
         }
     )
 
@@ -1756,7 +2323,6 @@ def api_sync_billing_subscription_event():
     }
     try:
         result = sync_billing_subscription_payload(payload)
-        result = sync_manual_billing_subscription_event(payload)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"ok": True, **result})
@@ -1980,7 +2546,8 @@ def api_dashboard_summary():
             "events_last_24h": events_24h,
             "events_last_7d": events_7d,
             "delivery_success_rate": round(success_rate, 4),
-            "running": running,
+            "worker_running": worker_running,
+            "app_role": APP_ROLE,
         }
     )
 
@@ -2176,6 +2743,129 @@ def api_check_monitor(monitor_id: int):
     return jsonify(check_monitor_once(row))
 
 
+@app.post("/api/checkout/tasks")
+@require_auth
+def api_create_checkout_task():
+    body = request.json or {}
+    monitor_id = body.get("monitor_id")
+    if monitor_id is None:
+        return jsonify({"error": "monitor_id is required"}), 400
+
+    workspace_id = current_workspace_id()
+    conn = db()
+    monitor = conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (int(monitor_id), workspace_id),
+    ).fetchone()
+    if not monitor:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+
+    initial_state = body.get("initial_state", "queued")
+    try:
+        task = create_checkout_task(
+            conn,
+            workspace_id=workspace_id,
+            monitor_id=int(monitor_id),
+            task_name=(body.get("task_name") or "").strip() or None,
+            task_config=body.get("task_config") if isinstance(body.get("task_config"), dict) else None,
+            initial_state=initial_state,
+        )
+    except ValueError as exc:
+        conn.close()
+        return jsonify({"error": str(exc)}), 400
+
+    conn.commit()
+    conn.close()
+    return jsonify(serialize_checkout_task(task)), 201
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/start")
+@require_auth
+def api_start_checkout_task(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="monitoring",
+        reason="api_start",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/pause")
+@require_auth
+def api_pause_checkout_task(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="paused",
+        reason="api_pause",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/stop")
+@require_auth
+def api_stop_checkout_task(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="stopped",
+        reason="api_stop",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.get("/api/checkout/tasks/<int:task_id>/state")
+@require_auth
+def api_checkout_task_state(task_id: int):
+    conn = db()
+    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    last_attempt = conn.execute(
+        """
+        select * from checkout_attempts
+        where task_id = ?
+        order by id desc
+        limit 1
+        """,
+        (task_id,),
+    ).fetchone()
+    conn.close()
+    return jsonify(
+        {
+            "task_id": task_id,
+            "current_state": row["current_state"],
+            "last_error": row["last_error"],
+            "last_transition_at": row["last_transition_at"],
+            "last_attempt": dict(last_attempt) if last_attempt else None,
+        }
+    )
+
+
 @app.get("/api/events")
 @require_auth
 def api_events():
@@ -2336,6 +3026,355 @@ def api_delete_webhook(webhook_id: int):
     return jsonify({"ok": True})
 
 
+@app.post("/api/profiles")
+@require_auth
+def api_create_profile():
+    body = request.json or {}
+    try:
+        name = (body.get("name") or "").strip()
+        if not name:
+            raise ValueError("name is required")
+        email = _validate_email(body.get("email") or "")
+        phone = _validate_phone(body.get("phone"))
+        shipping = _validate_address(body.get("shipping_address"), "shipping_address")
+        billing = _validate_address(body.get("billing_address"), "billing_address")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    now_iso = utc_now()
+    conn = db()
+    cur = conn.execute(
+        """
+        insert into checkout_profiles(
+            workspace_id, name, email, phone, shipping_address_json, billing_address_json, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (current_workspace_id(), name, email, phone, json.dumps(shipping), json.dumps(billing), now_iso, now_iso),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from checkout_profiles where id = ? and workspace_id = ?",
+        (cur.lastrowid, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    return jsonify(serialize_checkout_profile(row)), 201
+
+
+@app.get("/api/profiles")
+@require_auth
+def api_list_profiles():
+    conn = db()
+    rows = conn.execute(
+        "select * from checkout_profiles where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_checkout_profile(r) for r in rows])
+
+
+@app.patch("/api/profiles/<int:profile_id>")
+@require_auth
+def api_update_profile(profile_id: int):
+    body = request.json or {}
+    fields: list[tuple[str, Any]] = []
+    try:
+        if "name" in body:
+            name = (body.get("name") or "").strip()
+            if not name:
+                raise ValueError("name cannot be empty")
+            fields.append(("name", name))
+        if "email" in body:
+            fields.append(("email", _validate_email(body.get("email") or "")))
+        if "phone" in body:
+            fields.append(("phone", _validate_phone(body.get("phone"))))
+        if "shipping_address" in body:
+            fields.append(("shipping_address_json", json.dumps(_validate_address(body.get("shipping_address"), "shipping_address"))))
+        if "billing_address" in body:
+            fields.append(("billing_address_json", json.dumps(_validate_address(body.get("billing_address"), "billing_address"))))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not fields:
+        return jsonify({"error": "No mutable fields provided"}), 400
+    fields.append(("updated_at", utc_now()))
+    conn = db()
+    for key, value in fields:
+        conn.execute(
+            f"update checkout_profiles set {key} = ? where id = ? and workspace_id = ?",
+            (value, profile_id, current_workspace_id()),
+        )
+    conn.commit()
+    row = conn.execute(
+        "select * from checkout_profiles where id = ? and workspace_id = ?",
+        (profile_id, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Profile not found"}), 404
+    return jsonify(serialize_checkout_profile(row))
+
+
+@app.delete("/api/profiles/<int:profile_id>")
+@require_auth
+def api_delete_profile(profile_id: int):
+    conn = db()
+    cur = conn.execute(
+        "delete from checkout_profiles where id = ? and workspace_id = ?",
+        (profile_id, current_workspace_id()),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Profile not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.post("/api/accounts")
+@require_auth
+def api_create_account():
+    body = request.json or {}
+    try:
+        retailer = canonical_retailer(body.get("retailer") or "")
+        if retailer not in SUPPORTED_RETAILERS:
+            raise ValueError(f"Unsupported retailer '{retailer}'")
+        username = (body.get("username") or "").strip() or None
+        email = body.get("email")
+        email = _validate_email(email) if email else None
+        if not username and not email:
+            raise ValueError("username or email is required")
+        credential_ref = (body.get("encrypted_credential_ref") or "").strip()
+        if not credential_ref:
+            raise ValueError("encrypted_credential_ref is required")
+        session_status = (body.get("session_status") or "logged_out").strip().lower()
+        if session_status not in SESSION_STATUSES:
+            raise ValueError("Invalid session_status")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    now_iso = utc_now()
+    conn = db()
+    cur = conn.execute(
+        """
+        insert into retailer_accounts(
+            workspace_id, retailer, username, email, encrypted_credential_ref, session_status, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (current_workspace_id(), retailer, username, email, credential_ref, session_status, now_iso, now_iso),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from retailer_accounts where id = ? and workspace_id = ?",
+        (cur.lastrowid, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    return jsonify(serialize_retailer_account(row)), 201
+
+
+@app.get("/api/accounts")
+@require_auth
+def api_list_accounts():
+    conn = db()
+    rows = conn.execute(
+        "select * from retailer_accounts where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_retailer_account(r) for r in rows])
+
+
+@app.patch("/api/accounts/<int:account_id>")
+@require_auth
+def api_update_account(account_id: int):
+    body = request.json or {}
+    fields: list[tuple[str, Any]] = []
+    try:
+        if "retailer" in body:
+            retailer = canonical_retailer(body.get("retailer") or "")
+            if retailer not in SUPPORTED_RETAILERS:
+                raise ValueError(f"Unsupported retailer '{retailer}'")
+            fields.append(("retailer", retailer))
+        if "username" in body:
+            fields.append(("username", (body.get("username") or "").strip() or None))
+        if "email" in body:
+            email = body.get("email")
+            fields.append(("email", _validate_email(email) if email else None))
+        if "encrypted_credential_ref" in body:
+            credential_ref = (body.get("encrypted_credential_ref") or "").strip()
+            if not credential_ref:
+                raise ValueError("encrypted_credential_ref cannot be empty")
+            fields.append(("encrypted_credential_ref", credential_ref))
+        if "session_status" in body:
+            session_status = (body.get("session_status") or "").strip().lower()
+            if session_status not in SESSION_STATUSES:
+                raise ValueError("Invalid session_status")
+            fields.append(("session_status", session_status))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not fields:
+        return jsonify({"error": "No mutable fields provided"}), 400
+    fields.append(("updated_at", utc_now()))
+    conn = db()
+    for key, value in fields:
+        conn.execute(
+            f"update retailer_accounts set {key} = ? where id = ? and workspace_id = ?",
+            (value, account_id, current_workspace_id()),
+        )
+    conn.commit()
+    row = conn.execute(
+        "select * from retailer_accounts where id = ? and workspace_id = ?",
+        (account_id, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Account not found"}), 404
+    return jsonify(serialize_retailer_account(row))
+
+
+@app.delete("/api/accounts/<int:account_id>")
+@require_auth
+def api_delete_account(account_id: int):
+    conn = db()
+    cur = conn.execute(
+        "delete from retailer_accounts where id = ? and workspace_id = ?",
+        (account_id, current_workspace_id()),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Account not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.post("/api/payments")
+@require_auth
+def api_create_payment():
+    body = request.json or {}
+    prohibited = {"pan", "card_number", "number", "cvv", "cvc"}
+    if any(key in body for key in prohibited):
+        return jsonify({"error": "Raw card data is not allowed; store tokenized reference only"}), 400
+    try:
+        label = (body.get("label") or "").strip()
+        if not label:
+            raise ValueError("label is required")
+        provider = (body.get("provider") or "").strip() or None
+        token_reference = (body.get("token_reference") or "").strip()
+        if not token_reference:
+            raise ValueError("token_reference is required")
+        billing_profile_id = body.get("billing_profile_id")
+        if billing_profile_id is not None:
+            billing_profile_id = int(billing_profile_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    now_iso = utc_now()
+    conn = db()
+    if billing_profile_id is not None:
+        profile = conn.execute(
+            "select id from checkout_profiles where id = ? and workspace_id = ?",
+            (billing_profile_id, current_workspace_id()),
+        ).fetchone()
+        if not profile:
+            conn.close()
+            return jsonify({"error": "billing_profile_id not found"}), 400
+    cur = conn.execute(
+        """
+        insert into payment_methods(
+            workspace_id, label, provider, token_reference, billing_profile_id, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (current_workspace_id(), label, provider, token_reference, billing_profile_id, now_iso, now_iso),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from payment_methods where id = ? and workspace_id = ?",
+        (cur.lastrowid, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    return jsonify(serialize_payment_method(row)), 201
+
+
+@app.get("/api/payments")
+@require_auth
+def api_list_payments():
+    conn = db()
+    rows = conn.execute(
+        "select * from payment_methods where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_payment_method(r) for r in rows])
+
+
+@app.patch("/api/payments/<int:payment_id>")
+@require_auth
+def api_update_payment(payment_id: int):
+    body = request.json or {}
+    prohibited = {"pan", "card_number", "number", "cvv", "cvc"}
+    if any(key in body for key in prohibited):
+        return jsonify({"error": "Raw card data is not allowed; store tokenized reference only"}), 400
+    fields: list[tuple[str, Any]] = []
+    try:
+        if "label" in body:
+            label = (body.get("label") or "").strip()
+            if not label:
+                raise ValueError("label cannot be empty")
+            fields.append(("label", label))
+        if "provider" in body:
+            fields.append(("provider", (body.get("provider") or "").strip() or None))
+        if "token_reference" in body:
+            token_reference = (body.get("token_reference") or "").strip()
+            if not token_reference:
+                raise ValueError("token_reference cannot be empty")
+            fields.append(("token_reference", token_reference))
+        if "billing_profile_id" in body:
+            billing_profile_id = body.get("billing_profile_id")
+            value = int(billing_profile_id) if billing_profile_id is not None else None
+            fields.append(("billing_profile_id", value))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not fields:
+        return jsonify({"error": "No mutable fields provided"}), 400
+    conn = db()
+    for key, value in fields:
+        if key == "billing_profile_id" and value is not None:
+            profile = conn.execute(
+                "select id from checkout_profiles where id = ? and workspace_id = ?",
+                (value, current_workspace_id()),
+            ).fetchone()
+            if not profile:
+                conn.close()
+                return jsonify({"error": "billing_profile_id not found"}), 400
+        conn.execute(
+            f"update payment_methods set {key} = ? where id = ? and workspace_id = ?",
+            (value, payment_id, current_workspace_id()),
+        )
+    conn.execute(
+        "update payment_methods set updated_at = ? where id = ? and workspace_id = ?",
+        (utc_now(), payment_id, current_workspace_id()),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from payment_methods where id = ? and workspace_id = ?",
+        (payment_id, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Payment method not found"}), 404
+    return jsonify(serialize_payment_method(row))
+
+
+@app.delete("/api/payments/<int:payment_id>")
+@require_auth
+def api_delete_payment(payment_id: int):
+    conn = db()
+    cur = conn.execute(
+        "delete from payment_methods where id = ? and workspace_id = ?",
+        (payment_id, current_workspace_id()),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Payment method not found"}), 404
+    return jsonify({"ok": True})
+
+
 @app.get("/api/schedules")
 @require_auth
 def api_list_schedules():
@@ -2421,21 +3460,41 @@ def api_delete_schedule(schedule_id: int):
 @app.post("/api/start")
 @require_auth
 def api_start():
-    global running, monitor_thread
-    if running:
-        return jsonify({"ok": True, "running": True})
-    running = True
-    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-    monitor_thread.start()
-    return jsonify({"ok": True, "running": True})
+    global worker_running, worker_thread
+    if not ENABLE_EMBEDDED_WORKER:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Embedded worker disabled. Use APP_ROLE=worker and external process management.",
+                }
+            ),
+            409,
+        )
+    if worker_running:
+        return jsonify({"ok": True, "worker_running": True, "mode": "embedded"})
+    worker_running = True
+    worker_thread = threading.Thread(target=worker_loop, daemon=True)
+    worker_thread.start()
+    return jsonify({"ok": True, "worker_running": True, "mode": "embedded"})
 
 
 @app.post("/api/stop")
 @require_auth
 def api_stop():
-    global running
-    running = False
-    return jsonify({"ok": True, "running": False})
+    global worker_running
+    if not ENABLE_EMBEDDED_WORKER:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Embedded worker disabled. Stop worker process via external supervisor.",
+                }
+            ),
+            409,
+        )
+    worker_running = False
+    return jsonify({"ok": True, "worker_running": False, "mode": "embedded"})
 
 
 if __name__ == "__main__":
@@ -2444,4 +3503,14 @@ if __name__ == "__main__":
         "Legal/ethical note: this project provides stock monitoring + alerts only. Auto-checkout is intentionally not implemented.",
         level="warning",
     )
-    socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
+    if APP_ROLE == "worker":
+        worker_running = True
+        worker_loop()
+    elif APP_ROLE == "all":
+        if ENABLE_EMBEDDED_WORKER:
+            worker_running = True
+            worker_thread = threading.Thread(target=worker_loop, daemon=True)
+            worker_thread.start()
+        socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
+    else:
+        socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
