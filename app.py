@@ -1676,11 +1676,6 @@ def api_create_monitor():
         if not (url.startswith("http://") or url.startswith("https://")):
             raise ValueError("product_url must be http(s)")
 
-        if retailer not in SUPPORTED_RETAILERS:
-            raise ValueError(f"Unsupported retailer: {retailer}")
-        if not (url.startswith("http://") or url.startswith("https://")):
-            raise ValueError("product_url must start with http:// or https://")
-
         enforce_plan_limits(current_workspace_id(), poll_interval)
     except (KeyError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400

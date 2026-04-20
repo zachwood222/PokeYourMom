@@ -62,7 +62,7 @@ def test_create_monitor_validates_retailer(tmp_path, monkeypatch):
     )
 
     assert resp.status_code == 400
-    assert "Unsupported retailer" in resp.get_json()["error"]
+    assert resp.get_json()["error"] == "Unsupported retailer 'amazon'"
 
 
 def test_create_monitor_requires_http_url(tmp_path, monkeypatch):
@@ -76,7 +76,7 @@ def test_create_monitor_requires_http_url(tmp_path, monkeypatch):
     )
 
     assert resp.status_code == 400
-    assert "product_url" in resp.get_json()["error"]
+    assert resp.get_json()["error"] == "product_url must be http(s)"
 
 
 def test_create_monitor_accepts_pokemon_center_alias(tmp_path, monkeypatch):
