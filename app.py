@@ -1243,11 +1243,6 @@ def extract_price_cents(text: str) -> int | None:
     return min(values) if values else None
 
 
-def canonical_retailer(retailer: str) -> str:
-    value = retailer.strip().lower()
-    return RETAILER_ALIASES.get(value, value)
-
-
 def _parse_common_title_and_text(html: str) -> tuple[str, str]:
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
     title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "Product"
@@ -1995,6 +1990,35 @@ def create_monitor_error_events(monitor: sqlite3.Row, error_text: str) -> None:
         workspace_id=monitor["workspace_id"],
         monitor_id=monitor["id"],
     )
+
+
+def emit_monitor_events(monitor: sqlite3.Row, result: MonitorResult, eligible: bool) -> None:
+    payload = {
+        "monitor_id": monitor["id"],
+        "workspace_id": monitor["workspace_id"],
+        "retailer": monitor["retailer"],
+        "status_text": result.status_text,
+        "eligible_for_alert": bool(eligible),
+        "in_stock": bool(result.in_stock),
+        "price_cents": result.price_cents,
+        "availability_reason": result.availability_reason,
+        "parser_confidence": result.parser_confidence,
+        "checked_at": utc_now(),
+    }
+    try:
+        socketio.emit("monitor_update", payload)
+    except Exception as exc:  # noqa: BLE001
+        # Best-effort telemetry; never fail monitor execution because of socket emit issues.
+        print(json.dumps(format_log_entry("warning", f"monitor_update_emit_failed: {exc}", workspace_id=monitor["workspace_id"], monitor_id=monitor["id"])))
+    try:
+        log(
+            f"Monitor {monitor['id']} telemetry emitted ({result.status_text}, eligible={int(bool(eligible))})",
+            level="info",
+            workspace_id=monitor["workspace_id"],
+            monitor_id=monitor["id"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps(format_log_entry("warning", f"monitor_telemetry_log_failed: {exc}", workspace_id=monitor["workspace_id"], monitor_id=monitor["id"])))
 
 
 STEP_RETRY_POLICY = {
@@ -3035,26 +3059,17 @@ def api_update_monitor(monitor_id: int):
     enabled = body.get("enabled")
     if enabled is None:
         return jsonify({"error": "enabled is required"}), 400
+
     conn = db()
-    conn.execute(
-        "update monitors set enabled = ? where id = ? and workspace_id = ?",
-        (int(bool(enabled)), monitor_id, current_workspace_id()),
-    )
+    conn.execute("update monitors set enabled = ? where id = ? and workspace_id = ?", (int(bool(enabled)), monitor_id, workspace_id))
     conn.commit()
     row = conn.execute(
         "select * from monitors where id = ? and workspace_id = ?",
-        (monitor_id, current_workspace_id()),
+        (monitor_id, workspace_id),
     ).fetchone()
-    conn.close()
     if not row:
         conn.close()
         return jsonify({"error": "Monitor not found"}), 404
-    conn.execute(
-        "update monitors set enabled = ? where id = ? and workspace_id = ?",
-        (int(bool(enabled)), monitor_id, workspace_id),
-    )
-    conn.commit()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
     return jsonify(dict(row))
 
