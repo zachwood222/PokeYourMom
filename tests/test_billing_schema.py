@@ -37,6 +37,12 @@ def test_init_db_creates_billing_tables_and_columns(tmp_path, monkeypatch):
     subscription_columns = {
         row[1] for row in conn.execute("pragma table_info(billing_subscriptions)").fetchall()
     }
+    secret_columns = {
+        row[1] for row in conn.execute("pragma table_info(account_secrets)").fetchall()
+    }
+    webhook_columns = {
+        row[1] for row in conn.execute("pragma table_info(webhooks)").fetchall()
+    }
     conn.close()
 
     assert tables == {"billing_customers", "billing_subscriptions", "billing_webhook_events"}
@@ -62,6 +68,14 @@ def test_init_db_creates_billing_tables_and_columns(tmp_path, monkeypatch):
         "created_at",
         "updated_at",
     }.issubset(subscription_columns)
+    assert {
+        "workspace_id",
+        "secret_type",
+        "ciphertext",
+        "created_at",
+        "updated_at",
+    }.issubset(secret_columns)
+    assert "webhook_secret_id" in webhook_columns
 
 
 def test_init_db_is_idempotent_and_preserves_billing_schema(tmp_path, monkeypatch):
@@ -84,6 +98,9 @@ def test_init_db_is_idempotent_and_preserves_billing_schema(tmp_path, monkeypatc
     subscription_columns = {
         row[1] for row in conn.execute("pragma table_info(billing_subscriptions)").fetchall()
     }
+    not_null_secret_columns = {
+        row[1] for row in conn.execute("pragma table_info(account_secrets)").fetchall() if row[3] == 1
+    }
     conn.close()
 
     assert index_names == {
@@ -92,6 +109,9 @@ def test_init_db_is_idempotent_and_preserves_billing_schema(tmp_path, monkeypatc
     }
     assert "provider_customer_id" in customer_columns
     assert "provider_subscription_id" in subscription_columns
+    assert {"workspace_id", "secret_type", "ciphertext", "created_at", "updated_at"}.issubset(
+        not_null_secret_columns
+    )
 
 
 def test_init_db_schema_only_no_network_or_stripe_side_effects(tmp_path, monkeypatch):

@@ -593,6 +593,29 @@ def test_webhook_health_trends_scoped_to_workspace(tmp_path, monkeypatch):
     assert payload["webhooks"][0]["recent_failures_7d"] == 1
 
 
+def test_webhook_secret_is_encrypted_at_rest_and_redacted_in_api(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_resp = client.post(
+        "/api/webhooks",
+        json={"name": "Secure", "webhook_url": "https://discord.com/api/webhooks/abc123/token456"},
+        headers=_auth_headers(),
+    )
+    assert create_resp.status_code == 201
+    created = create_resp.get_json()
+    assert created["webhook_url"] == "[redacted]"
+
+    conn = app_module.db()
+    hook = conn.execute("select webhook_url, webhook_secret_id from webhooks where name = 'Secure'").fetchone()
+    secret = conn.execute("select ciphertext from account_secrets where id = ?", (hook["webhook_secret_id"],)).fetchone()
+    conn.close()
+
+    assert hook["webhook_url"] != "https://discord.com/api/webhooks/abc123/token456"
+    assert secret is not None
+    assert "abc123" not in secret["ciphertext"]
+
+
 def test_parser_dispatch_uses_walmart_and_fallback(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
 

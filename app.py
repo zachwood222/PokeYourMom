@@ -9,6 +9,7 @@ import threading
 import time
 import hashlib
 import hmac
+import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
@@ -29,6 +30,7 @@ POKEMON_MSRP_BUFFER_CENTS = int(os.getenv("POKEMON_MSRP_BUFFER_CENTS", "1000"))
 APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
 RELEASE_CHANNEL = os.getenv("RELEASE_CHANNEL", "stable")
 API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "dev-token")
+SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY", "local-dev-secret-key")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
 UPDATE_CHECK_TIMEOUT_SECONDS = float(os.getenv("UPDATE_CHECK_TIMEOUT_SECONDS", "2.0"))
@@ -119,6 +121,59 @@ def verify_stripe_webhook_signature(payload: bytes, signature_header: str | None
     ).hexdigest()
     if not any(hmac.compare_digest(expected_signature, candidate) for candidate in signatures):
         raise PermissionError("Invalid Stripe signature")
+
+
+def _encryption_keystream(secret_key: str, nonce: bytes, length: int) -> bytes:
+    stream = bytearray()
+    counter = 0
+    key_bytes = secret_key.encode("utf-8")
+    while len(stream) < length:
+        block = hashlib.sha256(key_bytes + nonce + counter.to_bytes(8, "big")).digest()
+        stream.extend(block)
+        counter += 1
+    return bytes(stream[:length])
+
+
+def encrypt_secret_value(plaintext: str) -> str:
+    nonce = secrets.token_bytes(16)
+    payload = plaintext.encode("utf-8")
+    keystream = _encryption_keystream(SECRET_ENCRYPTION_KEY, nonce, len(payload))
+    cipher = bytes(a ^ b for a, b in zip(payload, keystream))
+    mac = hmac.new(SECRET_ENCRYPTION_KEY.encode("utf-8"), nonce + cipher, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(nonce + cipher + mac).decode("ascii")
+
+
+def decrypt_secret_value(ciphertext: str) -> str:
+    raw = base64.urlsafe_b64decode(ciphertext.encode("ascii"))
+    if len(raw) < 48:
+        raise ValueError("Invalid secret payload")
+    nonce = raw[:16]
+    mac = raw[-32:]
+    cipher = raw[16:-32]
+    expected_mac = hmac.new(SECRET_ENCRYPTION_KEY.encode("utf-8"), nonce + cipher, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        raise ValueError("Secret integrity check failed")
+    keystream = _encryption_keystream(SECRET_ENCRYPTION_KEY, nonce, len(cipher))
+    payload = bytes(a ^ b for a, b in zip(cipher, keystream))
+    return payload.decode("utf-8")
+
+
+SENSITIVE_FIELD_MARKERS = ("token", "secret", "password", "authorization", "webhook_url")
+
+
+def redact_sensitive_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            lower = key.lower()
+            if any(marker in lower for marker in SENSITIVE_FIELD_MARKERS):
+                out[key] = "[redacted]"
+            else:
+                out[key] = redact_sensitive_payload(item)
+        return out
+    if isinstance(value, list):
+        return [redact_sensitive_payload(item) for item in value]
+    return value
 
 
 def _workspace_id_from_subscription_object(subscription: dict[str, Any]) -> int | None:
@@ -275,9 +330,14 @@ def log(
     monitor_id: int | None = None,
     correlation_id: str | None = None,
 ) -> None:
+    sanitized_message = re.sub(
+        r"https://discord\.com/api/webhooks/[^\s]+",
+        "https://discord.com/api/webhooks/***redacted***",
+        message,
+    )
     entry = format_log_entry(
         level=level,
-        message=message,
+        message=sanitized_message,
         workspace_id=workspace_id,
         monitor_id=monitor_id,
         correlation_id=correlation_id,
@@ -352,6 +412,7 @@ def init_db() -> None:
             workspace_id integer not null,
             name text not null,
             webhook_url text not null,
+            webhook_secret_id integer,
             enabled integer not null default 1,
             notify_success integer not null default 1,
             notify_failures integer not null default 0,
@@ -364,7 +425,20 @@ def init_db() -> None:
             last_error text,
             last_status_code integer,
             created_at text not null,
-            foreign key(workspace_id) references workspaces(id)
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(webhook_secret_id) references account_secrets(id)
+        );
+
+        create table if not exists account_secrets (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            user_id integer,
+            secret_type text not null,
+            ciphertext text not null,
+            created_at text not null,
+            updated_at text not null,
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(user_id) references users(id)
         );
 
         create table if not exists events (
@@ -506,9 +580,36 @@ def init_db() -> None:
     ensure_column(conn, "webhooks", "fail_streak", "integer not null default 0")
     ensure_column(conn, "webhooks", "last_error", "text")
     ensure_column(conn, "webhooks", "last_status_code", "integer")
+    ensure_column(conn, "webhooks", "webhook_secret_id", "integer")
     ensure_column(conn, "workspaces", "subscription_status", "text not null default 'inactive'")
     ensure_column(conn, "workspaces", "subscription_source", "text not null default 'manual'")
     ensure_column(conn, "workspaces", "subscription_updated_at", "text")
+
+    legacy_webhooks = conn.execute(
+        """
+        select id, workspace_id, webhook_url
+        from webhooks
+        where webhook_secret_id is null and webhook_url like 'https://discord.com/api/webhooks/%'
+        """
+    ).fetchall()
+    now_iso = utc_now()
+    for hook in legacy_webhooks:
+        secret_cur = conn.execute(
+            """
+            insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
+            values (?, null, 'webhook_url', ?, ?, ?)
+            """,
+            (
+                hook["workspace_id"],
+                encrypt_secret_value(hook["webhook_url"]),
+                now_iso,
+                now_iso,
+            ),
+        )
+        conn.execute(
+            "update webhooks set webhook_url = ?, webhook_secret_id = ? where id = ?",
+            (redact_webhook_url(hook["webhook_url"]), secret_cur.lastrowid, hook["id"]),
+        )
     conn.commit()
     conn.close()
 
@@ -524,7 +625,7 @@ def get_workspace_for_user(user_id: int) -> sqlite3.Row | None:
     conn = db()
     row = conn.execute(
         """
-        select w.* from workspace_members wm
+        select w.*, wm.role as member_role from workspace_members wm
         join workspaces w on w.id = wm.workspace_id
         where wm.user_id = ?
         order by w.id asc
@@ -586,9 +687,6 @@ def get_workspace_from_auth() -> sqlite3.Row:
 
 
 def _token_from_request() -> str | None:
-    api_token = (request.headers.get("X-API-Token") or "").strip()
-    if api_token:
-        return api_token
     auth_header = (request.headers.get("Authorization") or "").strip()
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
@@ -599,6 +697,7 @@ def _set_auth_context(user: sqlite3.Row | dict[str, Any], workspace: sqlite3.Row
     g.current_user = dict(user)
     g.workspace_id = int(workspace["id"])
     g.current_workspace = workspace
+    g.current_role = workspace["member_role"] if "member_role" in workspace.keys() else "owner"
 
 
 @app.before_request
@@ -617,10 +716,6 @@ def require_api_auth() -> tuple[dict[str, str], int] | None:
         _set_auth_context(user, workspace)
         return None
 
-    token = _token_from_request()
-    if token and token == API_AUTH_TOKEN:
-        _set_auth_context(DEFAULT_USER, get_workspace(1))
-        return None
     return jsonify({"error": "Unauthorized"}), 401
 
 
@@ -629,6 +724,13 @@ def add_correlation_id_header(response):
     correlation_id = getattr(g, "correlation_id", None)
     if correlation_id:
         response.headers["X-Correlation-ID"] = correlation_id
+    if request.path.startswith("/api/") and response.is_json:
+        try:
+            payload = response.get_json(silent=True)
+            if payload is not None:
+                response.set_data(json.dumps(redact_sensitive_payload(payload)))
+        except Exception:
+            pass
     return response
 
 
@@ -651,6 +753,14 @@ def ensure_workspace_owner() -> tuple[dict[str, str], int] | None:
     workspace_id = current_workspace_id()
     if not user or not user_is_workspace_owner(int(user["id"]), workspace_id):
         return jsonify({"error": "Workspace owner access required"}), 403
+    return None
+
+
+def ensure_workspace_role(*allowed_roles: str) -> tuple[dict[str, str], int] | None:
+    current_role = (getattr(g, "current_role", None) or "").lower()
+    expected = {role.lower() for role in allowed_roles}
+    if current_role not in expected:
+        return jsonify({"error": "Insufficient role for this operation"}), 403
     return None
 
 
@@ -703,6 +813,9 @@ def map_subscription_to_internal_plan(
 
 
 def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return sync_manual_billing_subscription_event(payload)
+
+
 def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str, Any]:
     provider = (payload.get("provider") or "stripe").strip().lower()
     subscription_id = (payload.get("provider_subscription_id") or "").strip()
@@ -1135,7 +1248,8 @@ def create_event_and_deliver(
             continue
         status, code, body = "queued", None, ""
         try:
-            resp = requests.post(hook["webhook_url"], json=payload, timeout=8)
+            webhook_target = resolve_webhook_url(conn, hook)
+            resp = requests.post(webhook_target, json=payload, timeout=8)
             code = resp.status_code
             body = (resp.text or "")[:1000]
             status = "sent" if 200 <= resp.status_code < 300 else "failed"
@@ -1168,10 +1282,47 @@ def cents_to_dollars(cents: int | None) -> str:
     return f"${cents / 100:.2f}"
 
 
+def redact_webhook_url(url: str) -> str:
+    if not url:
+        return ""
+    if "/api/webhooks/" in url:
+        parts = url.rstrip("/").split("/")
+        if len(parts) >= 2:
+            tail = parts[-1]
+            return f"{'/'.join(parts[:-1])}/***{tail[-4:]}"
+    return "***redacted***"
+
+
+def create_secret(
+    conn: sqlite3.Connection, workspace_id: int, secret_type: str, plaintext: str, user_id: int | None = None
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, hook: sqlite3.Row) -> str:
+    secret_id = hook["webhook_secret_id"]
+    if secret_id:
+        secret = conn.execute("select ciphertext from account_secrets where id = ?", (secret_id,)).fetchone()
+        if secret:
+            return decrypt_secret_value(secret["ciphertext"])
+    return hook["webhook_url"]
+
+
 def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
-    return dict(row)
+    payload = dict(row)
+    payload["webhook_url"] = redact_webhook_url(payload.get("webhook_url") or "")
+    payload = redact_sensitive_payload(payload)
+    return payload
 
 
 def should_send_to_webhook(monitor: sqlite3.Row, hook: sqlite3.Row, eligible: bool) -> bool:
@@ -1489,6 +1640,9 @@ def api_workspace():
 @app.post("/api/workspace/plan")
 @require_auth
 def api_update_plan():
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
     plan = (request.json or {}).get("plan", "basic")
     if plan not in PLAN_LIMITS:
         return jsonify({"error": "Invalid plan"}), 400
@@ -1504,9 +1658,9 @@ def api_update_plan():
 @app.post("/api/billing/subscription-events")
 @require_auth
 def api_sync_billing_subscription_event():
-    owner_error = ensure_workspace_owner()
-    if owner_error:
-        return owner_error
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
     body = request.json or {}
     subscription = body.get("subscription") if isinstance(body.get("subscription"), dict) else {}
     payload = {
@@ -1621,6 +1775,9 @@ def api_dashboard_summary():
 @app.get("/api/ops/metrics")
 @require_auth
 def api_ops_metrics():
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
     workspace_id = get_workspace_id_for_request()
     conn = db()
     metrics = {
@@ -1664,6 +1821,9 @@ def api_ops_metrics():
 @app.get("/api/ops/monitor-failure-trends")
 @require_auth
 def api_monitor_failure_trends():
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
     workspace_id = get_workspace_id_for_request()
     conn = db()
     rows = conn.execute(
@@ -1686,6 +1846,9 @@ def api_monitor_failure_trends():
 @app.get("/api/ops/webhook-health-trends")
 @require_auth
 def api_webhook_health_trends():
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
     workspace_id = get_workspace_id_for_request()
     conn = db()
     rows = conn.execute(
@@ -1831,9 +1994,9 @@ def api_events():
 @app.post("/api/webhooks")
 @require_auth
 def api_add_webhook():
-    owner_error = ensure_workspace_owner()
-    if owner_error:
-        return owner_error
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
     body = request.json or {}
     name = (body.get("name") or "Discord").strip()
     url = (body.get("webhook_url") or "").strip()
@@ -1844,12 +2007,22 @@ def api_add_webhook():
         return jsonify({"error": "Invalid Discord webhook URL"}), 400
 
     conn = db()
+    secret_id = create_secret(conn, current_workspace_id(), "webhook_url", url, int(g.current_user["id"]))
     cur = conn.execute(
         """
-        insert into webhooks(workspace_id, name, webhook_url, notify_success, notify_failures, notify_restock_only, created_at)
-        values (?, ?, ?, ?, ?, ?, ?)
+        insert into webhooks(workspace_id, name, webhook_url, webhook_secret_id, notify_success, notify_failures, notify_restock_only, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (current_workspace_id(), name, url, notify_success, notify_failures, notify_restock_only, utc_now()),
+        (
+            current_workspace_id(),
+            name,
+            redact_webhook_url(url),
+            secret_id,
+            notify_success,
+            notify_failures,
+            notify_restock_only,
+            utc_now(),
+        ),
     )
     conn.commit()
     row = conn.execute("select * from webhooks where id = ?", (cur.lastrowid,)).fetchone()
@@ -1860,9 +2033,9 @@ def api_add_webhook():
 @app.get("/api/webhooks")
 @require_auth
 def api_list_webhooks():
-    owner_error = ensure_workspace_owner()
-    if owner_error:
-        return owner_error
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
     conn = db()
     rows = conn.execute(
         "select * from webhooks where workspace_id = ? order by id desc",
@@ -1875,9 +2048,9 @@ def api_list_webhooks():
 @app.post("/api/webhooks/<int:webhook_id>/test")
 @require_auth
 def api_test_webhook(webhook_id: int):
-    owner_error = ensure_workspace_owner()
-    if owner_error:
-        return owner_error
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
     conn = db()
     hook = conn.execute(
         "select * from webhooks where id = ? and workspace_id = ?",
@@ -1894,7 +2067,8 @@ def api_test_webhook(webhook_id: int):
     started = time.perf_counter()
     conn = db()
     try:
-        resp = requests.post(hook["webhook_url"], json=payload, timeout=8)
+        webhook_target = resolve_webhook_url(conn, hook)
+        resp = requests.post(webhook_target, json=payload, timeout=8)
         ok = 200 <= resp.status_code < 300
         status = "sent" if ok else "failed"
         body = (resp.text or "")[:500]
@@ -1919,9 +2093,9 @@ def api_test_webhook(webhook_id: int):
 @app.patch("/api/webhooks/<int:webhook_id>")
 @require_auth
 def api_update_webhook(webhook_id: int):
-    owner_error = ensure_workspace_owner()
-    if owner_error:
-        return owner_error
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
     body = request.json or {}
     fields: list[tuple[str, Any]] = []
     if "enabled" in body:
@@ -1954,9 +2128,9 @@ def api_update_webhook(webhook_id: int):
 @app.delete("/api/webhooks/<int:webhook_id>")
 @require_auth
 def api_delete_webhook(webhook_id: int):
-    owner_error = ensure_workspace_owner()
-    if owner_error:
-        return owner_error
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
     conn = db()
     cur = conn.execute(
         "delete from webhooks where id = ? and workspace_id = ?",
