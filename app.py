@@ -118,8 +118,29 @@ class Job:
     locked_at: str | None
     payload_json: str | None
 
+
+@dataclass(frozen=True)
+class ProxyLease:
+    lease_id: int
+    proxy_id: int
+    endpoint: str
+    lease_key: str
+    owner_type: str
+    owner_id: int | None
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_json_object(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def is_dev_environment() -> bool:
@@ -461,10 +482,52 @@ def init_db() -> None:
             last_in_stock integer,
             last_price_cents integer,
             proxy_url text,
+            proxy_type text,
+            proxy_region text,
+            proxy_residential_only integer not null default 0,
+            proxy_sticky_session_seconds integer,
             session_task_key text,
             session_metadata text,
             created_at text not null,
             foreign key(workspace_id) references workspaces(id)
+        );
+
+        create table if not exists proxies (
+            id integer primary key autoincrement,
+            provider text not null,
+            endpoint text not null unique,
+            proxy_type text not null default 'http',
+            status text not null default 'active',
+            cooldown_until text,
+            fail_streak integer not null default 0,
+            request_count integer not null default 0,
+            success_count integer not null default 0,
+            timeout_count integer not null default 0,
+            rate_limited_count integer not null default 0,
+            forbidden_count integer not null default 0,
+            failure_count integer not null default 0,
+            health_score real not null default 1.0,
+            quarantine_reason text,
+            region_code text,
+            is_residential integer not null default 0,
+            sticky_session_seconds integer,
+            last_used_at text,
+            last_success_at text,
+            last_failure_at text,
+            created_at text not null,
+            updated_at text not null
+        );
+
+        create table if not exists proxy_leases (
+            id integer primary key autoincrement,
+            proxy_id integer not null,
+            lease_key text not null,
+            owner_type text not null,
+            owner_id integer,
+            acquired_at text not null,
+            expires_at text not null,
+            released_at text,
+            foreign key(proxy_id) references proxies(id)
         );
 
         create table if not exists webhooks (
@@ -568,6 +631,8 @@ def init_db() -> None:
             monitor_id integer not null,
             task_name text,
             task_config text,
+            active_proxy_id integer,
+            active_proxy_lease_key text,
             current_state text not null default 'queued',
             enabled integer not null default 0,
             is_paused integer not null default 0,
@@ -576,7 +641,8 @@ def init_db() -> None:
             updated_at text not null,
             last_transition_at text,
             foreign key(workspace_id) references workspaces(id),
-            foreign key(monitor_id) references monitors(id)
+            foreign key(monitor_id) references monitors(id),
+            foreign key(active_proxy_id) references proxies(id)
         );
 
         create table if not exists checkout_attempts (
@@ -711,6 +777,9 @@ def init_db() -> None:
             foreign key(retailer_account_id) references retailer_accounts(id),
             foreign key(payment_method_id) references payment_methods(id)
         );
+
+        create index if not exists idx_proxy_status_cooldown on proxies(status, cooldown_until);
+        create index if not exists idx_proxy_leases_active on proxy_leases(proxy_id) where released_at is null;
         """
     )
     existing = conn.execute("select id from workspaces limit 1").fetchone()
@@ -766,14 +835,239 @@ def init_db() -> None:
     ensure_column(conn, "workspaces", "proxy_url", "text")
     ensure_column(conn, "workspaces", "session_metadata", "text")
     ensure_column(conn, "monitors", "proxy_url", "text")
+    ensure_column(conn, "monitors", "proxy_type", "text")
+    ensure_column(conn, "monitors", "proxy_region", "text")
+    ensure_column(conn, "monitors", "proxy_residential_only", "integer not null default 0")
+    ensure_column(conn, "monitors", "proxy_sticky_session_seconds", "integer")
     ensure_column(conn, "monitors", "session_task_key", "text")
     ensure_column(conn, "monitors", "session_metadata", "text")
+    ensure_column(conn, "checkout_tasks", "active_proxy_id", "integer")
+    ensure_column(conn, "checkout_tasks", "active_proxy_lease_key", "text")
     ensure_column(conn, "jobs", "job_type", "text not null default 'monitor_check'")
     ensure_column(conn, "jobs", "monitor_id", "integer")
     ensure_column(conn, "jobs", "payload_json", "text")
     ensure_column(conn, "jobs", "last_error", "text")
     conn.commit()
     conn.close()
+
+
+def normalize_proxy_policy(policy: dict[str, Any] | None) -> dict[str, Any]:
+    policy = policy or {}
+    normalized: dict[str, Any] = {
+        "residential_only": bool(policy.get("residential_only")),
+    }
+    region = (policy.get("region") or "").strip().upper()
+    if region:
+        normalized["region"] = region
+    proxy_type = (policy.get("type") or "").strip().lower()
+    if proxy_type:
+        normalized["type"] = proxy_type
+    sticky_raw = policy.get("sticky_session_seconds")
+    if sticky_raw is not None:
+        sticky = int(sticky_raw)
+        if sticky < 0:
+            raise ValueError("sticky_session_seconds must be >= 0")
+        normalized["sticky_session_seconds"] = sticky
+    return normalized
+
+
+class ProxyAllocator:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+
+    def acquire_lease(
+        self,
+        *,
+        owner_type: str,
+        owner_id: int | None,
+        lease_key: str,
+        policy: dict[str, Any] | None = None,
+        lease_seconds: int = 60,
+    ) -> ProxyLease | None:
+        now_iso = utc_now()
+        expires_iso = datetime.fromisoformat(now_iso).timestamp() + max(1, lease_seconds)
+        expires_at = datetime.fromtimestamp(expires_iso, tz=timezone.utc).isoformat()
+        normalized = normalize_proxy_policy(policy)
+        filters = ["p.status = 'active'", "(p.cooldown_until is null or datetime(p.cooldown_until) <= datetime(?))"]
+        params: list[Any] = [now_iso]
+        if normalized.get("residential_only"):
+            filters.append("p.is_residential = 1")
+        if normalized.get("region"):
+            filters.append("upper(p.region_code) = ?")
+            params.append(normalized["region"])
+        if normalized.get("type"):
+            filters.append("p.proxy_type = ?")
+            params.append(normalized["type"])
+        if normalized.get("sticky_session_seconds"):
+            filters.append("(p.sticky_session_seconds is null or p.sticky_session_seconds >= ?)")
+            params.append(int(normalized["sticky_session_seconds"]))
+
+        self.conn.execute("begin immediate")
+        try:
+            self.conn.execute(
+                "update proxy_leases set released_at = ? where released_at is null and datetime(expires_at) <= datetime(?)",
+                (now_iso, now_iso),
+            )
+            existing = self.conn.execute(
+                """
+                select pl.id as lease_id, p.id as proxy_id, p.endpoint
+                from proxy_leases pl
+                join proxies p on p.id = pl.proxy_id
+                where pl.released_at is null
+                  and pl.owner_type = ?
+                  and pl.owner_id is ?
+                  and pl.lease_key = ?
+                  and datetime(pl.expires_at) > datetime(?)
+                limit 1
+                """,
+                (owner_type, owner_id, lease_key, now_iso),
+            ).fetchone()
+            if existing:
+                self.conn.commit()
+                return ProxyLease(
+                    lease_id=existing["lease_id"],
+                    proxy_id=existing["proxy_id"],
+                    endpoint=existing["endpoint"],
+                    lease_key=lease_key,
+                    owner_type=owner_type,
+                    owner_id=owner_id,
+                )
+            candidate = self.conn.execute(
+                f"""
+                select p.*
+                from proxies p
+                where {' and '.join(filters)}
+                  and not exists (
+                    select 1
+                    from proxy_leases pl
+                    where pl.proxy_id = p.id
+                      and pl.released_at is null
+                      and datetime(pl.expires_at) > datetime(?)
+                  )
+                order by p.health_score desc, p.fail_streak asc, coalesce(p.last_used_at, '1970-01-01T00:00:00+00:00') asc
+                limit 1
+                """,
+                (*params, now_iso),
+            ).fetchone()
+            if not candidate:
+                self.conn.commit()
+                return None
+            cur = self.conn.execute(
+                """
+                insert into proxy_leases(proxy_id, lease_key, owner_type, owner_id, acquired_at, expires_at)
+                values (?, ?, ?, ?, ?, ?)
+                """,
+                (candidate["id"], lease_key, owner_type, owner_id, now_iso, expires_at),
+            )
+            self.conn.execute(
+                "update proxies set last_used_at = ?, updated_at = ? where id = ?",
+                (now_iso, now_iso, candidate["id"]),
+            )
+            self.conn.commit()
+            return ProxyLease(
+                lease_id=int(cur.lastrowid),
+                proxy_id=candidate["id"],
+                endpoint=candidate["endpoint"],
+                lease_key=lease_key,
+                owner_type=owner_type,
+                owner_id=owner_id,
+            )
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def release_lease(self, *, lease_id: int) -> None:
+        now_iso = utc_now()
+        self.conn.execute("begin immediate")
+        try:
+            self.conn.execute(
+                "update proxy_leases set released_at = coalesce(released_at, ?) where id = ?",
+                (now_iso, lease_id),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def record_telemetry(self, *, lease: ProxyLease, request_result: RequestResult) -> None:
+        telemetry = request_result.telemetry
+        status = telemetry.status_code
+        is_timeout = telemetry.error_class in {"Timeout", "ReadTimeout", "ConnectTimeout"}
+        is_429 = status == 429
+        is_403 = status == 403
+        ok = telemetry.ok and not request_result.error
+        now_iso = utc_now()
+        self.conn.execute(
+            """
+            update proxies
+            set request_count = request_count + 1,
+                success_count = success_count + ?,
+                timeout_count = timeout_count + ?,
+                rate_limited_count = rate_limited_count + ?,
+                forbidden_count = forbidden_count + ?,
+                failure_count = failure_count + ?,
+                fail_streak = case when ? then 0 else fail_streak + 1 end,
+                last_success_at = case when ? then ? else last_success_at end,
+                last_failure_at = case when ? then last_failure_at else ? end,
+                updated_at = ?
+            where id = ?
+            """,
+            (
+                int(ok),
+                int(is_timeout),
+                int(is_429),
+                int(is_403),
+                int(not ok),
+                int(ok),
+                int(ok),
+                now_iso,
+                int(ok),
+                now_iso,
+                now_iso,
+                lease.proxy_id,
+            ),
+        )
+        self.conn.execute(
+            """
+            update proxies
+            set health_score = (
+                (cast(success_count as real) / nullif(request_count, 0))
+                - ((cast(timeout_count as real) / nullif(request_count, 0)) * 0.45)
+                - ((cast(rate_limited_count as real) / nullif(request_count, 0)) * 0.30)
+                - ((cast(forbidden_count as real) / nullif(request_count, 0)) * 0.60)
+                - min(0.30, fail_streak * 0.04)
+            )
+            where id = ? and request_count > 0
+            """,
+            (lease.proxy_id,),
+        )
+        row = self.conn.execute(
+            """
+            select request_count, fail_streak, health_score,
+                   (cast(timeout_count + rate_limited_count + forbidden_count as real) / nullif(request_count, 0)) as severe_failure_rate
+            from proxies
+            where id = ?
+            """,
+            (lease.proxy_id,),
+        ).fetchone()
+        if row and (
+            row["fail_streak"] >= 5
+            or (row["request_count"] >= 8 and (row["health_score"] or 0) < 0.30)
+            or (row["request_count"] >= 10 and (row["severe_failure_rate"] or 0) > 0.45)
+        ):
+            cooldown_at = datetime.now(timezone.utc).timestamp() + 15 * 60
+            cooldown_until = datetime.fromtimestamp(cooldown_at, tz=timezone.utc).isoformat()
+            self.conn.execute(
+                """
+                update proxies
+                set status = 'quarantined',
+                    cooldown_until = ?,
+                    quarantine_reason = 'auto_health_quarantine',
+                    updated_at = ?
+                where id = ?
+                """,
+                (cooldown_until, now_iso, lease.proxy_id),
+            )
 
 
 def perform_request(
@@ -786,6 +1080,7 @@ def perform_request(
     timeout: float,
     retry_total: int,
     backoff_factor: float,
+    proxy_lease: ProxyLease | None = None,
     **kwargs: Any,
 ) -> RequestResult:
     result = session_manager.request(
@@ -807,6 +1102,14 @@ def perform_request(
         level=level,
         workspace_id=workspace_id,
     )
+    if proxy_lease:
+        conn = db()
+        try:
+            allocator = ProxyAllocator(conn)
+            allocator.record_telemetry(lease=proxy_lease, request_result=result)
+            conn.commit()
+        finally:
+            conn.close()
     return result
 
 
@@ -1460,27 +1763,51 @@ def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
     }
     conn = db()
     workspace = conn.execute("select proxy_url from workspaces where id = ?", (monitor["workspace_id"],)).fetchone()
-    conn.close()
+    allocator = ProxyAllocator(conn)
     proxy_url = monitor["proxy_url"] or (workspace["proxy_url"] if workspace else None)
+    lease: ProxyLease | None = None
+    if not proxy_url:
+        policy = {
+            "residential_only": bool(monitor["proxy_residential_only"]),
+            "region": monitor["proxy_region"],
+            "type": monitor["proxy_type"],
+            "sticky_session_seconds": monitor["proxy_sticky_session_seconds"],
+        }
+        lease = allocator.acquire_lease(
+            owner_type="monitor",
+            owner_id=monitor["id"],
+            lease_key=monitor["session_task_key"] or f"monitor-{monitor['id']}",
+            policy=policy,
+            lease_seconds=int(monitor["proxy_sticky_session_seconds"] or 60),
+        )
+        if lease:
+            proxy_url = lease.endpoint
     task_key = monitor["session_task_key"] or f"monitor-{monitor['id']}"
-    req = perform_request(
-        task_key=task_key,
-        method="GET",
-        url=monitor["product_url"],
-        workspace_id=monitor["workspace_id"],
-        proxy_url=proxy_url,
-        timeout=15,
-        retry_total=2,
-        backoff_factor=0.35,
-        headers=headers,
-    )
-    if req.error:
-        raise req.error
-    assert req.response is not None
-    r = req.response
-    r.raise_for_status()
-    keyword = (monitor["keyword"] or "").strip() or None
-    return evaluate_page(r.text, keyword=keyword, retailer=monitor["retailer"])
+    try:
+        req = perform_request(
+            task_key=task_key,
+            method="GET",
+            url=monitor["product_url"],
+            workspace_id=monitor["workspace_id"],
+            proxy_url=proxy_url,
+            timeout=15,
+            retry_total=2,
+            backoff_factor=0.35,
+            proxy_lease=lease,
+            headers=headers,
+        )
+        if req.error:
+            raise req.error
+        assert req.response is not None
+        r = req.response
+        r.raise_for_status()
+        keyword = (monitor["keyword"] or "").strip() or None
+        return evaluate_page(r.text, keyword=keyword, retailer=monitor["retailer"])
+    finally:
+        if lease:
+            allocator.release_lease(lease_id=lease.lease_id)
+            conn.commit()
+        conn.close()
 
 
 def alert_eligibility(monitor: sqlite3.Row, result: MonitorResult) -> bool:
@@ -1704,6 +2031,9 @@ def create_checkout_task(
     task_config: dict[str, Any] | None = None,
     initial_state: str = "queued",
 ) -> sqlite3.Row:
+    task_config = dict(task_config or {})
+    if "proxy_policy" in task_config:
+        task_config["proxy_policy"] = normalize_proxy_policy(task_config.get("proxy_policy"))
     normalized_state = normalize_checkout_state(initial_state, allow_control_states=False)
     now_iso = utc_now()
     cur = conn.execute(
@@ -1770,6 +2100,32 @@ def transition_checkout_task(
         return None
 
     normalized_state = normalize_checkout_state(requested_state)
+    task_config = parse_json_object(row["task_config"])
+    active_lease_key = row["active_proxy_lease_key"]
+    active_proxy_id = row["active_proxy_id"]
+    allocator = ProxyAllocator(conn)
+    if normalized_state == "monitoring" and not active_lease_key:
+        policy = task_config.get("proxy_policy") if isinstance(task_config.get("proxy_policy"), dict) else {}
+        sticky = int(policy.get("sticky_session_seconds") or 300)
+        lease = allocator.acquire_lease(
+            owner_type="checkout_task",
+            owner_id=task_id,
+            lease_key=f"checkout-task-{task_id}",
+            policy=policy,
+            lease_seconds=sticky,
+        )
+        if lease:
+            active_lease_key = lease.lease_key
+            active_proxy_id = lease.proxy_id
+    if normalized_state in {"paused", "stopped", "success", "failed"} and active_lease_key:
+        lease_row = conn.execute(
+            "select id from proxy_leases where owner_type = 'checkout_task' and owner_id = ? and lease_key = ? and released_at is null",
+            (task_id, active_lease_key),
+        ).fetchone()
+        if lease_row:
+            allocator.release_lease(lease_id=lease_row["id"])
+        active_lease_key = None
+        active_proxy_id = None
     enabled = int(normalized_state not in {"stopped", "success", "failed"})
     is_paused = int(normalized_state == "paused")
     now_iso = utc_now()
@@ -1779,6 +2135,8 @@ def transition_checkout_task(
         set current_state = ?,
             enabled = ?,
             is_paused = ?,
+            active_proxy_id = ?,
+            active_proxy_lease_key = ?,
             last_error = ?,
             updated_at = ?,
             last_transition_at = ?
@@ -1788,6 +2146,8 @@ def transition_checkout_task(
             normalized_state,
             enabled,
             is_paused,
+            active_proxy_id,
+            active_lease_key,
             (error_text or "")[:500] if error_text else None,
             now_iso,
             now_iso,
@@ -1854,7 +2214,18 @@ def enqueue_checkout_for_monitor(
         workspace_id=monitor["workspace_id"],
         monitor_id=monitor["id"],
         task_name=f"Monitor {monitor['id']} checkout",
-        task_config={"retailer": monitor["retailer"], "product_url": monitor["product_url"]},
+        task_config={
+            "retailer": monitor["retailer"],
+            "product_url": monitor["product_url"],
+            "proxy_policy": normalize_proxy_policy(
+                {
+                    "residential_only": bool(monitor["proxy_residential_only"]),
+                    "region": monitor["proxy_region"],
+                    "type": monitor["proxy_type"],
+                    "sticky_session_seconds": monitor["proxy_sticky_session_seconds"],
+                }
+            ),
+        },
         initial_state="queued",
     )
     record_checkout_attempt(
@@ -3127,6 +3498,14 @@ def api_create_monitor():
         msrp_cents = body.get("msrp_cents")
         if msrp_cents is not None:
             msrp_cents = int(msrp_cents)
+        proxy_policy = normalize_proxy_policy(
+            {
+                "residential_only": body.get("proxy_residential_only", False),
+                "region": body.get("proxy_region"),
+                "type": body.get("proxy_type"),
+                "sticky_session_seconds": body.get("proxy_sticky_session_seconds"),
+            }
+        )
         if retailer not in SUPPORTED_RETAILERS:
             raise ValueError(f"Unsupported retailer '{retailer}'")
         if not (url.startswith("http://") or url.startswith("https://")):
@@ -3139,10 +3518,26 @@ def api_create_monitor():
     conn = db()
     cur = conn.execute(
         """
-        insert into monitors(workspace_id, retailer, product_url, keyword, max_price_cents, msrp_cents, poll_interval_seconds, created_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?)
+        insert into monitors(
+            workspace_id, retailer, product_url, keyword, max_price_cents, msrp_cents, poll_interval_seconds,
+            proxy_type, proxy_region, proxy_residential_only, proxy_sticky_session_seconds, created_at
+        )
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (current_workspace_id(), retailer, url, keyword, max_price_cents, msrp_cents, poll_interval, utc_now()),
+        (
+            current_workspace_id(),
+            retailer,
+            url,
+            keyword,
+            max_price_cents,
+            msrp_cents,
+            poll_interval,
+            proxy_policy.get("type"),
+            proxy_policy.get("region"),
+            int(proxy_policy.get("residential_only", False)),
+            proxy_policy.get("sticky_session_seconds"),
+            utc_now(),
+        ),
     )
     conn.commit()
     monitor_id = cur.lastrowid
@@ -3157,11 +3552,39 @@ def api_update_monitor(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     body = request.json or {}
     enabled = body.get("enabled")
-    if enabled is None:
-        return jsonify({"error": "enabled is required"}), 400
+    has_proxy_policy = any(
+        k in body for k in ("proxy_residential_only", "proxy_region", "proxy_type", "proxy_sticky_session_seconds")
+    )
+    if enabled is None and not has_proxy_policy:
+        return jsonify({"error": "enabled or proxy policy fields are required"}), 400
+    proxy_policy = normalize_proxy_policy(
+        {
+            "residential_only": body.get("proxy_residential_only", False),
+            "region": body.get("proxy_region"),
+            "type": body.get("proxy_type"),
+            "sticky_session_seconds": body.get("proxy_sticky_session_seconds"),
+        }
+    ) if has_proxy_policy else None
 
     conn = db()
-    conn.execute("update monitors set enabled = ? where id = ? and workspace_id = ?", (int(bool(enabled)), monitor_id, workspace_id))
+    if enabled is not None:
+        conn.execute("update monitors set enabled = ? where id = ? and workspace_id = ?", (int(bool(enabled)), monitor_id, workspace_id))
+    if proxy_policy is not None:
+        conn.execute(
+            """
+            update monitors
+            set proxy_type = ?, proxy_region = ?, proxy_residential_only = ?, proxy_sticky_session_seconds = ?
+            where id = ? and workspace_id = ?
+            """,
+            (
+                proxy_policy.get("type"),
+                proxy_policy.get("region"),
+                int(proxy_policy.get("residential_only", False)),
+                proxy_policy.get("sticky_session_seconds"),
+                monitor_id,
+                workspace_id,
+            ),
+        )
     conn.commit()
     row = conn.execute(
         "select * from monitors where id = ? and workspace_id = ?",

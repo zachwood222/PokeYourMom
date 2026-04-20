@@ -171,10 +171,10 @@ def test_captcha_invalid_or_missing_token_rejects_protected_post(tmp_path, monke
         headers=_auth_headers(),
     )
 
-    assert missing_token.status_code == 400
+    assert missing_token.status_code == 403
     assert missing_token.get_json()["reason"] == "missing_token"
-    assert invalid_token.status_code == 400
-    assert invalid_token.get_json()["reason"] == "invalid_token"
+    assert invalid_token.status_code == 403
+    assert invalid_token.get_json()["reason"] == "provider_rejected"
 
 
 def test_captcha_provider_errors_fail_safely(tmp_path, monkeypatch):
@@ -1262,6 +1262,24 @@ def test_init_db_creates_checkout_tables(tmp_path, monkeypatch):
     assert tables == {"checkout_tasks", "checkout_attempts", "task_logs"}
 
 
+def test_init_db_creates_proxy_tables(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    conn = app_module.db()
+    tables = {
+        row["name"]
+        for row in conn.execute(
+            "select name from sqlite_master where type = 'table' and name in ('proxies', 'proxy_leases')"
+        ).fetchall()
+    }
+    monitor_columns = {row["name"] for row in conn.execute("pragma table_info(monitors)").fetchall()}
+    conn.close()
+
+    assert tables == {"proxies", "proxy_leases"}
+    assert {"proxy_type", "proxy_region", "proxy_residential_only", "proxy_sticky_session_seconds"}.issubset(
+        monitor_columns
+    )
+
+
 def test_check_monitor_enqueues_checkout_task_for_eligible_stock(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -1352,3 +1370,86 @@ def test_checkout_task_lifecycle_routes(tmp_path, monkeypatch):
     payload = state_resp.get_json()
     assert payload["current_state"] == "stopped"
     assert payload["last_error"] is None
+
+
+def test_checkout_task_proxy_lease_is_acquired_and_released(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    now = app_module.utc_now()
+    conn.execute(
+        """
+        insert into proxies(provider, endpoint, proxy_type, status, created_at, updated_at, is_residential, region_code, sticky_session_seconds)
+        values ('pool-a', 'http://proxy.local:9000', 'http', 'active', ?, ?, 1, 'US', 600)
+        """,
+        (now, now),
+    )
+    conn.commit()
+    conn.close()
+
+    monitor_resp = client.post(
+        "/api/monitors",
+        json={"retailer": "target", "product_url": "https://example.com/item", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
+    )
+    monitor = monitor_resp.get_json()
+    assert monitor_resp.status_code == 201
+
+    task_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor["id"],
+            "task_name": "Checkout leased",
+            "task_config": {"proxy_policy": {"residential_only": True, "region": "us", "sticky_session_seconds": 300}},
+        },
+        headers=_auth_headers(),
+    )
+    task = task_resp.get_json()
+    assert task_resp.status_code == 201
+
+    start_resp = client.post(f"/api/checkout/tasks/{task['id']}/start", headers=_auth_headers())
+    assert start_resp.status_code == 200
+    started_task = start_resp.get_json()["task"]
+    assert started_task["active_proxy_id"] is not None
+    assert started_task["active_proxy_lease_key"] == f"checkout-task-{task['id']}"
+
+    pause_resp = client.post(f"/api/checkout/tasks/{task['id']}/pause", headers=_auth_headers())
+    assert pause_resp.status_code == 200
+    paused_task = pause_resp.get_json()["task"]
+    assert paused_task["active_proxy_id"] is None
+    assert paused_task["active_proxy_lease_key"] is None
+
+    conn = app_module.db()
+    lease_count = conn.execute(
+        "select count(*) as c from proxy_leases where owner_type = 'checkout_task' and owner_id = ? and released_at is not null",
+        (task["id"],),
+    ).fetchone()["c"]
+    conn.close()
+    assert lease_count == 1
+
+
+def test_create_monitor_accepts_proxy_policy_fields(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://example.com/item",
+            "poll_interval_seconds": 20,
+            "proxy_residential_only": True,
+            "proxy_region": "us",
+            "proxy_type": "http",
+            "proxy_sticky_session_seconds": 120,
+        },
+        headers=_auth_headers(),
+    )
+    payload = resp.get_json()
+
+    assert resp.status_code == 201
+    assert payload["proxy_residential_only"] == 1
+    assert payload["proxy_region"] == "US"
+    assert payload["proxy_type"] == "http"
+    assert payload["proxy_sticky_session_seconds"] == 120

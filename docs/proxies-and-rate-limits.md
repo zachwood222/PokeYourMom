@@ -1,35 +1,64 @@
 # Proxies and Rate Limits
 
-This project now uses a shared request/session utility (`network/session_manager.py`) for monitor fetches,
-webhook deliveries/tests, and update checks.
+This service now has first-class proxy pool management with lock-based leasing so monitor checks and checkout
+tasks can share a pool safely.
 
-## Current controls
+## Data model
 
-- Per-monitor polling cadence: `poll_interval_seconds`
-- Global loop cadence: `POLL_LOOP_SECONDS` environment variable
-- Per-task persistent sessions (cookie jar persisted under `.session_cookies/`)
-- Configurable timeout + retry + backoff in request helper calls
-- Structured request telemetry logged for latency/status/error class
-- Optional proxy assignment at workspace/monitor level via DB fields:
-  - `workspaces.proxy_url` (workspace default)
-  - `monitors.proxy_url` (monitor override)
-  - Session metadata placeholders:
-    - `workspaces.session_metadata`
-    - `monitors.session_task_key`
-    - `monitors.session_metadata`
-- Plan minimum intervals:
-  - `basic`: 20s
-  - `pro`: 10s
-  - `team`: 5s
+- `proxies`
+  - Required: `provider`, `endpoint`, `proxy_type`, `status`, `fail_streak`
+  - Health telemetry counters: `request_count`, `success_count`, `timeout_count`, `rate_limited_count`,
+    `forbidden_count`, `failure_count`, `health_score`
+  - Control fields: `cooldown_until`, `quarantine_reason`, `region_code`, `is_residential`,
+    `sticky_session_seconds`, `last_used_at`
+- `proxy_leases`
+  - Lease ownership: `proxy_id`, `owner_type`, `owner_id`, `lease_key`
+  - Lock lifecycle: `acquired_at`, `expires_at`, `released_at`
+  - Active leases are unique per proxy (`released_at is null`).
 
-## Operational guidance
+## Lease semantics
 
-- Keep monitor intervals conservative for large monitor sets.
-- Stagger monitor intervals across tasks to reduce burst pressure.
-- Prefer retailer-specific parsers over broad keyword matching to reduce retries.
-- Add request retry and timeout telemetry before increasing concurrency.
+- Lease acquisition is atomic (`BEGIN IMMEDIATE`) and releases expired leases before selecting candidates.
+- Candidate selection rejects proxies that are:
+  - disabled/quarantined (`status != 'active'`)
+  - still cooling down (`cooldown_until > now`)
+  - currently leased by another owner.
+- Monitors lease a proxy for each check and release it after request completion.
+- Checkout tasks lease on start (`/start`) and release on pause/stop/success/failure transitions.
 
-## Next enhancements
+## Proxy policy constraints (monitor + task config)
 
-- Add rotating proxy pools
-- Add retailer-specific backoff and adaptive throttling
+You can constrain allocator selection through:
+
+- `residential_only` / monitor field `proxy_residential_only`
+- `region` / monitor field `proxy_region`
+- `sticky_session_seconds` / monitor field `proxy_sticky_session_seconds`
+- `type` / monitor field `proxy_type`
+
+When present, these policies are enforced in allocator SQL filters before a proxy is leased.
+
+## Health scoring and auto-quarantine
+
+Each proxied request records telemetry (success/failure + status code class):
+
+- Timeout pressure (`Timeout`, `ReadTimeout`, `ConnectTimeout`)
+- Anti-bot pressure (`429` and `403` rates)
+- Success ratio
+
+`health_score` is recalculated after each request. Proxies are automatically quarantined (`status='quarantined'`)
+when severe trends are detected, for example:
+
+- fail streak reaches 5+
+- low score after warmup traffic
+- sustained high severe failure rate.
+
+Quarantine applies a cooldown window (`cooldown_until`), so the allocator will skip that endpoint until expiry
+or operator intervention.
+
+## Operator guidance
+
+- Seed multiple providers/endpoints to avoid single-proxy hotspots.
+- Prefer residential-only policy only where truly needed (it reduces available pool capacity).
+- Use region targeting only when retailer behavior requires geolocation affinity.
+- Keep sticky sessions short for monitor checks; use longer sticky windows for checkout workflows.
+- Investigate proxies with repeated `auto_health_quarantine` reasons and high `403` rates first.
