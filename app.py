@@ -413,6 +413,192 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -
         conn.execute(f"alter table {table} add column {column} {ddl}")
 
 
+def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "select 1 from sqlite_master where type = 'table' and name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def normalize_legacy_task_state(raw_state: Any) -> str:
+    state = str(raw_state or "").strip().lower()
+    compat_map = {
+        "idle": "queued",
+        "running": "monitoring",
+        "complete": "success",
+        "completed": "success",
+        "error": "failed",
+        "cancelled": "stopped",
+        "canceled": "stopped",
+    }
+    state = compat_map.get(state, state or "queued")
+    if state not in CHECKOUT_TASK_STATES:
+        return "queued"
+    return state
+
+
+def run_legacy_tasks_migration(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        create table if not exists schema_migrations (
+            key text primary key,
+            applied_at text not null
+        )
+        """
+    )
+    migration_key = "2026_04_20_legacy_tasks_to_checkout_tasks"
+    already_applied = conn.execute(
+        "select 1 from schema_migrations where key = ?",
+        (migration_key,),
+    ).fetchone()
+    if already_applied:
+        return
+
+    if not table_exists(conn, "tasks"):
+        conn.execute(
+            "insert into schema_migrations(key, applied_at) values (?, ?)",
+            (migration_key, utc_now()),
+        )
+        return
+
+    task_columns = {row["name"] for row in conn.execute("pragma table_info(tasks)").fetchall()}
+    if "id" not in task_columns:
+        conn.execute(
+            "insert into schema_migrations(key, applied_at) values (?, ?)",
+            (migration_key, utc_now()),
+        )
+        return
+
+    ensure_column(conn, "checkout_tasks", "legacy_task_id", "integer")
+    conn.execute(
+        """
+        create unique index if not exists idx_checkout_tasks_legacy_task_id
+        on checkout_tasks(legacy_task_id)
+        where legacy_task_id is not null
+        """
+    )
+
+    legacy_tasks = conn.execute("select * from tasks order by id asc").fetchall()
+    migrated_count = 0
+    for row in legacy_tasks:
+        legacy_task_id = int(row["id"])
+        existing = conn.execute(
+            "select id from checkout_tasks where legacy_task_id = ?",
+            (legacy_task_id,),
+        ).fetchone()
+        if existing:
+            continue
+
+        workspace_id = int(row["workspace_id"]) if "workspace_id" in task_columns and row["workspace_id"] else 1
+        retailer = (row["retailer"] if "retailer" in task_columns else None) or "walmart"
+        product_url = (
+            (row["product_url"] if "product_url" in task_columns else None)
+            or (row["url"] if "url" in task_columns else None)
+            or ""
+        )
+        profile = (row["profile"] if "profile" in task_columns else None) or ""
+        account = (row["account"] if "account" in task_columns else None) or ""
+        payment = (row["payment"] if "payment" in task_columns else None) or ""
+        normalized_state = normalize_legacy_task_state(row["state"] if "state" in task_columns else None)
+        last_error = (row["last_error"] if "last_error" in task_columns else None) or None
+        created_at = (row["created_at"] if "created_at" in task_columns else None) or utc_now()
+        updated_at = (row["updated_at"] if "updated_at" in task_columns else None) or created_at
+        last_step = (row["last_step"] if "last_step" in task_columns else None) or normalized_state
+        retries = int(row["retries"]) if "retries" in task_columns and row["retries"] is not None else 0
+
+        monitor_row = conn.execute(
+            """
+            select id from monitors
+            where workspace_id = ? and retailer = ? and product_url = ?
+            order by id asc
+            limit 1
+            """,
+            (workspace_id, retailer, product_url),
+        ).fetchone()
+        if monitor_row:
+            monitor_id = int(monitor_row["id"])
+        else:
+            cur = conn.execute(
+                """
+                insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, enabled, created_at)
+                values (?, ?, ?, 20, ?, ?)
+                """,
+                (workspace_id, retailer, product_url, int(normalized_state == "monitoring"), created_at),
+            )
+            monitor_id = int(cur.lastrowid)
+
+        task_config = json.dumps(
+            {
+                "retailer": retailer,
+                "product_url": product_url,
+                "profile": profile,
+                "account": account,
+                "payment": payment,
+            }
+        )
+        enabled = int(normalized_state not in {"stopped", "success", "failed"})
+        is_paused = int(normalized_state == "paused")
+        cur = conn.execute(
+            """
+            insert into checkout_tasks(
+                workspace_id,
+                monitor_id,
+                task_name,
+                task_config,
+                current_state,
+                enabled,
+                is_paused,
+                last_error,
+                created_at,
+                updated_at,
+                last_transition_at,
+                legacy_task_id
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                workspace_id,
+                monitor_id,
+                f"{retailer} task",
+                task_config,
+                normalized_state,
+                enabled,
+                is_paused,
+                last_error,
+                created_at,
+                updated_at,
+                updated_at,
+                legacy_task_id,
+            ),
+        )
+        new_task_id = int(cur.lastrowid)
+        conn.execute(
+            """
+            insert into checkout_attempts(task_id, workspace_id, monitor_id, state, status, details, error_text, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_task_id,
+                workspace_id,
+                monitor_id,
+                normalized_state,
+                "migrated",
+                json.dumps({"legacy_task_id": legacy_task_id, "last_step": last_step, "retries": retries}),
+                last_error,
+                updated_at,
+            ),
+        )
+        migrated_count += 1
+
+    conn.execute(
+        "insert into schema_migrations(key, applied_at) values (?, ?)",
+        (migration_key, utc_now()),
+    )
+    if migrated_count:
+        log(f"✅ Migrated {migrated_count} legacy rows from tasks to checkout_tasks")
+
+
 def init_db() -> None:
     conn = db()
     conn.executescript(
@@ -1938,6 +2124,27 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return payload
 
 
+def serialize_task_ui(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    payload = serialize_checkout_task(row)
+    if payload is None:
+        return None
+    config = payload.get("task_config") or {}
+    current_state = str(payload.get("current_state") or "queued")
+    state = "running" if current_state == "monitoring" else ("idle" if current_state == "queued" else current_state)
+    return {
+        "id": payload["id"],
+        "state": state,
+        "retries": 0,
+        "last_step": current_state,
+        "last_error": payload.get("last_error"),
+        "retailer": config.get("retailer"),
+        "product_url": config.get("product_url"),
+        "profile": config.get("profile"),
+        "account": config.get("account"),
+        "payment": config.get("payment"),
+    }
+
+
 def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
@@ -2425,124 +2632,6 @@ def worker_loop() -> None:
     log(f"Worker loop stopped ({WORKER_ID})")
 
 
-def run_task_worker(task_id: int, workspace_id: int, stop_event: threading.Event) -> None:
-    steps = ["session_init", "profile_submit", "account_submit", "payment_submit"]
-    max_attempts = 4
-    try:
-        for attempt_number in range(1, max_attempts + 1):
-            if stop_event.is_set():
-                break
-
-            conn = db()
-            set_task_state(
-                conn,
-                task_id,
-                state="running",
-                retries=attempt_number - 1,
-                last_step="session_init",
-                last_error=None,
-                started_at=utc_now(),
-                stopped_at=None,
-            )
-            conn.commit()
-            conn.close()
-            emit_task_update(task_id)
-            log(f"Task {task_id}: started attempt {attempt_number}", workspace_id=workspace_id)
-
-            attempt_failed = False
-            attempt_error = None
-            for step in steps:
-                if stop_event.is_set():
-                    break
-                conn = db()
-                set_task_state(conn, task_id, state="running", retries=attempt_number - 1, last_step=step, last_error=None)
-                conn.commit()
-                conn.close()
-                emit_task_update(task_id)
-                time.sleep(TASK_STEP_DELAY_SECONDS)
-
-            if stop_event.is_set():
-                break
-
-            if attempt_number < 3:
-                attempt_failed = True
-                attempt_error = f"Transient checkout failure at attempt {attempt_number}"
-
-            conn = db()
-            if attempt_failed:
-                set_task_state(
-                    conn,
-                    task_id,
-                    state="retrying",
-                    retries=attempt_number,
-                    last_step="retry_backoff",
-                    last_error=attempt_error,
-                )
-                attempt_id = insert_task_attempt(
-                    conn,
-                    task_id=task_id,
-                    workspace_id=workspace_id,
-                    attempt_number=attempt_number,
-                    state="failed",
-                    step="payment_submit",
-                    error=attempt_error,
-                )
-                conn.commit()
-                conn.close()
-                emit_task_attempt(task_id, attempt_id)
-                emit_task_update(task_id)
-                log(f"Task {task_id}: attempt {attempt_number} failed ({attempt_error})", level="warning", workspace_id=workspace_id)
-                time.sleep(TASK_STEP_DELAY_SECONDS)
-                continue
-
-            set_task_state(
-                conn,
-                task_id,
-                state="completed",
-                retries=attempt_number - 1,
-                last_step="completed",
-                last_error=None,
-            )
-            attempt_id = insert_task_attempt(
-                conn,
-                task_id=task_id,
-                workspace_id=workspace_id,
-                attempt_number=attempt_number,
-                state="success",
-                step="completed",
-                error=None,
-            )
-            conn.commit()
-            conn.close()
-            emit_task_attempt(task_id, attempt_id)
-            emit_task_update(task_id)
-            log(f"Task {task_id}: completed successfully on attempt {attempt_number}", workspace_id=workspace_id)
-            return
-
-        conn = db()
-        stop_reason = "stopped" if stop_event.is_set() else "failed"
-        stop_error = None if stop_event.is_set() else "Max retries exhausted"
-        set_task_state(
-            conn,
-            task_id,
-            state=stop_reason,
-            last_step="stopped" if stop_event.is_set() else "failed",
-            last_error=stop_error,
-            stopped_at=utc_now() if stop_event.is_set() else None,
-        )
-        conn.commit()
-        conn.close()
-        emit_task_update(task_id)
-        if stop_event.is_set():
-            log(f"Task {task_id}: stopped", workspace_id=workspace_id)
-        else:
-            log(f"Task {task_id}: max retries exhausted", level="error", workspace_id=workspace_id)
-    finally:
-        with task_runtime_lock:
-            task_threads.pop(task_id, None)
-            task_stop_events.pop(task_id, None)
-
-
 @app.route("/")
 def index():
     return render_template(
@@ -2765,222 +2854,6 @@ def api_list_monitors():
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
-
-
-@app.post("/api/tasks")
-@require_auth
-def api_create_task():
-    body = request.json or {}
-    try:
-        retailer = canonical_retailer((body.get("retailer") or "").strip())
-        product_url = (body.get("url") or body.get("product_url") or "").strip()
-        profile = (body.get("profile") or "").strip()
-        account = (body.get("account") or "").strip()
-        payment = (body.get("payment") or "").strip()
-        if retailer not in SUPPORTED_RETAILERS:
-            raise ValueError(f"Unsupported retailer '{retailer}'")
-        if not (product_url.startswith("http://") or product_url.startswith("https://")):
-            raise ValueError("url must be http(s)")
-        if not profile:
-            raise ValueError("profile is required")
-        if not account:
-            raise ValueError("account is required")
-        if not payment:
-            raise ValueError("payment is required")
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-
-    workspace_id = current_workspace_id()
-    conn = db()
-    enforce_plan_limits(workspace_id, 20)
-    monitor_cur = conn.execute(
-        """
-        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, enabled, created_at)
-        values (?, ?, ?, 20, 0, ?)
-        """,
-        (workspace_id, retailer, product_url, utc_now()),
-    )
-    monitor_id = int(monitor_cur.lastrowid)
-    task = create_checkout_task(
-        conn,
-        workspace_id=workspace_id,
-        monitor_id=monitor_id,
-        task_name=f"{retailer} task",
-        task_config={
-            "retailer": retailer,
-            "product_url": product_url,
-            "profile": profile,
-            "account": account,
-            "payment": payment,
-        },
-        initial_state="queued",
-    )
-    conn.commit()
-    conn.close()
-
-    payload = {
-        "id": task["id"],
-        "workspace_id": workspace_id,
-        "retailer": retailer,
-        "product_url": product_url,
-        "profile": profile,
-        "account": account,
-        "payment": payment,
-        "state": "idle",
-        "retries": 0,
-        "last_step": None,
-        "last_error": None,
-    }
-    socketio.emit("task_update", payload)
-    return jsonify(payload), 201
-
-
-@app.get("/api/tasks")
-@require_auth
-def api_list_tasks():
-    conn = db()
-    rows = conn.execute(
-        "select * from checkout_tasks where workspace_id = ? order by id desc",
-        (current_workspace_id(),),
-    ).fetchall()
-    payloads = []
-    for row in rows:
-        config = {}
-        raw = row["task_config"]
-        if raw:
-            try:
-                config = json.loads(raw)
-            except (TypeError, json.JSONDecodeError):
-                config = {}
-        state = row["current_state"]
-        compat_state = "idle" if state == "queued" and not row["enabled"] else ("running" if state == "monitoring" else state)
-        payloads.append(
-            {
-                "id": row["id"],
-                "workspace_id": row["workspace_id"],
-                "retailer": config.get("retailer"),
-                "product_url": config.get("product_url"),
-                "profile": config.get("profile"),
-                "account": config.get("account"),
-                "payment": config.get("payment"),
-                "state": compat_state,
-                "retries": 0,
-                "last_step": row["current_state"],
-                "last_error": row["last_error"],
-            }
-        )
-    conn.close()
-    return jsonify(payloads)
-
-
-@app.post("/api/tasks/<int:task_id>/start")
-@require_auth
-def api_start_task(task_id: int):
-    workspace_id = current_workspace_id()
-    conn = db()
-    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
-    if not task:
-        conn.close()
-        return jsonify({"error": "Task not found"}), 404
-    transitioned = transition_checkout_task(
-        conn,
-        task_id=task_id,
-        workspace_id=workspace_id,
-        requested_state="monitoring",
-        reason="compat_api_start_task",
-    )
-    conn.commit()
-    conn.close()
-    assert transitioned is not None
-    config = json.loads(transitioned["task_config"] or "{}")
-    payload = {
-        "id": transitioned["id"],
-        "workspace_id": workspace_id,
-        "retailer": config.get("retailer"),
-        "product_url": config.get("product_url"),
-        "profile": config.get("profile"),
-        "account": config.get("account"),
-        "payment": config.get("payment"),
-        "state": "running",
-        "retries": 0,
-        "last_step": transitioned["current_state"],
-        "last_error": transitioned["last_error"],
-    }
-    socketio.emit("task_update", payload)
-    return jsonify({"ok": True, "task": payload, "already_running": False})
-
-
-@app.post("/api/tasks/<int:task_id>/stop")
-@require_auth
-def api_stop_task(task_id: int):
-    workspace_id = current_workspace_id()
-    conn = db()
-    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
-    if not task:
-        conn.close()
-        return jsonify({"error": "Task not found"}), 404
-    transitioned = transition_checkout_task(
-        conn,
-        task_id=task_id,
-        workspace_id=workspace_id,
-        requested_state="stopped",
-        reason="compat_api_stop_task",
-    )
-    conn.commit()
-    conn.close()
-    assert transitioned is not None
-    config = json.loads(transitioned["task_config"] or "{}")
-    payload = {
-        "id": transitioned["id"],
-        "workspace_id": workspace_id,
-        "retailer": config.get("retailer"),
-        "product_url": config.get("product_url"),
-        "profile": config.get("profile"),
-        "account": config.get("account"),
-        "payment": config.get("payment"),
-        "state": "stopped",
-        "retries": 0,
-        "last_step": transitioned["current_state"],
-        "last_error": transitioned["last_error"],
-    }
-    socketio.emit("task_update", payload)
-    return jsonify({"ok": True, "task": payload})
-
-
-@app.get("/api/tasks/<int:task_id>/attempts")
-@require_auth
-def api_task_attempts(task_id: int):
-    workspace_id = current_workspace_id()
-    conn = db()
-    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
-    if not task:
-        conn.close()
-        return jsonify({"error": "Task not found"}), 404
-    attempts = conn.execute(
-        """
-        select
-            id,
-            task_id,
-            workspace_id,
-            monitor_id,
-            coalesce(attempt_number, id) as attempt_number,
-            state,
-            coalesce(step, status) as step,
-            coalesce(error, error_text) as error,
-            details,
-            status,
-            error_text,
-            created_at,
-            updated_at
-        from checkout_attempts
-        where workspace_id = ? and task_id = ?
-          and coalesce(step, status) != 'created'
-        order by id desc
-        """,
-        (workspace_id, task_id),
-    ).fetchall()
-    conn.close()
-    return jsonify([dict(row) for row in attempts])
 
 
 @app.get("/api/dashboard/summary")
@@ -3286,7 +3159,59 @@ def api_create_checkout_task():
 
     conn.commit()
     conn.close()
-    return jsonify(serialize_checkout_task(task)), 201
+    payload = serialize_checkout_task_summary(task)
+    socketio.emit("task_update", payload)
+    return jsonify(payload), 201
+
+
+@app.get("/api/checkout/tasks")
+@require_auth
+def api_list_checkout_tasks():
+    conn = db()
+    rows = conn.execute(
+        """
+        select *
+        from checkout_tasks
+        where workspace_id = ?
+        order by id desc
+        """,
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_checkout_task_summary(row) for row in rows])
+
+
+@app.get("/api/checkout/tasks/<int:task_id>/attempts")
+@require_auth
+def api_checkout_task_attempts(task_id: int):
+    conn = db()
+    task = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
+    if not task:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    attempts = conn.execute(
+        """
+        select *
+        from checkout_attempts
+        where task_id = ? and workspace_id = ?
+        order by id desc
+        """,
+        (task_id, current_workspace_id()),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(row) for row in attempts])
+
+
+@app.get("/api/checkout/tasks")
+@require_auth
+def api_list_checkout_tasks():
+    conn = db()
+    rows = conn.execute(
+        "select * from checkout_tasks where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_task_ui(row) for row in rows])
 
 
 @app.post("/api/checkout/tasks/<int:task_id>/start")
@@ -3305,7 +3230,9 @@ def api_start_checkout_task(task_id: int):
         return jsonify({"error": "Checkout task not found"}), 404
     conn.commit()
     conn.close()
-    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+    payload = serialize_checkout_task_summary(row)
+    socketio.emit("task_update", payload)
+    return jsonify({"ok": True, "task": payload})
 
 
 @app.post("/api/checkout/tasks/<int:task_id>/pause")
@@ -3324,7 +3251,9 @@ def api_pause_checkout_task(task_id: int):
         return jsonify({"error": "Checkout task not found"}), 404
     conn.commit()
     conn.close()
-    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+    payload = serialize_checkout_task_summary(row)
+    socketio.emit("task_update", payload)
+    return jsonify({"ok": True, "task": payload})
 
 
 @app.post("/api/checkout/tasks/<int:task_id>/stop")
@@ -3343,7 +3272,42 @@ def api_stop_checkout_task(task_id: int):
         return jsonify({"error": "Checkout task not found"}), 404
     conn.commit()
     conn.close()
-    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+    payload = serialize_checkout_task_summary(row)
+    socketio.emit("task_update", payload)
+    return jsonify({"ok": True, "task": payload})
+
+
+@app.get("/api/checkout/tasks/<int:task_id>/attempts")
+@require_auth
+def api_checkout_task_attempts(task_id: int):
+    conn = db()
+    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    attempts = conn.execute(
+        """
+        select id, task_id, state, status, error_text, created_at
+        from checkout_attempts
+        where task_id = ?
+        order by id desc
+        """,
+        (task_id,),
+    ).fetchall()
+    conn.close()
+    return jsonify(
+        [
+            {
+                "id": a["id"],
+                "task_id": a["task_id"],
+                "state": a["state"],
+                "step": a["status"],
+                "error": a["error_text"],
+                "created_at": a["created_at"],
+            }
+            for a in attempts
+        ]
+    )
 
 
 @app.get("/api/checkout/tasks/<int:task_id>/state")
