@@ -1,64 +1,82 @@
 # Proxies and Rate Limits
 
-This service now has first-class proxy pool management with lock-based leasing so monitor checks and checkout
-tasks can share a pool safely.
+This project now uses a shared request/session utility (`network/session_manager.py`) for monitor fetches,
+webhook deliveries/tests, and update checks.
 
-## Data model
+## Current controls
 
-- `proxies`
-  - Required: `provider`, `endpoint`, `proxy_type`, `status`, `fail_streak`
-  - Health telemetry counters: `request_count`, `success_count`, `timeout_count`, `rate_limited_count`,
-    `forbidden_count`, `failure_count`, `health_score`
-  - Control fields: `cooldown_until`, `quarantine_reason`, `region_code`, `is_residential`,
-    `sticky_session_seconds`, `last_used_at`
-- `proxy_leases`
-  - Lease ownership: `proxy_id`, `owner_type`, `owner_id`, `lease_key`
-  - Lock lifecycle: `acquired_at`, `expires_at`, `released_at`
-  - Active leases are unique per proxy (`released_at is null`).
+- Per-monitor polling cadence: `poll_interval_seconds`
+- Global loop cadence: `POLL_LOOP_SECONDS` environment variable
+- Queue-side randomized scheduling:
+  - `QUEUE_ENQUEUE_JITTER_SECONDS` (default `1.25s`) spreads newly due jobs
+  - `WORKER_IDLE_SLEEP_JITTER_SECONDS` (default `0.75s`) avoids synchronized worker wakes
+  - `WORKER_ACTIVE_JITTER_SECONDS` (default `0.2s`) adds bounded spacing between claimed jobs
+- Per-task persistent sessions (cookie jar persisted under `.session_cookies/`)
+- Configurable timeout + retry + backoff in request helper calls
+- Structured request telemetry logged for latency/status/error class plus pacing fields:
+  - `pacing_profile`
+  - `planned_delay_ms`
+  - `applied_delay_ms`
+  - `adaptive_level`
+  - `throttled`
+  - `throttle_reason`
+- Optional proxy assignment at workspace/monitor level via DB fields:
+  - `workspaces.proxy_url` (workspace default)
+  - `monitors.proxy_url` (monitor override)
+- Session metadata placeholders:
+    - `workspaces.session_metadata`
+    - `monitors.session_task_key`
+    - `monitors.session_metadata`
+- Request behavior metadata:
+  - `workspaces.behavior_metadata` (workspace default policy)
+  - `monitors.behavior_metadata` (monitor override policy)
+- Plan minimum intervals:
+  - `basic`: 20s
+  - `pro`: 10s
+  - `team`: 5s
 
-## Lease semantics
+## Policy defaults
 
-- Lease acquisition is atomic (`BEGIN IMMEDIATE`) and releases expired leases before selecting candidates.
-- Candidate selection rejects proxies that are:
-  - disabled/quarantined (`status != 'active'`)
-  - still cooling down (`cooldown_until > now`)
-  - currently leased by another owner.
-- Monitors lease a proxy for each check and release it after request completion.
-- Checkout tasks lease on start (`/start`) and release on pause/stop/success/failure transitions.
+Default request behavior policy:
 
-## Proxy policy constraints (monitor + task config)
+- `base_delay_seconds`: `0.2`
+- `jitter_ratio`: `0.2`
+- `min_delay_seconds`: `0.05`
+- `max_delay_seconds`: `2.5`
+- `adaptive_backoff_enabled`: `true`
+- `adaptive_backoff_step_seconds`: `0.4`
+- `adaptive_backoff_cap_seconds`: `5.0`
+- Retailer profiles (override default profile):
+  - walmart: base `0.3s`, max `3.0s`
+  - target: base `0.25s`, max `2.5s`
+  - bestbuy: base `0.2s`, max `2.0s`
+  - pokemoncenter: base `0.35s`, max `3.5s`
 
-You can constrain allocator selection through:
+## Operational guidance
 
-- `residential_only` / monitor field `proxy_residential_only`
-- `region` / monitor field `proxy_region`
-- `sticky_session_seconds` / monitor field `proxy_sticky_session_seconds`
-- `type` / monitor field `proxy_type`
+- Keep monitor intervals conservative for large monitor sets (target 20s+ unless paid plan and proven stable).
+- Stagger monitor intervals and keep enqueue jitter enabled to reduce synchronized bursts.
+- Prefer retailer-specific parsers over broad keyword matching to reduce retries.
+- Use behavior metadata overrides per workspace/monitor instead of globally shrinking delays.
+- Tune only one dimension at a time (poll interval, base delay, or backoff step), and observe telemetry for at least 30 minutes.
 
-When present, these policies are enforced in allocator SQL filters before a proxy is leased.
+## Safe operational limits
 
-## Health scoring and auto-quarantine
+- Recommended `poll_interval_seconds` floor:
+  - `basic`: `>= 20s`
+  - `pro`: `>= 10s`
+  - `team`: `>= 5s`
+- Recommended request pacing bounds:
+  - `base_delay_seconds`: `0.15s` to `1.5s`
+  - `jitter_ratio`: `0.1` to `0.35`
+  - `max_delay_seconds`: `<= 5s`
+  - `adaptive_backoff_cap_seconds`: `<= 10s`
+- If throttle signals (`429`/`503`) or `throttled=1` increase for more than 10 minutes:
+  - raise base delay by `+0.1s` to `+0.25s`,
+  - keep jitter at or above `0.2`,
+  - avoid increasing worker count before throttle rate stabilizes.
 
-Each proxied request records telemetry (success/failure + status code class):
+## Next enhancements
 
-- Timeout pressure (`Timeout`, `ReadTimeout`, `ConnectTimeout`)
-- Anti-bot pressure (`429` and `403` rates)
-- Success ratio
-
-`health_score` is recalculated after each request. Proxies are automatically quarantined (`status='quarantined'`)
-when severe trends are detected, for example:
-
-- fail streak reaches 5+
-- low score after warmup traffic
-- sustained high severe failure rate.
-
-Quarantine applies a cooldown window (`cooldown_until`), so the allocator will skip that endpoint until expiry
-or operator intervention.
-
-## Operator guidance
-
-- Seed multiple providers/endpoints to avoid single-proxy hotspots.
-- Prefer residential-only policy only where truly needed (it reduces available pool capacity).
-- Use region targeting only when retailer behavior requires geolocation affinity.
-- Keep sticky sessions short for monitor checks; use longer sticky windows for checkout workflows.
-- Investigate proxies with repeated `auto_health_quarantine` reasons and high `403` rates first.
+- Add rotating proxy pools
+- Add explicit throttle outcome aggregation endpoints for dashboard tuning
