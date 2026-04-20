@@ -390,6 +390,28 @@ def test_api_routes_require_auth(tmp_path, monkeypatch):
     assert resp.get_json() == {"error": "Unauthorized"}
 
 
+def test_api_routes_accept_x_api_token_without_bearer(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/monitors", headers={"X-API-Token": "test-token"})
+
+    assert resp.status_code == 200
+
+
+def test_bearer_auth_is_checked_before_x_api_token(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get(
+        "/api/monitors",
+        headers={"Authorization": "Bearer wrong-token", "X-API-Token": "test-token"},
+    )
+
+    assert resp.status_code == 401
+    assert resp.get_json() == {"error": "Unauthorized"}
+
+
 def test_captcha_valid_token_allows_request(tmp_path, monkeypatch):
     monkeypatch.setenv("CAPTCHA_SECRET_KEY", "captcha-secret")
     monkeypatch.setenv("CAPTCHA_VERIFY_URL", "https://captcha.example/verify")

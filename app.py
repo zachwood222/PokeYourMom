@@ -856,8 +856,10 @@ def get_workspace_from_auth() -> sqlite3.Row:
 def _token_from_request() -> str | None:
     auth_header = (request.headers.get("Authorization") or "").strip()
     if auth_header.lower().startswith("bearer "):
-        return auth_header[7:].strip()
-    return None
+        token = auth_header[7:].strip()
+        return token or None
+    token = (request.headers.get("X-API-Token") or "").strip()
+    return token or None
 
 
 def _set_auth_context(user: sqlite3.Row | dict[str, Any], workspace: sqlite3.Row) -> None:
