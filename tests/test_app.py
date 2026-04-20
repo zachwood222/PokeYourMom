@@ -51,6 +51,28 @@ def test_protected_endpoint_requires_auth(tmp_path, monkeypatch):
     assert "Unauthorized" in resp.get_json()["error"]
 
 
+def test_workspace_endpoint_requires_auth(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/workspace")
+
+    assert resp.status_code == 401
+    assert resp.get_json() == {"error": "Unauthorized"}
+
+
+def test_workspace_endpoint_allows_authenticated_user_and_returns_context(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/workspace", headers={"Authorization": "Bearer test-token"})
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["workspace"]["id"] == 1
+    assert payload["user"]["email"] == "owner@local.test"
+
+
 def test_create_monitor_validates_retailer(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -214,6 +236,10 @@ def test_captcha_invalid_or_missing_token_rejects_protected_post(tmp_path, monke
     assert missing_token.get_json()["reason"] == "missing_token"
     assert invalid_token.status_code in {400, 403}
     assert invalid_token.get_json()["reason"] in {"invalid_token", "provider_rejected"}
+    assert missing_token.status_code == 403
+    assert missing_token.get_json()["reason"] == "missing_token"
+    assert invalid_token.status_code == 403
+    assert invalid_token.get_json()["reason"] == "provider_rejected"
 
 
 def test_captcha_provider_errors_fail_safely(tmp_path, monkeypatch):
@@ -417,6 +443,35 @@ def test_init_db_migrates_existing_monitors_table_with_msrp_column(tmp_path, mon
     assert "session_metadata" in columns
     assert "proxy_url" in workspace_columns
     assert "session_metadata" in workspace_columns
+
+
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
 
 
 def test_api_routes_require_auth(tmp_path, monkeypatch):
