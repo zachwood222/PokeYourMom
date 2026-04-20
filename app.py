@@ -38,6 +38,8 @@ POLL_LOOP_SECONDS = int(os.getenv("POLL_LOOP_SECONDS", "15"))
 WORKER_IDLE_SLEEP_SECONDS = float(os.getenv("WORKER_IDLE_SLEEP_SECONDS", "2.0"))
 WORKER_LOCK_TIMEOUT_SECONDS = int(os.getenv("WORKER_LOCK_TIMEOUT_SECONDS", "60"))
 WORKER_ID = os.getenv("WORKER_ID", f"worker-{uuid4()}")
+ACCOUNT_START_DELAY_MIN_SECONDS = int(os.getenv("ACCOUNT_START_DELAY_MIN_SECONDS", "1"))
+ACCOUNT_START_DELAY_MAX_SECONDS = int(os.getenv("ACCOUNT_START_DELAY_MAX_SECONDS", "8"))
 APP_ROLE = os.getenv("APP_ROLE", "api").lower()
 ENABLE_EMBEDDED_WORKER = os.getenv("ENABLE_EMBEDDED_WORKER", "0") == "1"
 DEFAULT_PLAN = os.getenv("DEFAULT_PLAN", "basic")
@@ -689,6 +691,12 @@ def init_db() -> None:
             username text,
             email text,
             encrypted_credential_ref text not null,
+            proxy_url text,
+            proxy_lock_state text not null default 'unlocked',
+            proxy_lock_owner text,
+            proxy_lock_acquired_at text,
+            last_used_at text,
+            next_start_after text,
             session_status text not null default 'logged_out',
             created_at text not null,
             updated_at text not null,
@@ -772,6 +780,12 @@ def init_db() -> None:
     ensure_column(conn, "jobs", "monitor_id", "integer")
     ensure_column(conn, "jobs", "payload_json", "text")
     ensure_column(conn, "jobs", "last_error", "text")
+    ensure_column(conn, "retailer_accounts", "proxy_url", "text")
+    ensure_column(conn, "retailer_accounts", "proxy_lock_state", "text not null default 'unlocked'")
+    ensure_column(conn, "retailer_accounts", "proxy_lock_owner", "text")
+    ensure_column(conn, "retailer_accounts", "proxy_lock_acquired_at", "text")
+    ensure_column(conn, "retailer_accounts", "last_used_at", "text")
+    ensure_column(conn, "retailer_accounts", "next_start_after", "text")
     conn.commit()
     conn.close()
 
@@ -1824,6 +1838,20 @@ def enqueue_checkout_for_monitor(
     if not result.in_stock:
         return None
     conn = db()
+    binding_ok, binding_error = _require_checkout_binding(
+        conn,
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+    )
+    if not binding_ok:
+        log(
+            f"Skipping checkout enqueue for monitor {monitor['id']}: {binding_error}",
+            level="warning",
+            workspace_id=monitor["workspace_id"],
+            monitor_id=monitor["id"],
+        )
+        conn.close()
+        return None
     existing = conn.execute(
         """
         select * from checkout_tasks
@@ -1885,6 +1913,39 @@ def enqueue_checkout_for_monitor(
     return int(task["id"])
 
 
+def _checkout_binding_for_monitor(
+    conn: sqlite3.Connection, *, workspace_id: int, monitor_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        select b.*, a.proxy_url as account_proxy_url
+        from task_profile_bindings b
+        left join retailer_accounts a
+          on a.id = b.retailer_account_id
+         and a.workspace_id = b.workspace_id
+        where b.workspace_id = ? and b.monitor_id = ?
+        """,
+        (workspace_id, monitor_id),
+    ).fetchone()
+
+
+def _require_checkout_binding(
+    conn: sqlite3.Connection, *, workspace_id: int, monitor_id: int
+) -> tuple[bool, str | None]:
+    binding = _checkout_binding_for_monitor(conn, workspace_id=workspace_id, monitor_id=monitor_id)
+    if not binding:
+        return False, "Task binding is required before creating checkout tasks"
+    if binding["retailer_account_id"] is None:
+        return False, "Task binding must include retailer_account_id for checkout-capable tasks"
+    account = conn.execute(
+        "select id from retailer_accounts where id = ? and workspace_id = ?",
+        (binding["retailer_account_id"], workspace_id),
+    ).fetchone()
+    if not account:
+        return False, "retailer_account_id in task binding does not exist"
+    return True, None
+
+
 def cents_to_dollars(cents: int | None) -> str:
     if cents is None:
         return "unknown"
@@ -1928,6 +1989,12 @@ def serialize_payment_method(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 def serialize_retailer_account(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return dict(row)
+
+
+def serialize_task_profile_binding(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     return dict(row)
@@ -2369,6 +2436,157 @@ def execute_monitor_job(queue: SQLiteJobQueue, job: Job, *, now_iso: str) -> Non
         )
 
 
+def _active_checkout_states() -> tuple[str, ...]:
+    return ("queued", "monitoring", "carting", "shipping", "payment", "submitting")
+
+
+def _release_proxy_lock_if_owned(conn: sqlite3.Connection, account_id: int) -> None:
+    conn.execute(
+        """
+        update retailer_accounts
+        set proxy_lock_state = 'unlocked',
+            proxy_lock_owner = null,
+            proxy_lock_acquired_at = null,
+            updated_at = ?
+        where id = ?
+        """,
+        (utc_now(), account_id),
+    )
+
+
+def _try_acquire_proxy_lock(conn: sqlite3.Connection, account: sqlite3.Row, *, now_iso: str) -> bool:
+    proxy_url = (account["proxy_url"] or "").strip()
+    if not proxy_url:
+        conn.execute(
+            """
+            update retailer_accounts
+            set proxy_lock_state = 'unlocked',
+                proxy_lock_owner = null,
+                proxy_lock_acquired_at = null,
+                updated_at = ?
+            where id = ?
+            """,
+            (now_iso, account["id"]),
+        )
+        return True
+    lock_owner = f"account:{account['id']}"
+    conflict = conn.execute(
+        """
+        select id
+        from retailer_accounts
+        where workspace_id = ?
+          and proxy_url = ?
+          and id != ?
+          and proxy_lock_state = 'locked'
+        limit 1
+        """,
+        (account["workspace_id"], proxy_url, account["id"]),
+    ).fetchone()
+    if conflict:
+        return False
+    conn.execute(
+        """
+        update retailer_accounts
+        set proxy_lock_state = 'locked',
+            proxy_lock_owner = ?,
+            proxy_lock_acquired_at = coalesce(proxy_lock_acquired_at, ?),
+            last_used_at = ?,
+            updated_at = ?
+        where id = ?
+        """,
+        (lock_owner, now_iso, now_iso, now_iso, account["id"]),
+    )
+    return True
+
+
+def _deterministic_account_delay_seconds(account_id: int) -> int:
+    floor = min(ACCOUNT_START_DELAY_MIN_SECONDS, ACCOUNT_START_DELAY_MAX_SECONDS)
+    ceiling = max(ACCOUNT_START_DELAY_MIN_SECONDS, ACCOUNT_START_DELAY_MAX_SECONDS)
+    if floor == ceiling:
+        return floor
+    span = ceiling - floor + 1
+    bucket = int(datetime.now(timezone.utc).timestamp() // 60)
+    digest = hashlib.sha256(f"{account_id}:{bucket}".encode("utf-8")).hexdigest()
+    return floor + (int(digest[:8], 16) % span)
+
+
+def run_checkout_account_scheduler(conn: sqlite3.Connection, *, now_iso: str) -> None:
+    rows = conn.execute(
+        """
+        select
+            a.*,
+            t.id as task_id,
+            t.current_state as task_state,
+            t.created_at as task_created_at
+        from retailer_accounts a
+        left join task_profile_bindings b
+          on b.workspace_id = a.workspace_id
+         and b.retailer_account_id = a.id
+        left join checkout_tasks t
+          on t.workspace_id = a.workspace_id
+         and t.monitor_id = b.monitor_id
+         and t.is_paused = 0
+         and t.current_state in ('queued', 'monitoring', 'carting', 'shipping', 'payment', 'submitting')
+        order by a.id asc, t.id asc
+        """
+    ).fetchall()
+    if not rows:
+        return
+    by_account: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        payload = by_account.setdefault(
+            row["id"],
+            {"account": row, "tasks": []},
+        )
+        if row["task_id"] is not None:
+            payload["tasks"].append(row)
+
+    for account_id, payload in by_account.items():
+        account = payload["account"]
+        tasks = payload["tasks"]
+        if not tasks:
+            _release_proxy_lock_if_owned(conn, account_id)
+            continue
+
+        lock_ok = _try_acquire_proxy_lock(conn, account, now_iso=now_iso)
+        if not lock_ok:
+            continue
+        active_now = next((t for t in tasks if t["task_state"] != "queued"), None)
+        if active_now:
+            continue
+
+        next_start_after = account["next_start_after"]
+        if next_start_after:
+            try:
+                if datetime.fromisoformat(next_start_after) > datetime.fromisoformat(now_iso):
+                    continue
+            except ValueError:
+                pass
+        next_task = tasks[0]
+        transition_checkout_task(
+            conn,
+            task_id=next_task["task_id"],
+            workspace_id=account["workspace_id"],
+            requested_state="monitoring",
+            reason="account_scheduler_start",
+        )
+        delay_seconds = _deterministic_account_delay_seconds(account_id)
+        next_start_ts = datetime.now(timezone.utc).timestamp() + delay_seconds
+        conn.execute(
+            """
+            update retailer_accounts
+            set next_start_after = ?, last_used_at = ?, updated_at = ?
+            where id = ?
+            """,
+            (
+                datetime.fromtimestamp(next_start_ts, tz=timezone.utc).isoformat(),
+                now_iso,
+                now_iso,
+                account_id,
+            ),
+        )
+
+
 def worker_loop() -> None:
     log(f"Worker loop started ({WORKER_ID})")
     while worker_running:
@@ -2376,6 +2594,7 @@ def worker_loop() -> None:
             conn = db()
             now_iso = utc_now()
             queue = SQLiteJobQueue(conn, worker_id=WORKER_ID)
+            run_checkout_account_scheduler(conn, now_iso=now_iso)
             apply_due_schedules(conn)
             monitors = conn.execute("select * from monitors where enabled = 1").fetchall()
             for monitor in monitors:
@@ -3220,6 +3439,14 @@ def api_create_checkout_task():
     if not monitor:
         conn.close()
         return jsonify({"error": "Monitor not found"}), 404
+    binding_ok, binding_error = _require_checkout_binding(
+        conn,
+        workspace_id=workspace_id,
+        monitor_id=int(monitor_id),
+    )
+    if not binding_ok:
+        conn.close()
+        return jsonify({"error": binding_error}), 400
 
     initial_state = body.get("initial_state", "queued")
     try:
@@ -3629,6 +3856,7 @@ def api_create_account():
         credential_ref = (body.get("encrypted_credential_ref") or "").strip()
         if not credential_ref:
             raise ValueError("encrypted_credential_ref is required")
+        proxy_url = (body.get("proxy_url") or "").strip() or None
         session_status = (body.get("session_status") or "logged_out").strip().lower()
         if session_status not in SESSION_STATUSES:
             raise ValueError("Invalid session_status")
@@ -3640,10 +3868,10 @@ def api_create_account():
     cur = conn.execute(
         """
         insert into retailer_accounts(
-            workspace_id, retailer, username, email, encrypted_credential_ref, session_status, created_at, updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?)
+            workspace_id, retailer, username, email, encrypted_credential_ref, proxy_url, session_status, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (current_workspace_id(), retailer, username, email, credential_ref, session_status, now_iso, now_iso),
+        (current_workspace_id(), retailer, username, email, credential_ref, proxy_url, session_status, now_iso, now_iso),
     )
     conn.commit()
     row = conn.execute(
@@ -3687,6 +3915,8 @@ def api_update_account(account_id: int):
             if not credential_ref:
                 raise ValueError("encrypted_credential_ref cannot be empty")
             fields.append(("encrypted_credential_ref", credential_ref))
+        if "proxy_url" in body:
+            fields.append(("proxy_url", (body.get("proxy_url") or "").strip() or None))
         if "session_status" in body:
             session_status = (body.get("session_status") or "").strip().lower()
             if session_status not in SESSION_STATUSES:
@@ -3727,6 +3957,159 @@ def api_delete_account(account_id: int):
     if cur.rowcount == 0:
         return jsonify({"error": "Account not found"}), 404
     return jsonify({"ok": True})
+
+
+@app.post("/api/task-profile-bindings")
+@require_auth
+def api_upsert_task_profile_binding():
+    body = request.json or {}
+    try:
+        monitor_id = int(body.get("monitor_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "monitor_id is required"}), 400
+    workspace_id = current_workspace_id()
+    checkout_profile_id = body.get("checkout_profile_id")
+    payment_method_id = body.get("payment_method_id")
+    retailer_account_id = body.get("retailer_account_id")
+    if retailer_account_id is None:
+        return jsonify({"error": "retailer_account_id is required for checkout-capable task bindings"}), 400
+    try:
+        retailer_account_id = int(retailer_account_id)
+        checkout_profile_id = int(checkout_profile_id) if checkout_profile_id is not None else None
+        payment_method_id = int(payment_method_id) if payment_method_id is not None else None
+    except ValueError:
+        return jsonify({"error": "Invalid numeric identifier in binding payload"}), 400
+
+    now_iso = utc_now()
+    conn = db()
+    monitor = conn.execute(
+        "select id from monitors where id = ? and workspace_id = ?",
+        (monitor_id, workspace_id),
+    ).fetchone()
+    if not monitor:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+    account = conn.execute(
+        "select id from retailer_accounts where id = ? and workspace_id = ?",
+        (retailer_account_id, workspace_id),
+    ).fetchone()
+    if not account:
+        conn.close()
+        return jsonify({"error": "retailer_account_id not found"}), 400
+    if checkout_profile_id is not None:
+        profile = conn.execute(
+            "select id from checkout_profiles where id = ? and workspace_id = ?",
+            (checkout_profile_id, workspace_id),
+        ).fetchone()
+        if not profile:
+            conn.close()
+            return jsonify({"error": "checkout_profile_id not found"}), 400
+    if payment_method_id is not None:
+        payment = conn.execute(
+            "select id from payment_methods where id = ? and workspace_id = ?",
+            (payment_method_id, workspace_id),
+        ).fetchone()
+        if not payment:
+            conn.close()
+            return jsonify({"error": "payment_method_id not found"}), 400
+    conn.execute(
+        """
+        insert into task_profile_bindings(
+            workspace_id, monitor_id, checkout_profile_id, retailer_account_id, payment_method_id, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?)
+        on conflict(workspace_id, monitor_id) do update set
+            checkout_profile_id = excluded.checkout_profile_id,
+            retailer_account_id = excluded.retailer_account_id,
+            payment_method_id = excluded.payment_method_id,
+            updated_at = excluded.updated_at
+        """,
+        (workspace_id, monitor_id, checkout_profile_id, retailer_account_id, payment_method_id, now_iso, now_iso),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from task_profile_bindings where workspace_id = ? and monitor_id = ?",
+        (workspace_id, monitor_id),
+    ).fetchone()
+    conn.close()
+    return jsonify(serialize_task_profile_binding(row)), 201
+
+
+@app.get("/api/task-profile-bindings")
+@require_auth
+def api_list_task_profile_bindings():
+    conn = db()
+    rows = conn.execute(
+        "select * from task_profile_bindings where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_task_profile_binding(r) for r in rows])
+
+
+def _account_execution_read_model(conn: sqlite3.Connection, workspace_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        select
+            a.*,
+            count(t.id) as queue_depth,
+            min(case when t.current_state != 'queued' then t.id end) as active_task_id,
+            min(case when t.current_state != 'queued' then t.current_state end) as active_task_state
+        from retailer_accounts a
+        left join task_profile_bindings b
+          on b.workspace_id = a.workspace_id
+         and b.retailer_account_id = a.id
+        left join checkout_tasks t
+          on t.workspace_id = a.workspace_id
+         and t.monitor_id = b.monitor_id
+         and t.is_paused = 0
+         and t.current_state in ('queued', 'monitoring', 'carting', 'shipping', 'payment', 'submitting')
+        where a.workspace_id = ?
+        group by a.id
+        order by a.id asc
+        """,
+        (workspace_id,),
+    ).fetchall()
+    payload: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        queue_depth = int(item["queue_depth"] or 0)
+        if queue_depth == 0:
+            execution_status = "idle"
+        elif item["proxy_lock_state"] == "locked":
+            execution_status = "running" if item["active_task_id"] else "queued_waiting_for_stagger"
+        else:
+            execution_status = "queued_waiting_for_proxy"
+        item["execution_status"] = execution_status
+        payload.append(item)
+    return payload
+
+
+@app.get("/api/accounts/execution")
+@require_auth
+def api_account_execution_status():
+    workspace_id = current_workspace_id()
+    conn = db()
+    payload = _account_execution_read_model(conn, workspace_id)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.get("/api/accounts/proxy-locks")
+@require_auth
+def api_account_proxy_locks():
+    workspace_id = current_workspace_id()
+    conn = db()
+    rows = conn.execute(
+        """
+        select id as account_id, retailer, proxy_url, proxy_lock_state, proxy_lock_owner, proxy_lock_acquired_at, last_used_at
+        from retailer_accounts
+        where workspace_id = ?
+        order by id asc
+        """,
+        (workspace_id,),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
 
 
 @app.post("/api/payments")
