@@ -1662,10 +1662,19 @@ def get_workspace(workspace_id: int) -> sqlite3.Row:
     return row
 
 
+def get_default_workspace() -> sqlite3.Row:
+    conn = db()
+    row = conn.execute("select * from workspaces order by id asc limit 1").fetchone()
+    conn.close()
+    if not row:
+        raise ValueError("Workspace not found")
+    return row
+
+
 def get_workspace_for_request() -> sqlite3.Row:
     workspace = getattr(g, "current_workspace", None)
     if workspace is None:
-        workspace = get_workspace(1)
+        workspace = get_default_workspace()
     return workspace
 
 
@@ -1727,7 +1736,7 @@ def require_api_auth() -> tuple[dict[str, str], int] | None:
     else:
         token = _token_from_request()
         if token and token == API_AUTH_TOKEN:
-            _set_auth_context(DEFAULT_USER, get_workspace(1))
+            _set_auth_context(DEFAULT_USER, get_default_workspace())
         else:
             return jsonify({"error": "Unauthorized"}), 401
 
@@ -2937,6 +2946,12 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return payload
 
 
+def redact_webhook_url(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 12:
+        return "***"
+    return f"{value[:8]}...{value[-4:]}"
 def serialize_task_ui(row: sqlite3.Row | None) -> dict[str, Any] | None:
     payload = serialize_checkout_task(row)
     if payload is None:
@@ -4520,7 +4535,7 @@ def api_delete_monitor(monitor_id: int):
     conn = db()
     conn.execute(
         "delete from monitors where id = ? and workspace_id = ?",
-        (monitor_id, current_workspace_id()),
+        (monitor_id, workspace_id),
     )
     conn.commit()
     conn.close()
@@ -4534,7 +4549,7 @@ def api_check_monitor(monitor_id: int):
     conn = db()
     row = conn.execute(
         "select * from monitors where id = ? and workspace_id = ?",
-        (monitor_id, current_workspace_id()),
+        (monitor_id, workspace_id),
     ).fetchone()
     conn.close()
     if not row:
