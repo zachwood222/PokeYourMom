@@ -30,6 +30,8 @@ APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
 RELEASE_CHANNEL = os.getenv("RELEASE_CHANNEL", "stable")
 API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "dev-token")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
+UPDATE_CHECK_TIMEOUT_SECONDS = float(os.getenv("UPDATE_CHECK_TIMEOUT_SECONDS", "2.0"))
 
 PLAN_LIMITS = {
     "basic": {"max_monitors": 20, "min_poll_seconds": 20},
@@ -700,7 +702,7 @@ def map_subscription_to_internal_plan(
     return "basic"
 
 
-def sync_billing_subscription_event(payload: dict[str, Any]) -> dict[str, Any]:
+def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str, Any]:
     provider = (payload.get("provider") or "stripe").strip().lower()
     subscription_id = (payload.get("provider_subscription_id") or "").strip()
     customer_id = (payload.get("provider_customer_id") or "").strip() or None
@@ -980,7 +982,6 @@ def bestbuy_parser(html: str, keyword: str | None = None) -> MonitorResult:
         '"buttonstate":"coming soon"',
         "sold out",
         "coming soon",
-        "unavailable",
     ]
     has_in = any(marker in text for marker in in_markers)
     has_out = any(marker in text for marker in out_markers)
@@ -1519,7 +1520,7 @@ def api_sync_billing_subscription_event():
         "source": body.get("source") or "billing_subscriptions",
     }
     try:
-        result = sync_billing_subscription_event(payload)
+        result = sync_manual_billing_subscription_event(payload)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"ok": True, **result})
