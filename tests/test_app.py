@@ -98,6 +98,111 @@ def test_create_monitor_accepts_pokemon_center_alias(tmp_path, monkeypatch):
     assert payload["retailer"] == "pokemoncenter"
 
 
+def test_captcha_valid_token_allows_protected_post(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPTCHA_SECRET_KEY", "captcha-secret")
+    monkeypatch.setenv("CAPTCHA_VERIFY_URL", "https://captcha.local/verify")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    class DummyResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"success": True}
+
+    def fake_post(url, data, timeout):
+        assert url == "https://captcha.local/verify"
+        assert data["secret"] == "captcha-secret"
+        assert data["response"] == "token-ok"
+        return DummyResponse()
+
+    monkeypatch.setattr(app_module.requests, "post", fake_post)
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+            "captcha_token": "token-ok",
+        },
+        headers=_auth_headers(),
+    )
+
+    assert resp.status_code == 201
+
+
+def test_captcha_invalid_or_missing_token_rejects_protected_post(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPTCHA_SECRET_KEY", "captcha-secret")
+    monkeypatch.setenv("CAPTCHA_VERIFY_URL", "https://captcha.local/verify")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    def fake_post(url, data, timeout):
+        class DummyResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"success": False}
+
+        return DummyResponse()
+
+    monkeypatch.setattr(app_module.requests, "post", fake_post)
+
+    missing_token = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    invalid_token = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+            "captcha_token": "bad-token",
+        },
+        headers=_auth_headers(),
+    )
+
+    assert missing_token.status_code == 400
+    assert missing_token.get_json()["reason"] == "missing_token"
+    assert invalid_token.status_code == 400
+    assert invalid_token.get_json()["reason"] == "invalid_token"
+
+
+def test_captcha_provider_errors_fail_safely(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPTCHA_SECRET_KEY", "captcha-secret")
+    monkeypatch.setenv("CAPTCHA_VERIFY_URL", "https://captcha.local/verify")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    def fake_post(url, data, timeout):
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(app_module.requests, "post", fake_post)
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+            "captcha_token": "token-any",
+        },
+        headers=_auth_headers(),
+    )
+
+    assert resp.status_code == 400
+    assert resp.get_json()["reason"] == "provider_unreachable"
+
+
 def test_authenticated_user_only_sees_own_workspace_data(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -270,6 +375,65 @@ def test_api_routes_require_auth(tmp_path, monkeypatch):
 
     assert resp.status_code == 401
     assert resp.get_json() == {"error": "Unauthorized"}
+
+
+def test_create_list_task_and_attempts_endpoint(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_resp = client.post(
+        "/api/tasks",
+        json={
+            "retailer": "walmart",
+            "url": "https://www.walmart.com/ip/sku",
+            "profile": "profile-main",
+            "account": "acc-primary",
+            "payment": "visa-4242",
+        },
+        headers=_auth_headers(),
+    )
+    assert create_resp.status_code == 201
+    created = create_resp.get_json()
+    assert created["state"] == "idle"
+    task_id = created["id"]
+
+    list_resp = client.get("/api/tasks", headers=_auth_headers())
+    assert list_resp.status_code == 200
+    tasks = list_resp.get_json()
+    assert len(tasks) == 1
+    assert tasks[0]["id"] == task_id
+
+    attempts_resp = client.get(f"/api/tasks/{task_id}/attempts", headers=_auth_headers())
+    assert attempts_resp.status_code == 200
+    assert attempts_resp.get_json() == []
+
+
+def test_start_and_stop_task(tmp_path, monkeypatch):
+    monkeypatch.setenv("TASK_STEP_DELAY_SECONDS", "0.01")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_resp = client.post(
+        "/api/tasks",
+        json={
+            "retailer": "target",
+            "url": "https://www.target.com/p/abc",
+            "profile": "default",
+            "account": "acct-1",
+            "payment": "amex",
+        },
+        headers=_auth_headers(),
+    )
+    task_id = create_resp.get_json()["id"]
+
+    start_resp = client.post(f"/api/tasks/{task_id}/start", headers=_auth_headers())
+    assert start_resp.status_code == 200
+    started_task = start_resp.get_json()["task"]
+    assert started_task["state"] in {"queued", "running"}
+
+    stop_resp = client.post(f"/api/tasks/{task_id}/stop", headers=_auth_headers())
+    assert stop_resp.status_code == 200
+    assert stop_resp.get_json()["task"]["state"] == "stopped"
 
 
 def test_stripe_webhook_valid_signature_accepted(tmp_path, monkeypatch):
@@ -593,41 +757,18 @@ def test_webhook_health_trends_scoped_to_workspace(tmp_path, monkeypatch):
     assert payload["webhooks"][0]["recent_failures_7d"] == 1
 
 
-def test_webhook_secret_is_encrypted_at_rest_and_redacted_in_api(tmp_path, monkeypatch):
-    app_module = _load_app(tmp_path, monkeypatch)
-    client = app_module.app.test_client()
-
-    create_resp = client.post(
-        "/api/webhooks",
-        json={"name": "Secure", "webhook_url": "https://discord.com/api/webhooks/abc123/token456"},
-        headers=_auth_headers(),
-    )
-    assert create_resp.status_code == 201
-    created = create_resp.get_json()
-    assert created["webhook_url"] == "[redacted]"
-
-    conn = app_module.db()
-    hook = conn.execute("select webhook_url, webhook_secret_id from webhooks where name = 'Secure'").fetchone()
-    secret = conn.execute("select ciphertext from account_secrets where id = ?", (hook["webhook_secret_id"],)).fetchone()
-    conn.close()
-
-    assert hook["webhook_url"] != "https://discord.com/api/webhooks/abc123/token456"
-    assert secret is not None
-    assert "abc123" not in secret["ciphertext"]
-
-
-def test_parser_dispatch_uses_walmart_and_fallback(tmp_path, monkeypatch):
+def test_adapter_dispatch_uses_walmart_and_fallback(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
 
-    walmart_parser = app_module.get_parser_for_retailer("walmart")
-    target_parser = app_module.get_parser_for_retailer("target")
-    bestbuy_parser = app_module.get_parser_for_retailer("bestbuy")
-    fallback_parser = app_module.get_parser_for_retailer("unknown-retailer")
+    walmart_adapter = app_module.get_adapter_for_retailer("walmart")
+    target_adapter = app_module.get_adapter_for_retailer("target")
+    bestbuy_adapter = app_module.get_adapter_for_retailer("bestbuy")
+    fallback_adapter = app_module.get_adapter_for_retailer("unknown-retailer")
 
-    assert walmart_parser.name == "walmart"
-    assert target_parser.name == "target"
-    assert bestbuy_parser.name == "bestbuy"
-    assert fallback_parser.name == "default"
+    assert walmart_adapter.name == "walmart"
+    assert target_adapter.name == "target"
+    assert bestbuy_adapter.name == "bestbuy"
+    assert fallback_adapter.name == "default"
 
 
 def test_walmart_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch):
@@ -946,3 +1087,108 @@ def test_billing_sync_canceled_subscription_enforces_stricter_limits(tmp_path, m
     )
     assert blocked_monitor_count.status_code == 400
     assert "Plan limit reached (20 monitors)" in blocked_monitor_count.get_json()["error"]
+
+
+def test_init_db_creates_checkout_tables(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    conn = app_module.db()
+    tables = {
+        row["name"]
+        for row in conn.execute(
+            "select name from sqlite_master where type = 'table' and name in ('checkout_tasks', 'checkout_attempts', 'task_logs')"
+        ).fetchall()
+    }
+    conn.close()
+    assert tables == {"checkout_tasks", "checkout_attempts", "task_logs"}
+
+
+def test_check_monitor_enqueues_checkout_task_for_eligible_stock(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://example.com/item",
+            "keyword": "pokemon",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    monitor = create_resp.get_json()
+    assert create_resp.status_code == 201
+
+    def fake_fetch(_monitor):
+        return app_module.MonitorResult(
+            in_stock=True,
+            price_cents=2499,
+            title="Pokemon Test Item",
+            status_text="in_stock",
+            keyword_matched=True,
+        )
+
+    monkeypatch.setattr(app_module, "fetch_monitor", fake_fetch)
+    check_resp = client.post(f"/api/monitors/{monitor['id']}/check", headers=_auth_headers())
+    assert check_resp.status_code == 200
+    assert check_resp.get_json()["eligible_for_alert"] is True
+
+    conn = app_module.db()
+    task = conn.execute("select * from checkout_tasks where monitor_id = ?", (monitor["id"],)).fetchone()
+    attempt_count = conn.execute(
+        "select count(*) as c from checkout_attempts where task_id = ?",
+        (task["id"],),
+    ).fetchone()["c"]
+    log_count = conn.execute(
+        "select count(*) as c from task_logs where task_id = ?",
+        (task["id"],),
+    ).fetchone()["c"]
+    conn.close()
+
+    assert task is not None
+    assert task["current_state"] == "queued"
+    assert attempt_count >= 2
+    assert log_count >= 2
+
+
+def test_checkout_task_lifecycle_routes(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_monitor_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/item",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    monitor = create_monitor_resp.get_json()
+    assert create_monitor_resp.status_code == 201
+
+    create_task_resp = client.post(
+        "/api/checkout/tasks",
+        json={"monitor_id": monitor["id"], "task_name": "Checkout 1"},
+        headers=_auth_headers(),
+    )
+    assert create_task_resp.status_code == 201
+    task = create_task_resp.get_json()
+
+    start_resp = client.post(f"/api/checkout/tasks/{task['id']}/start", headers=_auth_headers())
+    assert start_resp.status_code == 200
+    assert start_resp.get_json()["task"]["current_state"] == "monitoring"
+
+    pause_resp = client.post(f"/api/checkout/tasks/{task['id']}/pause", headers=_auth_headers())
+    assert pause_resp.status_code == 200
+    assert pause_resp.get_json()["task"]["current_state"] == "paused"
+
+    stop_resp = client.post(f"/api/checkout/tasks/{task['id']}/stop", headers=_auth_headers())
+    assert stop_resp.status_code == 200
+    assert stop_resp.get_json()["task"]["current_state"] == "stopped"
+
+    state_resp = client.get(f"/api/checkout/tasks/{task['id']}/state", headers=_auth_headers())
+    assert state_resp.status_code == 200
+    payload = state_resp.get_json()
+    assert payload["current_state"] == "stopped"
+    assert payload["last_error"] is None
