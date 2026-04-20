@@ -300,32 +300,13 @@
           <h2>Create Automation Task</h2>
           <div class="row">
             <div>
-              <label>Retailer</label>
-              <select id="task_retailer">
-                <option>walmart</option>
-                <option>target</option>
-                <option>bestbuy</option>
-                <option>pokemoncenter</option>
-              </select>
+              <label>Monitor</label>
+              <select id="task_monitor_id"></select>
             </div>
             <div>
-              <label>Product URL</label>
-              <input id="task_url" placeholder="https://www.walmart.com/ip/..." />
+              <label>Task Name (Optional)</label>
+              <input id="task_name" placeholder="Walmart checkout task" />
             </div>
-          </div>
-          <div class="row" style="margin-top:10px;">
-            <div>
-              <label>Profile</label>
-              <input id="task_profile" placeholder="profile-main" />
-            </div>
-            <div>
-              <label>Account</label>
-              <input id="task_account" placeholder="acc-primary" />
-            </div>
-          </div>
-          <div style="margin-top:10px;">
-            <label>Payment</label>
-            <input id="task_payment" placeholder="visa-ending-4242" />
           </div>
           <button style="margin-top:10px;" onclick="createTask()">Create Task</button>
         </div>
@@ -333,7 +314,7 @@
         <div class="card" style="margin-top:14px;">
           <h2 class="section-title">Live Task Table</h2>
           <table>
-            <thead><tr><th>ID</th><th>Retailer</th><th>State</th><th>Retries</th><th>Last Step</th><th>Last Error</th><th>Actions</th></tr></thead>
+            <thead><tr><th>ID</th><th>Monitor</th><th>Retailer</th><th>State</th><th>Last Transition</th><th>Last Error</th><th>Actions</th></tr></thead>
             <tbody id="tasks"></tbody>
           </table>
         </div>
@@ -706,14 +687,16 @@
     }
 
     async function createTask() {
+      const monitorId = Number(document.getElementById('task_monitor_id').value);
+      if (!monitorId) {
+        alert('Please choose a monitor first.');
+        return;
+      }
       const payload = {
-        retailer: document.getElementById('task_retailer').value,
-        url: document.getElementById('task_url').value,
-        profile: document.getElementById('task_profile').value,
-        account: document.getElementById('task_account').value,
-        payment: document.getElementById('task_payment').value,
+        monitor_id: monitorId,
+        task_name: document.getElementById('task_name').value || null,
       };
-      const res = await apiFetch('/api/tasks', {
+      const res = await apiFetch('/api/checkout/tasks', {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
       });
       const data = await res.json();
@@ -737,10 +720,10 @@
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td>${task.id}</td>
+          <td>${task.monitor_id || '-'}</td>
           <td>${task.retailer}</td>
           <td>${task.state}</td>
-          <td>${task.retries || 0}</td>
-          <td>${task.last_step || '-'}</td>
+          <td>${task.last_transition_at || '-'}</td>
           <td>${taskErrorLabel(task.last_error)}</td>
           <td class="actions">
             <button onclick="startTask(${task.id})">Start</button>
@@ -753,7 +736,7 @@
     }
 
     async function loadTasks() {
-      const rows = await apiFetch('/api/tasks').then(r => r.json()).catch(() => []);
+      const rows = await apiFetch('/api/checkout/tasks').then(r => r.json()).catch(() => []);
       taskMap = new Map();
       for (const row of rows) {
         taskMap.set(row.id, row);
@@ -762,12 +745,12 @@
     }
 
     async function startTask(id) {
-      await apiFetch(`/api/tasks/${id}/start`, {method: 'POST'});
+      await apiFetch(`/api/checkout/tasks/${id}/start`, {method: 'POST'});
       await loadTasks();
     }
 
     async function stopTask(id) {
-      await apiFetch(`/api/tasks/${id}/stop`, {method: 'POST'});
+      await apiFetch(`/api/checkout/tasks/${id}/stop`, {method: 'POST'});
       await loadTasks();
     }
 
@@ -779,17 +762,31 @@
     }
 
     async function loadTaskAttempts(taskId) {
-      const attempts = await apiFetch(`/api/tasks/${taskId}/attempts`).then(r => r.json()).catch(() => []);
+      const attempts = await apiFetch(`/api/checkout/tasks/${taskId}/attempts`).then(r => r.json()).catch(() => []);
       const logs = document.getElementById('task_logs');
       logs.textContent = '';
       for (const attempt of attempts.slice().reverse()) {
-        logs.textContent += `[${attempt.created_at}] attempt=${attempt.attempt_number} state=${attempt.state} step=${attempt.step || '-'} err=${attempt.error || '-'}\n`;
+        let details = '{}';
+        if (attempt.details) {
+          try {
+            details = JSON.stringify(JSON.parse(attempt.details));
+          } catch (_) {
+            details = String(attempt.details);
+          }
+        }
+        logs.textContent += `[${attempt.created_at}] status=${attempt.status} state=${attempt.state} err=${attempt.error_text || '-'} details=${details}\n`;
       }
       logs.scrollTop = logs.scrollHeight;
     }
 
     async function loadMonitors() {
       const rows = await apiFetch('/api/monitors').then(r => r.json());
+      const taskMonitorSelect = document.getElementById('task_monitor_id');
+      if (taskMonitorSelect) {
+        taskMonitorSelect.innerHTML = rows
+          .map((m) => `<option value="${m.id}">#${m.id} ${m.retailer} - ${m.product_url}</option>`)
+          .join('');
+      }
       const tbody = document.getElementById('monitors');
       tbody.innerHTML = '';
       for (const r of rows) {
