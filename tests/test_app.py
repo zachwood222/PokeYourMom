@@ -272,6 +272,110 @@ def test_api_routes_require_auth(tmp_path, monkeypatch):
     assert resp.get_json() == {"error": "Unauthorized"}
 
 
+def test_captcha_valid_token_allows_request(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPTCHA_SECRET_KEY", "captcha-secret")
+    monkeypatch.setenv("CAPTCHA_VERIFY_URL", "https://captcha.example/verify")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    class DummyCaptchaResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"success": True}
+
+    def fake_captcha_post(url, data, timeout):
+        assert url == "https://captcha.example/verify"
+        assert data["secret"] == "captcha-secret"
+        assert data["response"] == "valid-token"
+        assert timeout == app_module.CAPTCHA_VERIFY_TIMEOUT_SECONDS
+        return DummyCaptchaResponse()
+
+    monkeypatch.setattr(app_module.requests, "post", fake_captcha_post)
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+        },
+        headers={**_auth_headers(), "X-CAPTCHA-Token": "valid-token"},
+    )
+
+    assert resp.status_code == 201
+
+
+def test_captcha_invalid_or_missing_token_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPTCHA_SECRET_KEY", "captcha-secret")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    class DummyCaptchaRejectResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"success": False}
+
+    def fake_captcha_post(url, data, timeout):
+        return DummyCaptchaRejectResponse()
+
+    monkeypatch.setattr(app_module.requests, "post", fake_captcha_post)
+
+    invalid_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+        },
+        headers={**_auth_headers(), "X-CAPTCHA-Token": "invalid-token"},
+    )
+    missing_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+
+    assert invalid_resp.status_code == 403
+    assert invalid_resp.get_json()["error"] == "CAPTCHA verification failed"
+    assert invalid_resp.get_json()["reason"] == "provider_rejected"
+    assert missing_resp.status_code == 403
+    assert missing_resp.get_json()["error"] == "CAPTCHA verification failed"
+    assert missing_resp.get_json()["reason"] == "missing_token"
+
+
+def test_captcha_provider_errors_fail_safely(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPTCHA_SECRET_KEY", "captcha-secret")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    def fake_captcha_post(url, data, timeout):
+        raise app_module.requests.RequestException("provider unavailable")
+
+    monkeypatch.setattr(app_module.requests, "post", fake_captcha_post)
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+        },
+        headers={**_auth_headers(), "X-CAPTCHA-Token": "valid-token"},
+    )
+
+    assert resp.status_code == 403
+    assert resp.get_json()["error"] == "CAPTCHA verification failed"
+    assert resp.get_json()["reason"] == "provider_request_failed"
+
+
 def test_stripe_webhook_valid_signature_accepted(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
