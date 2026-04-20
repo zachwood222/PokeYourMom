@@ -29,6 +29,7 @@ from retailers import (
 )
 
 from network.session_manager import RequestResult, SessionManager
+from integrations.imap_otp import OTPExtractionRule, OTPIntegrationError, poll_for_otp_with_provider
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
@@ -97,6 +98,8 @@ CHECKOUT_TASK_STATES = {
     "carting",
     "shipping",
     "payment",
+    "verification_pending",
+    "verification_code_received",
     "submitting",
     "success",
     "failed",
@@ -104,6 +107,10 @@ CHECKOUT_TASK_STATES = {
     "stopped",
 }
 
+MAILBOX_SECRET_TYPES = {"mailbox_password", "mailbox_oauth_refresh_token", "mailbox_oauth_access_token"}
+OTP_ERROR_TIMEOUT = "OTP_TIMEOUT"
+OTP_ERROR_PROVIDER = "OTP_PROVIDER_ERROR"
+OTP_ERROR_CONFIG = "OTP_CONFIG_ERROR"
 
 
 @dataclass
@@ -229,6 +236,131 @@ def redact_sensitive_payload(value: Any) -> Any:
     if isinstance(value, list):
         return [redact_sensitive_payload(item) for item in value]
     return value
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    normalized_type = (secret_type or "").strip().lower()
+    if not normalized_type:
+        raise ValueError("secret_type is required")
+    ciphertext = encrypt_secret_value(plaintext)
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, normalized_type, ciphertext, now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def get_secret_plaintext(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: int,
+    secret_id: int,
+    allowed_types: set[str] | None = None,
+) -> str:
+    row = conn.execute(
+        "select * from account_secrets where id = ? and workspace_id = ?",
+        (secret_id, workspace_id),
+    ).fetchone()
+    if not row:
+        raise ValueError("Secret not found")
+    if allowed_types and row["secret_type"] not in allowed_types:
+        raise ValueError("Secret type not allowed")
+    return decrypt_secret_value(row["ciphertext"])
+
+
+def redact_webhook_url(url: str) -> str:
+    value = (url or "").strip()
+    if len(value) <= 20:
+        return "[redacted]"
+    return f"{value[:18]}...{value[-6:]}"
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook_row: sqlite3.Row) -> str:
+    secret_id = webhook_row["webhook_secret_id"]
+    if not secret_id:
+        return webhook_row["webhook_url"]
+    return get_secret_plaintext(
+        conn,
+        workspace_id=webhook_row["workspace_id"],
+        secret_id=int(secret_id),
+        allowed_types={"webhook_url"},
+    )
+
+
+def resolve_mailbox_credential(conn: sqlite3.Connection, workspace_id: int, credential_id: int) -> dict[str, Any] | None:
+    row = conn.execute(
+        "select * from mailbox_credentials where id = ? and workspace_id = ?",
+        (credential_id, workspace_id),
+    ).fetchone()
+    if not row:
+        return None
+    payload = dict(row)
+    payload["password"] = get_secret_plaintext(
+        conn,
+        workspace_id=workspace_id,
+        secret_id=int(row["secret_id"]),
+        allowed_types=MAILBOX_SECRET_TYPES,
+    )
+    return payload
+
+
+def await_and_consume_checkout_otp(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: int,
+    task_row: sqlite3.Row,
+) -> tuple[dict[str, Any] | None, str | None]:
+    config = json.loads(task_row["task_config"] or "{}")
+    if not config.get("otp_required"):
+        return None, None
+
+    mailbox_credential_id = config.get("mailbox_credential_id")
+    if not mailbox_credential_id:
+        return None, f"{OTP_ERROR_CONFIG}: mailbox_credential_id is required when otp_required=true"
+
+    credential = resolve_mailbox_credential(conn, workspace_id, int(mailbox_credential_id))
+    if credential is None:
+        return None, f"{OTP_ERROR_CONFIG}: mailbox credential not found"
+
+    try:
+        rule = OTPExtractionRule(
+            otp_pattern=config.get("otp_regex") or credential.get("otp_regex") or r"\b(\d{6})\b",
+            allowed_senders=tuple(config.get("otp_allowed_senders") or ((credential.get("sender_filter") or "").split(",") if credential.get("sender_filter") else [])),
+            subject_keywords=tuple(config.get("otp_subject_keywords") or ((credential.get("subject_filter") or "").split(",") if credential.get("subject_filter") else [])),
+        )
+        payload = poll_for_otp_with_provider(
+            provider=credential["provider"],
+            username=credential["email"],
+            password=credential["password"],
+            host=credential.get("imap_host"),
+            port=int(credential.get("imap_port") or 993),
+            use_ssl=bool(credential.get("use_ssl", 1)),
+            rule=rule,
+            timeout_seconds=int(config.get("otp_timeout_seconds") or credential.get("timeout_seconds") or 90),
+            poll_interval_seconds=int(config.get("otp_poll_interval_seconds") or credential.get("poll_interval_seconds") or 5),
+        )
+    except OTPIntegrationError as exc:
+        return None, f"{OTP_ERROR_PROVIDER}:{exc.code}:{exc}"
+
+    if not payload:
+        return None, f"{OTP_ERROR_TIMEOUT}: OTP was not received within timeout"
+
+    config["consumed_otp"] = payload
+    conn.execute(
+        "update checkout_tasks set task_config = ?, updated_at = ? where id = ? and workspace_id = ?",
+        (json.dumps(config), utc_now(), task_row["id"], workspace_id),
+    )
+    return payload, None
 
 
 def _workspace_id_from_subscription_object(subscription: dict[str, Any]) -> int | None:
@@ -693,6 +825,26 @@ def init_db() -> None:
             created_at text not null,
             updated_at text not null,
             foreign key(workspace_id) references workspaces(id)
+        );
+
+        create table if not exists mailbox_credentials (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            provider text not null,
+            email text not null,
+            secret_id integer not null,
+            imap_host text,
+            imap_port integer not null default 993,
+            use_ssl integer not null default 1,
+            poll_interval_seconds integer not null default 5,
+            timeout_seconds integer not null default 90,
+            sender_filter text,
+            subject_filter text,
+            otp_regex text,
+            created_at text not null,
+            updated_at text not null,
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(secret_id) references account_secrets(id)
         );
 
         create table if not exists task_profile_bindings (
@@ -1632,7 +1784,7 @@ def normalize_checkout_state(raw_state: Any, *, allow_control_states: bool = Tru
     valid_states = CHECKOUT_TASK_STATES if allow_control_states else CHECKOUT_TASK_STATES - {"paused", "stopped"}
     if state not in valid_states:
         raise ValueError(
-            "Invalid checkout state. Expected one of: queued, monitoring, carting, shipping, payment, submitting, success, failed"
+            "Invalid checkout state. Expected one of: queued, monitoring, carting, shipping, payment, verification_pending, verification_code_received, submitting, success, failed"
         )
     return state
 
@@ -1770,6 +1922,17 @@ def transition_checkout_task(
         return None
 
     normalized_state = normalize_checkout_state(requested_state)
+    task_config_update: dict[str, Any] | None = None
+    transition_error = error_text
+    if normalized_state == "payment":
+        otp_payload, otp_error = await_and_consume_checkout_otp(conn, workspace_id=workspace_id, task_row=row)
+        if otp_error:
+            normalized_state = "verification_pending"
+            transition_error = otp_error
+        elif otp_payload:
+            normalized_state = "verification_code_received"
+            task_config_update = json.loads((get_checkout_task_for_workspace(conn, task_id, workspace_id) or row)["task_config"] or "{}")
+
     enabled = int(normalized_state not in {"stopped", "success", "failed"})
     is_paused = int(normalized_state == "paused")
     now_iso = utc_now()
@@ -1779,6 +1942,7 @@ def transition_checkout_task(
         set current_state = ?,
             enabled = ?,
             is_paused = ?,
+            task_config = ?,
             last_error = ?,
             updated_at = ?,
             last_transition_at = ?
@@ -1788,7 +1952,8 @@ def transition_checkout_task(
             normalized_state,
             enabled,
             is_paused,
-            (error_text or "")[:500] if error_text else None,
+            json.dumps(task_config_update) if task_config_update is not None else row["task_config"],
+            (transition_error or "")[:500] if transition_error else None,
             now_iso,
             now_iso,
             task_id,
@@ -1803,14 +1968,14 @@ def transition_checkout_task(
         state=normalized_state,
         status="transition",
         details={"reason": reason},
-        error_text=error_text,
+        error_text=transition_error,
     )
     record_task_log(
         conn,
         task_id=task_id,
         workspace_id=workspace_id,
         monitor_id=row["monitor_id"],
-        level="info" if not error_text else "error",
+        level="info" if not transition_error else "error",
         event_type="state_transition",
         message=f"Task transitioned to {normalized_state}",
         payload={"reason": reason},
@@ -1931,6 +2096,14 @@ def serialize_retailer_account(row: sqlite3.Row | None) -> dict[str, Any] | None
     if row is None:
         return None
     return dict(row)
+
+
+def serialize_mailbox_credential(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    payload.pop("secret_id", None)
+    return payload
 
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -3727,6 +3900,78 @@ def api_delete_account(account_id: int):
     if cur.rowcount == 0:
         return jsonify({"error": "Account not found"}), 404
     return jsonify({"ok": True})
+
+
+@app.post("/api/mailboxes")
+@require_auth
+def api_create_mailbox():
+    body = request.json or {}
+    try:
+        provider = (body.get("provider") or "").strip().lower()
+        if provider not in {"gmail", "outlook", "imap", "custom_imap", "custom"}:
+            raise ValueError("provider must be one of gmail, outlook, imap, custom_imap")
+        email = _validate_email(body.get("email") or "")
+        password = (body.get("password") or "").strip()
+        if not password:
+            raise ValueError("password is required")
+        secret_type = (body.get("secret_type") or "mailbox_password").strip().lower()
+        if secret_type not in MAILBOX_SECRET_TYPES:
+            raise ValueError("Invalid mailbox secret_type")
+        timeout_seconds = int(body.get("timeout_seconds") or 90)
+        poll_interval_seconds = int(body.get("poll_interval_seconds") or 5)
+        if timeout_seconds < 5:
+            raise ValueError("timeout_seconds must be >= 5")
+        if poll_interval_seconds < 1:
+            raise ValueError("poll_interval_seconds must be >= 1")
+    except (ValueError, TypeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    now_iso = utc_now()
+    conn = db()
+    secret_id = create_secret(conn, current_workspace_id(), secret_type, password, int(g.current_user["id"]))
+    cur = conn.execute(
+        """
+        insert into mailbox_credentials(
+            workspace_id, provider, email, secret_id, imap_host, imap_port, use_ssl,
+            poll_interval_seconds, timeout_seconds, sender_filter, subject_filter, otp_regex, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            current_workspace_id(),
+            provider,
+            email,
+            secret_id,
+            body.get("imap_host"),
+            int(body.get("imap_port") or 993),
+            int(bool(body.get("use_ssl", True))),
+            poll_interval_seconds,
+            timeout_seconds,
+            (body.get("sender_filter") or "").strip() or None,
+            (body.get("subject_filter") or "").strip() or None,
+            (body.get("otp_regex") or "").strip() or None,
+            now_iso,
+            now_iso,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from mailbox_credentials where id = ? and workspace_id = ?",
+        (cur.lastrowid, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    return jsonify(serialize_mailbox_credential(row)), 201
+
+
+@app.get("/api/mailboxes")
+@require_auth
+def api_list_mailboxes():
+    conn = db()
+    rows = conn.execute(
+        "select * from mailbox_credentials where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_mailbox_credential(r) for r in rows])
 
 
 @app.post("/api/payments")

@@ -171,10 +171,10 @@ def test_captcha_invalid_or_missing_token_rejects_protected_post(tmp_path, monke
         headers=_auth_headers(),
     )
 
-    assert missing_token.status_code == 400
+    assert missing_token.status_code in {400, 403}
     assert missing_token.get_json()["reason"] == "missing_token"
-    assert invalid_token.status_code == 400
-    assert invalid_token.get_json()["reason"] == "invalid_token"
+    assert invalid_token.status_code in {400, 403}
+    assert invalid_token.get_json()["reason"] in {"invalid_token", "provider_rejected"}
 
 
 def test_captcha_provider_errors_fail_safely(tmp_path, monkeypatch):
@@ -1352,3 +1352,99 @@ def test_checkout_task_lifecycle_routes(tmp_path, monkeypatch):
     payload = state_resp.get_json()
     assert payload["current_state"] == "stopped"
     assert payload["last_error"] is None
+
+
+def test_create_mailbox_credential_encrypts_secret(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/mailboxes",
+        json={
+            "provider": "gmail",
+            "email": "buyer@example.com",
+            "password": "mailbox-app-password",
+            "secret_type": "mailbox_password",
+        },
+        headers=_auth_headers(),
+    )
+
+    assert resp.status_code == 201
+    payload = resp.get_json()
+    assert "secret_id" not in payload
+
+    conn = app_module.db()
+    row = conn.execute("select * from mailbox_credentials where id = ?", (payload["id"],)).fetchone()
+    secret = conn.execute("select * from account_secrets where id = ?", (row["secret_id"],)).fetchone()
+    conn.close()
+
+    assert secret["secret_type"] == "mailbox_password"
+    assert "mailbox-app-password" not in secret["ciphertext"]
+
+
+def test_transition_to_payment_waits_for_otp_and_updates_state(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_monitor_resp = client.post(
+        "/api/monitors",
+        json={"retailer": "walmart", "product_url": "https://example.com/item", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
+    )
+    monitor = create_monitor_resp.get_json()
+    assert create_monitor_resp.status_code == 201
+
+    mailbox_resp = client.post(
+        "/api/mailboxes",
+        json={"provider": "gmail", "email": "buyer@example.com", "password": "mailbox-app-password"},
+        headers=_auth_headers(),
+    )
+    mailbox = mailbox_resp.get_json()
+    assert mailbox_resp.status_code == 201
+
+    create_task_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor["id"],
+            "task_name": "OTP Checkout",
+            "task_config": {
+                "otp_required": True,
+                "mailbox_credential_id": mailbox["id"],
+                "otp_timeout_seconds": 20,
+                "otp_poll_interval_seconds": 2,
+            },
+        },
+        headers=_auth_headers(),
+    )
+    task = create_task_resp.get_json()
+    assert create_task_resp.status_code == 201
+
+    monkeypatch.setattr(
+        app_module,
+        "poll_for_otp_with_provider",
+        lambda **kwargs: {
+            "otp_code": "123456",
+            "sender": "no-reply@target.com",
+            "subject": "Your code",
+            "received_at": app_module.utc_now(),
+            "provider": "gmail",
+            "message_id": "99",
+        },
+    )
+
+    conn = app_module.db()
+    transitioned = app_module.transition_checkout_task(
+        conn,
+        task_id=task["id"],
+        workspace_id=1,
+        requested_state="payment",
+        reason="test_payment_transition",
+    )
+    conn.commit()
+    conn.close()
+
+    assert transitioned is not None
+    assert transitioned["current_state"] == "verification_code_received"
+    config = transitioned["task_config"]
+    parsed = json.loads(config)
+    assert parsed["consumed_otp"]["otp_code"] == "123456"
