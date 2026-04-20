@@ -1274,11 +1274,6 @@ def extract_price_cents(text: str) -> int | None:
     return min(values) if values else None
 
 
-def canonical_retailer(retailer: str) -> str:
-    value = retailer.strip().lower()
-    return RETAILER_ALIASES.get(value, value)
-
-
 def _parse_common_title_and_text(html: str) -> tuple[str, str]:
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
     title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "Product"
