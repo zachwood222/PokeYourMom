@@ -41,6 +41,16 @@ Example:
 curl -H "Authorization: Bearer dev-token" http://localhost:5000/api/workspace
 ```
 
+## Configuration
+
+- `APP_VERSION` (default: `0.1.0`): current running app version used by `/api/meta` and `/api/meta/check-update`.
+- `RELEASE_CHANNEL` (default: `stable`): metadata channel returned by meta endpoints.
+- `UPDATE_CHECK_URL` (default: empty): optional upstream URL used by `/api/meta/check-update` to resolve the latest available version.
+  - Supports JSON payloads with `latest_version`, `version`, or `tag_name`.
+  - Supports plain text payloads containing just the version string.
+  - If unset or if the upstream request fails/parsing fails, the endpoint returns a non-fatal fallback payload and includes `source_error`.
+- `UPDATE_CHECK_TIMEOUT_SECONDS` (default: `3.0`): timeout (seconds) for the update check request.
+
 ## Notes
 
 This project is a scaffold for a subscription monitoring SaaS and should be expanded with:
