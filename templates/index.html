@@ -834,7 +834,7 @@
     }
 
     async function testFirstWebhook() {
-      const hooks = await fetch('/api/webhooks').then(r => r.json()).catch(() => []);
+      const hooks = await apiFetch('/api/webhooks').then(r => r.json()).catch(() => []);
       if (!Array.isArray(hooks) || !hooks.length) {
         alert('No webhooks available to test.');
         return;
