@@ -4718,28 +4718,6 @@ def api_checkout_task_attempts(task_id: int):
     return jsonify([dict(row) for row in attempts])
 
 
-@app.get("/api/checkout/tasks")
-@require_auth
-def api_list_checkout_tasks():
-    conn = db()
-    rows = conn.execute(
-        "select * from checkout_tasks where workspace_id = ? order by id desc",
-        (current_workspace_id(),),
-    ).fetchall()
-    conn.close()
-    return jsonify([serialize_task_ui(row) for row in rows])
-
-
-@app.get("/api/checkout/tasks")
-@require_auth
-def api_list_checkout_tasks():
-    conn = db()
-    rows = conn.execute(
-        "select * from checkout_tasks where workspace_id = ? order by id desc",
-        (current_workspace_id(),),
-    ).fetchall()
-    conn.close()
-    return jsonify([serialize_task_ui(row) for row in rows])
 
 
 @app.post("/api/checkout/tasks/<int:task_id>/start")
@@ -4805,70 +4783,6 @@ def api_stop_checkout_task(task_id: int):
     return jsonify({"ok": True, "task": payload})
 
 
-@app.get("/api/checkout/tasks/<int:task_id>/attempts")
-@require_auth
-def api_checkout_task_attempts(task_id: int):
-    conn = db()
-    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
-    if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    attempts = conn.execute(
-        """
-        select id, task_id, state, status, error_text, created_at
-        from checkout_attempts
-        where task_id = ?
-        order by id desc
-        """,
-        (task_id,),
-    ).fetchall()
-    conn.close()
-    return jsonify(
-        [
-            {
-                "id": a["id"],
-                "task_id": a["task_id"],
-                "state": a["state"],
-                "step": a["status"],
-                "error": a["error_text"],
-                "created_at": a["created_at"],
-            }
-            for a in attempts
-        ]
-    )
-
-
-@app.get("/api/checkout/tasks/<int:task_id>/attempts")
-@require_auth
-def api_checkout_task_attempts(task_id: int):
-    conn = db()
-    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
-    if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    attempts = conn.execute(
-        """
-        select id, task_id, state, status, error_text, created_at
-        from checkout_attempts
-        where task_id = ?
-        order by id desc
-        """,
-        (task_id,),
-    ).fetchall()
-    conn.close()
-    return jsonify(
-        [
-            {
-                "id": a["id"],
-                "task_id": a["task_id"],
-                "state": a["state"],
-                "step": a["status"],
-                "error": a["error_text"],
-                "created_at": a["created_at"],
-            }
-            for a in attempts
-        ]
-    )
 
 
 @app.get("/api/checkout/tasks/<int:task_id>/state")
@@ -5974,6 +5888,7 @@ if __name__ == "__main__":
         "Legal/ethical note: this project provides stock monitoring + alerts only. Auto-checkout is intentionally not implemented.",
         level="warning",
     )
+    listen_port = int(os.getenv("PORT", "5000"))
     if APP_ROLE == "worker":
         worker_running = True
         worker_loop()
@@ -5982,6 +5897,6 @@ if __name__ == "__main__":
             worker_running = True
             worker_thread = threading.Thread(target=worker_loop, daemon=True)
             worker_thread.start()
-        socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
+        socketio.run(app, host="0.0.0.0", port=listen_port, allow_unsafe_werkzeug=True)
     else:
-        socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
+        socketio.run(app, host="0.0.0.0", port=listen_port, allow_unsafe_werkzeug=True)
