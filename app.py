@@ -35,6 +35,7 @@ from retailers import (
     resolve_retailer_adapter,
     run_retailer_flow,
 )
+from tasks.parsers import MonitorInputValidationError, parse_monitor_input
 
 from network.session_manager import RequestResult, SessionManager
 from network.session_manager import RequestBehaviorPolicy
@@ -1964,6 +1965,25 @@ def enforce_plan_limits(workspace_id: int, poll_interval_seconds: int) -> None:
         raise ValueError(
             f"Plan {workspace['plan']} minimum poll interval is {limits['min_poll_seconds']} seconds"
         )
+
+
+def _resolve_monitor_input(
+    raw_input: str,
+    *,
+    is_edit_flow: bool = False,
+    existing_product_count: int | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    parsed_products = parse_monitor_input(
+        raw_input,
+        is_edit_flow=is_edit_flow,
+        existing_product_count=existing_product_count,
+    )
+    first_product = parsed_products[0]
+    pid = str(first_product["pid"])
+    if pid == "placeholder":
+        return "placeholder", parsed_products
+    canonical_url = f"https://www.pokemoncenter.com/product/{pid}"
+    return canonical_url, parsed_products
 
 
 def _normalize_plan_hint(value: str | None) -> str:
@@ -4920,6 +4940,7 @@ def api_create_task():
         retailer = canonical_retailer((body.get("retailer") or "").strip())
         category = (body.get("category") or "pokemon").strip().lower()
         product_url = (body.get("url") or body.get("product_url") or "").strip()
+        normalized_products: list[dict[str, Any]] | None = None
         profile = (body.get("profile") or "").strip()
         account = (body.get("account") or "").strip()
         payment = (body.get("payment") or "").strip()
@@ -4929,7 +4950,11 @@ def api_create_task():
             raise ValueError(f"Unsupported category '{category}'")
         if category not in RETAILER_CATEGORY_SUPPORT.get(retailer, set()):
             raise ValueError(f"Retailer '{retailer}' does not support category '{category}'")
-        if not (product_url.startswith("http://") or product_url.startswith("https://")):
+        if retailer == "pokemoncenter":
+            product_url, normalized_products = _resolve_monitor_input(product_url)
+            if product_url == "placeholder":
+                raise ValueError("placeholder is not allowed when creating monitors")
+        elif not (product_url.startswith("http://") or product_url.startswith("https://")):
             raise ValueError("url must be http(s)")
         if not profile:
             raise ValueError("profile is required")
@@ -4937,7 +4962,7 @@ def api_create_task():
             raise ValueError("account is required")
         if not payment:
             raise ValueError("payment is required")
-    except ValueError as exc:
+    except (ValueError, MonitorInputValidationError) as exc:
         return jsonify({"error": str(exc)}), 400
 
     workspace_id = current_workspace_id()
@@ -4966,6 +4991,7 @@ def api_create_task():
             "retailer": retailer,
             "category": category,
             "product_url": product_url,
+            "products": normalized_products or [],
             "profile": profile,
             "account": account,
             "payment": payment,
@@ -5305,6 +5331,7 @@ def api_create_monitor():
         retailer = canonical_retailer(body["retailer"])
         category = (body.get("category") or "pokemon").strip().lower()
         url = body["product_url"].strip()
+        normalized_products: list[dict[str, Any]] | None = None
         poll_interval = int(body.get("poll_interval_seconds", 20))
         keyword = (body.get("keyword") or "").strip() or None
         max_price_cents = body.get("max_price_cents")
@@ -5323,13 +5350,17 @@ def api_create_monitor():
             raise ValueError(f"Unsupported category '{category}'")
         if category not in RETAILER_CATEGORY_SUPPORT.get(retailer, set()):
             raise ValueError(f"Retailer '{retailer}' does not support category '{category}'")
-        if not (url.startswith("http://") or url.startswith("https://")):
+        if retailer == "pokemoncenter":
+            url, normalized_products = _resolve_monitor_input(url)
+            if url == "placeholder":
+                raise ValueError("placeholder is not allowed when creating monitors")
+        elif not (url.startswith("http://") or url.startswith("https://")):
             raise ValueError("product_url must be http(s)")
         if session_task_key and len(session_task_key) > 80:
             raise ValueError("session_task_key must be <= 80 chars")
 
         enforce_plan_limits(current_workspace_id(), poll_interval)
-    except (KeyError, ValueError) as exc:
+    except (KeyError, ValueError, MonitorInputValidationError) as exc:
         return jsonify({"error": str(exc)}), 400
 
     conn = db()
@@ -5354,7 +5385,10 @@ def api_create_monitor():
     monitor_id = cur.lastrowid
     row = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
     conn.close()
-    return jsonify(dict(row)), 201
+    payload = dict(row)
+    if normalized_products is not None:
+        payload["products"] = normalized_products
+    return jsonify(payload), 201
 
 
 @app.patch("/api/monitors/<int:monitor_id>")

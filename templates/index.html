@@ -166,6 +166,7 @@
     }
 
     .warn { color: #f7b955; font-size: 13px; }
+    .inline-error { color: #ff8e8e; font-size: 12px; margin-top: 8px; }
     .config-warn {
       display: none;
       margin: 16px;
@@ -308,6 +309,7 @@
               <input id="task_name" placeholder="Walmart checkout task" />
             </div>
           </div>
+          <div id="create_task_error" class="inline-error"></div>
           <button style="margin-top:10px;" onclick="createTask()">Create Task</button>
         </div>
 
@@ -363,6 +365,7 @@
               <div id="captcha_widget" class="cf-turnstile" data-sitekey="{{ captcha_site_key }}" data-theme="dark" data-callback="onCaptchaSuccess" data-expired-callback="onCaptchaExpired" data-error-callback="onCaptchaError"></div>
             </div>
             {% endif %}
+            <div id="monitor_input_error" class="inline-error"></div>
             <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
           </div>
 
@@ -670,6 +673,14 @@
     }
 
     async function addMonitor() {
+      const monitorInput = document.getElementById('product_url')?.value || '';
+      const monitorValidationError = validateMonitorInputClient(monitorInput, {isEditFlow: false, existingProductCount: 0});
+      const monitorErrorEl = document.getElementById('monitor_input_error');
+      if (monitorErrorEl) monitorErrorEl.textContent = monitorValidationError || '';
+      if (monitorValidationError) return;
+
+      const maxPrice = document.getElementById('max_price_cents').value;
+      const msrp = document.getElementById('msrp_cents').value;
       const retailerEl = document.getElementById('retailer');
       const productUrlEl = document.getElementById('product_url');
       const pollIntervalEl = document.getElementById('poll_interval');
@@ -722,6 +733,31 @@
     }
 
     async function createTask() {
+      const taskInput = document.getElementById('task_url')?.value || '';
+      const taskValidationError = validateMonitorInputClient(taskInput, {isEditFlow: false, existingProductCount: 0});
+      const taskErrorEl = document.getElementById('create_task_error');
+      if (taskErrorEl) taskErrorEl.textContent = taskValidationError || '';
+      if (taskValidationError) return;
+
+      const taskPayload = {
+        retailer: document.getElementById('task_retailer').value,
+        product_url: document.getElementById('task_url').value,
+        profile: document.getElementById('task_profile').value,
+        account: document.getElementById('task_account').value,
+        payment: document.getElementById('task_payment').value,
+      };
+
+      const monitorPayload = {
+        retailer: taskPayload.retailer,
+        product_url: taskPayload.product_url,
+        poll_interval_seconds: Number(document.getElementById('poll_interval').value),
+      };
+      const monitorRes = await apiFetch('/api/monitors', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(monitorPayload))
+      });
+      const monitor = await monitorRes.json();
+      if (monitor.error) {
+        alert(monitor.error);
       const monitorField = document.getElementById('task_monitor_id');
       const taskNameField = document.getElementById('task_name');
       const monitorIdRaw = monitorField?.value || '';
@@ -748,6 +784,32 @@
       }
       await loadTasks();
       selectTask(data.id);
+    }
+
+    function validateMonitorInputClient(rawInput, options = {}) {
+      const value = (rawInput || '').trim();
+      if (!value) return 'Product input is required.';
+      if (value.toLowerCase() === 'placeholder') return null;
+      if (value.startsWith('http://') || value.startsWith('https://')) return null;
+
+      const segments = value.split(',').map(s => s.trim());
+      if (segments.some(s => !s)) return 'invalid PID format: empty segment';
+      const quickEditMode = segments.length > 1 || segments.some(s => s.includes(':'));
+      if (quickEditMode && (!options.isEditFlow || options.existingProductCount !== 1)) {
+        return 'Quick Edit is only allowed when editing a task with exactly one product.';
+      }
+
+      for (const segment of segments) {
+        const [pid, qtyRaw] = segment.split(':');
+        if (!/^\d{2}-\d{5}-\d{3}$/.test((pid || '').trim())) {
+          return 'invalid PID format';
+        }
+        if (qtyRaw !== undefined) {
+          const qtyText = qtyRaw.trim();
+          if (!/^\d+$/.test(qtyText) || Number(qtyText) <= 0) return 'invalid quantity (must be an integer > 0)';
+        }
+      }
+      return null;
     }
 
     function taskErrorLabel(value) {
