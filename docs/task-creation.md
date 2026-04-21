@@ -5,6 +5,8 @@ A checkout task references a monitor (`monitor_id`) and stores task metadata in 
 
 ## Canonical API flow
 
+Monitor management endpoints are canonical at `/api/monitors` + `/api/monitors/<id>` (GET/PATCH/DELETE). Immediate checks use `POST /api/monitors/<id>/check`.
+
 - `retailer`: one of `walmart`, `target`, `bestbuy`, `pokemoncenter`
   - aliases accepted for Pokemon Center: `pokemon-center`, `pokemon_center`, `pokemon center`
 - `category`: one of `pokemon`, `sports_cards`, `one_piece`, `lorcana`

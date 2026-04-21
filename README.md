@@ -53,6 +53,9 @@ The last two commands are explicit migration-safety checks for:
   - `X-API-Token: <token>`
 - `POST /api/webhooks` to add Discord webhook.
 - `POST /api/monitors` to add product monitor.
+- `GET /api/monitors/<id>` to fetch a monitor within the current workspace.
+- `PATCH /api/monitors/<id>` to update monitor fields (for example, `enabled`).
+- `DELETE /api/monitors/<id>` to remove a monitor in the current workspace.
 - `POST /api/checkout/tasks` to create a checkout task for an existing monitor.
 - `POST /api/checkout/tasks/:id/start|pause|stop` to manage checkout task lifecycle.
 - `GET /api/checkout/tasks/:id/state` to read canonical task state and last attempt metadata.
@@ -62,7 +65,7 @@ The last two commands are explicit migration-safety checks for:
 - `POST /api/checkout/tasks/:id/run` to execute the checkout state machine (`monitoring` → `carting` → `shipping` → `payment` → `submitting`).
 - `GET /api/checkout/tasks/:id/attempts` to fetch execution attempts (use `?include_created=1` to include initialization rows).
 - `POST /api/start` to begin background monitor checks.
-- `POST /api/monitors/:id/check` to run an immediate check.
+- `POST /api/monitors/<id>/check` to run an immediate check.
 - `GET /api/workspace/usage-limits` to retrieve plan limits + current usage snapshot.
 
 Monitor check response compatibility notes:
