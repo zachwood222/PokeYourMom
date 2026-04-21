@@ -573,6 +573,65 @@ def test_events_endpoint_keeps_desc_limit_and_excludes_cross_tenant_rows(tmp_pat
         (other_workspace, app_module.utc_now()),
     ).lastrowid
 
+def test_create_event_and_deliver_uses_shared_request_helper_only(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    captured = {}
+
+    class DummyResponse:
+        status_code = 204
+        text = ""
+        ok = True
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    def fail_direct_post(*_args, **_kwargs):
+        raise AssertionError("direct requests.post should not be used for webhook delivery")
+
+    monkeypatch.setattr(app_module.requests, "post", fail_direct_post)
+
+    conn = app_module.db()
+    conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/p', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor = conn.execute("select * from monitors order by id desc limit 1").fetchone()
+    conn.execute(
+        "insert into webhooks(workspace_id, name, webhook_url, created_at) values (1, 'Main', 'https://discord.com/api/webhooks/test', ?)",
+        (app_module.utc_now(),),
+    )
+    conn.commit()
+    conn.close()
+
+    result = app_module.MonitorResult(
+        in_stock=True,
+        price_cents=2500,
+        title="Pokemon Product",
+        status_text="in_stock",
+        keyword_matched=True,
+    )
+    app_module.create_event_and_deliver(monitor, result, eligible=True)
+
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://discord.com/api/webhooks/test"
+    assert captured["retry_total"] == 1
+    assert captured["backoff_factor"] == 0.2
+
+
+def test_evaluate_page_sets_keyword_and_price_fields(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
     for idx in range(1, 121):
         conn.execute(
             """
@@ -2247,6 +2306,103 @@ def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
     assert members_count == 1
 
 
+def test_fetch_monitor_uses_monitor_proxy_override_and_session_task_key(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    class DummyResponse:
+        status_code = 200
+        text = "<html><title>Item</title><body>in stock add to cart $19.99</body></html>"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    captured = {}
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    conn.execute("update workspaces set proxy_url = ? where id = 1", ("http://workspace-proxy:8080",))
+    cur = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, proxy_url, session_task_key, created_at
+        ) values (1, 'target', 'https://example.com/item', 20, 'http://monitor-proxy:9090', 'session-custom-1', ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor = conn.execute("select * from monitors where id = ?", (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+
+    result = app_module.fetch_monitor(monitor)
+
+    assert result.in_stock is True
+    assert captured["task_key"] == "session-custom-1"
+    assert captured["proxy_url"] == "http://monitor-proxy:9090"
+    assert captured["retry_total"] == 2
+    assert captured["backoff_factor"] == 0.35
+
+
+def test_fetch_monitor_uses_workspace_proxy_and_default_session_task_key(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    class DummyResponse:
+        status_code = 200
+        text = "<html><title>Item</title><body>out of stock $29.99</body></html>"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    captured = {}
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    conn.execute("update workspaces set proxy_url = ? where id = 1", ("http://workspace-proxy:8080",))
+    cur = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, proxy_url, session_task_key, created_at
+        ) values (1, 'walmart', 'https://example.com/item2', 20, null, null, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor_id = int(cur.lastrowid)
+    monitor = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
+    conn.commit()
+    conn.close()
+
+    result = app_module.fetch_monitor(monitor)
+
+    assert result.in_stock is False
+    assert captured["task_key"] == f"monitor-{monitor_id}"
+    assert captured["proxy_url"] == "http://workspace-proxy:8080"
+    assert captured["retry_total"] == 2
+    assert captured["backoff_factor"] == 0.35
+
+
 def test_api_routes_require_auth(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -2394,12 +2550,22 @@ def test_create_checkout_task_and_read_state_endpoint(tmp_path, monkeypatch):
         },
         headers=_auth_headers(),
     )
+    monitor = create_monitor_resp.get_json()
+    assert create_monitor_resp.status_code == 201
     assert create_monitor_resp.status_code == 201
     monitor_id = create_monitor_resp.get_json()["id"]
 
     create_resp = client.post(
         "/api/checkout/tasks",
         json={
+            "monitor_id": monitor["id"],
+            "task_config": {
+                "retailer": "walmart",
+                "product_url": "https://www.walmart.com/ip/sku",
+                "profile": "profile-main",
+                "account": "acc-primary",
+                "payment": "visa-4242",
+            },
             "monitor_id": monitor_id,
             "task_name": "Smoke task",
             "task_config": {"profile": "profile-main", "account": "acc-primary", "payment": "visa-4242"},
@@ -2408,16 +2574,36 @@ def test_create_checkout_task_and_read_state_endpoint(tmp_path, monkeypatch):
     )
     assert create_resp.status_code == 201
     created = create_resp.get_json()
+    assert created["current_state"] == "queued"
     task_id = created["id"]
     assert created["monitor_id"] == monitor_id
     assert created["current_state"] == "queued"
 
+    list_resp = client.get("/api/checkout/tasks", headers=_auth_headers())
+    assert list_resp.status_code == 200
+    tasks = list_resp.get_json()
+    assert len(tasks) == 1
+    assert tasks[0]["id"] == task_id
+    assert tasks[0]["current_state"] == "queued"
+
+    attempts_resp = client.get(f"/api/checkout/tasks/{task_id}/attempts", headers=_auth_headers())
+    assert attempts_resp.status_code == 200
+    assert attempts_resp.get_json() == []
     state_resp = client.get(f"/api/checkout/tasks/{task_id}/state", headers=_auth_headers())
     assert state_resp.status_code == 200
     state_payload = state_resp.get_json()
     assert state_payload["task_id"] == task_id
     assert state_payload["current_state"] == "queued"
     assert state_payload["last_attempt"] is not None
+
+    attempts_with_created_resp = client.get(
+        f"/api/checkout/tasks/{task_id}/attempts?include_created=1",
+        headers=_auth_headers(),
+    )
+    assert attempts_with_created_resp.status_code == 200
+    attempts_with_created = attempts_with_created_resp.get_json()
+    assert len(attempts_with_created) == 1
+    assert attempts_with_created[0]["step"] == "created"
 
 
 def test_checkout_task_lifecycle_start_pause_stop(tmp_path, monkeypatch):
@@ -2431,6 +2617,26 @@ def test_checkout_task_lifecycle_start_pause_stop(tmp_path, monkeypatch):
             "retailer": "target",
             "product_url": "https://www.target.com/p/abc",
             "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    monitor = create_monitor_resp.get_json()
+    assert create_monitor_resp.status_code == 201
+
+    create_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor["id"],
+            "task_config": {
+                "retailer": "target",
+                "product_url": "https://www.target.com/p/abc",
+                "profile": "default",
+                "account": "acct-1",
+                "payment": "amex",
+            },
+        },
+        headers=_auth_headers(),
+    )
         },
         headers=_auth_headers(),
     )
@@ -2468,6 +2674,9 @@ def test_checkout_task_lifecycle_start_pause_stop(tmp_path, monkeypatch):
 
     start_resp = client.post(f"/api/checkout/tasks/{task_id}/start", headers=_auth_headers())
     assert start_resp.status_code == 200
+    started_task = start_resp.get_json()["task"]
+    assert started_task["current_state"] == "monitoring"
+
     assert start_resp.get_json()["task"]["current_state"] == "monitoring"
 
     pause_resp = client.post(f"/api/checkout/tasks/{task_id}/pause", headers=_auth_headers())
@@ -3221,6 +3430,38 @@ def test_check_monitor_api_includes_reason_and_confidence_for_ambiguous_markup(t
     assert resp.status_code == 200
     assert payload["availability_reason"] == "fallback_unknown"
     assert payload["parser_confidence"] == 0.2
+
+
+def test_check_monitor_notify_failures_do_not_clobber_persisted_state(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    monitor_id = _seed_monitor(app_module)
+    expected = app_module.MonitorResult(
+        in_stock=True,
+        price_cents=1999,
+        title="Pokemon Product",
+        status_text="in_stock",
+        availability_reason="marker_in_stock",
+        parser_confidence=0.91,
+        keyword_matched=True,
+    )
+
+    monkeypatch.setattr(app_module, "fetch_monitor", lambda monitor: expected)
+    monkeypatch.setattr(app_module, "create_event_and_deliver", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("notify down")))
+
+    resp = client.post(f"/api/monitors/{monitor_id}/check", headers=_auth_headers())
+    payload = resp.get_json()
+    assert resp.status_code == 200
+    assert payload["ok"] is True
+    assert payload["eligible_for_alert"] is True
+
+    conn = app_module.db()
+    row = conn.execute("select failure_streak, last_error, last_price_cents, last_in_stock from monitors where id = ?", (monitor_id,)).fetchone()
+    conn.close()
+    assert row["failure_streak"] == 0
+    assert row["last_error"] is None
+    assert row["last_price_cents"] == 1999
+    assert row["last_in_stock"] == 1
 
 
 def test_check_monitor_notify_failures_do_not_clobber_persisted_state(tmp_path, monkeypatch):

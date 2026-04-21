@@ -1983,6 +1983,189 @@ def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]
     return sync_manual_billing_subscription_event(payload)
 
 
+def extract_price_cents(text: str) -> int | None:
+    matches = re.findall(r"\$\s*(\d{1,4}(?:\.\d{2})?)", text)
+    if not matches:
+        return None
+    values = []
+    for m in matches:
+        try:
+            v = float(m)
+            if 1.0 <= v <= 2000.0:
+                values.append(int(round(v * 100)))
+        except ValueError:
+            continue
+    return min(values) if values else None
+
+
+def _parse_common_title_and_text(html: str) -> tuple[str, str]:
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "Product"
+    text = re.sub(r"<[^>]+>", " ", html).lower()
+    return title[:180], text
+
+
+def default_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
+
+    out_markers = [
+        "out of stock",
+        "sold out",
+        "unavailable",
+        "not available",
+        "coming soon",
+        "temporarily out of stock",
+    ]
+    in_markers = [
+        "in stock",
+        "add to cart",
+        "buy now",
+        "pickup",
+        "ship it",
+    ]
+
+    has_out = any(m in text for m in out_markers)
+    has_in = any(m in text for m in in_markers)
+
+    in_stock = has_in and not has_out
+    availability_reason = "fallback_unknown"
+    parser_confidence = 0.2
+    if has_out and not has_in:
+        availability_reason = "marker_out_of_stock"
+        parser_confidence = 0.9
+    elif has_in and not has_out:
+        availability_reason = "marker_in_stock"
+        parser_confidence = 0.9
+    elif has_in and has_out:
+        availability_reason = "marker_conflict"
+        parser_confidence = 0.35
+    keyword_matched: bool | None = None
+    if keyword:
+        keyword_matched = keyword.lower() in text
+    price_cents = extract_price_cents(re.sub(r"<[^>]+>", " ", html))
+    status_text = "in_stock" if in_stock else "out_or_unknown"
+    return MonitorResult(
+        in_stock=in_stock,
+        price_cents=price_cents,
+        title=title[:180],
+        status_text=status_text,
+        availability_reason=availability_reason,
+        parser_confidence=parser_confidence,
+        keyword_matched=keyword_matched,
+    )
+
+
+def pokemoncenter_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
+    result = default_parser(html, keyword=keyword)
+    out_markers = ["notify me when available", "currently unavailable"]
+    in_markers = ["add to bag"]
+    has_out = any(m in text for m in out_markers)
+    has_in = any(m in text for m in in_markers)
+    if has_out:
+        result.in_stock = False
+        result.status_text = "out_or_unknown"
+        result.availability_reason = "pokemoncenter_marker_out_of_stock"
+        result.parser_confidence = 0.98
+    elif has_in:
+        result.in_stock = True
+        result.status_text = "in_stock"
+        result.availability_reason = "pokemoncenter_marker_in_stock"
+        result.parser_confidence = 0.98
+    result.title = title
+    return result
+
+
+def walmart_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
+    result = default_parser(html, keyword=keyword)
+    if '"availability":"instock"' in text or "fulfillmentoptions" in text:
+        result.in_stock = True
+        result.status_text = "in_stock"
+        result.availability_reason = "walmart_marker_in_stock"
+        result.parser_confidence = 0.98
+    if '"availability":"outofstock"' in text or "out of stock" in text:
+        result.in_stock = False
+        result.status_text = "out_or_unknown"
+        result.availability_reason = "walmart_marker_out_of_stock"
+        result.parser_confidence = 0.98
+    result.price_cents = extract_price_cents(html)
+    result.title = title
+    return result
+
+
+def target_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
+    result = default_parser(html, keyword=keyword)
+
+    in_markers = [
+        '"availability":"instock"',
+        '"availability":"in_stock"',
+        "add to cart",
+        "ship it",
+        "pick up",
+    ]
+    out_markers = [
+        '"availability":"outofstock"',
+        '"availability":"out_of_stock"',
+        "out of stock",
+        "sold out",
+        "unavailable",
+    ]
+    has_in = any(marker in text for marker in in_markers)
+    has_out = any(marker in text for marker in out_markers)
+
+    if has_out:
+        result.in_stock = False
+        result.status_text = "out_or_unknown"
+        result.availability_reason = "target_marker_out_of_stock"
+        result.parser_confidence = 0.98
+    elif has_in:
+        result.in_stock = True
+        result.status_text = "in_stock"
+        result.availability_reason = "target_marker_in_stock"
+        result.parser_confidence = 0.98
+
+    result.price_cents = extract_price_cents(html)
+    result.title = title
+    return result
+
+
+def bestbuy_parser(html: str, keyword: str | None = None) -> MonitorResult:
+    title, text = _parse_common_title_and_text(html)
+    result = default_parser(html, keyword=keyword)
+
+    in_markers = [
+        '"buttonstate":"add to cart"',
+        '"shipping":"available"',
+        "ready for pickup today",
+    ]
+    out_markers = [
+        '"buttonstate":"sold out"',
+        '"buttonstate":"coming soon"',
+        '"shipping":"unavailable"',
+        "sold out",
+        "coming soon",
+    ]
+    has_in = any(marker in text for marker in in_markers)
+    has_out = any(marker in text for marker in out_markers)
+
+    if has_out:
+        result.in_stock = False
+        result.status_text = "out_or_unknown"
+        result.availability_reason = "bestbuy_marker_out_of_stock"
+        result.parser_confidence = 0.98
+    elif has_in:
+        result.in_stock = True
+        result.status_text = "in_stock"
+        result.availability_reason = "bestbuy_marker_in_stock"
+        result.parser_confidence = 0.98
+
+    result.price_cents = extract_price_cents(html)
+    result.title = title
+    return result
+
+
 def get_adapter_for_retailer(retailer: str | None):
     return resolve_retailer_adapter(retailer)
 
@@ -2639,6 +2822,302 @@ class CheckoutRetryableError(RuntimeError):
     pass
 
 
+def _classify_checkout_step_failure(step: str, exc: Exception, attempt_number: int) -> tuple[bool, str]:
+    policy = CHECKOUT_STEP_RETRY_POLICY[step]
+    if isinstance(exc, (ValueError, PermissionError)):
+        return False, "terminal_validation_error"
+    if attempt_number >= policy["max_attempts"]:
+        return False, "terminal_max_attempts_exceeded"
+    if isinstance(exc, (CheckoutRetryableError, requests.RequestException, TimeoutError, ConnectionError, sqlite3.OperationalError)):
+        return True, "retryable_exception"
+    return False, "terminal_unclassified"
+
+
+def _checkout_step_monitoring(
+    _conn: sqlite3.Connection,
+    _task: sqlite3.Row,
+    monitor: sqlite3.Row | None,
+    _config: dict[str, Any],
+    _attempt_number: int,
+) -> None:
+    if monitor is None:
+        raise ValueError("monitor_missing")
+
+
+def _checkout_step_carting(
+    _conn: sqlite3.Connection,
+    _task: sqlite3.Row,
+    _monitor: sqlite3.Row | None,
+    _config: dict[str, Any],
+    _attempt_number: int,
+) -> None:
+    return None
+
+
+def _checkout_step_shipping(
+    _conn: sqlite3.Connection,
+    _task: sqlite3.Row,
+    _monitor: sqlite3.Row | None,
+    config: dict[str, Any],
+    _attempt_number: int,
+) -> None:
+    if not config.get("profile"):
+        raise ValueError("shipping_profile_missing")
+
+
+def _checkout_step_payment(
+    _conn: sqlite3.Connection,
+    _task: sqlite3.Row,
+    _monitor: sqlite3.Row | None,
+    config: dict[str, Any],
+    attempt_number: int,
+) -> None:
+    if not config.get("payment"):
+        raise ValueError("payment_method_missing")
+    fail_step = str(config.get("simulate_fail_step") or "")
+    fail_times = int(config.get("simulate_fail_times") or 0)
+    if fail_step == "payment" and attempt_number <= fail_times:
+        if bool(config.get("simulate_retryable", True)):
+            raise CheckoutRetryableError("simulated_payment_failure")
+        raise ValueError("simulated_payment_terminal_failure")
+
+
+def _checkout_step_submitting(
+    _conn: sqlite3.Connection,
+    _task: sqlite3.Row,
+    _monitor: sqlite3.Row | None,
+    _config: dict[str, Any],
+    _attempt_number: int,
+) -> None:
+    return None
+
+
+CHECKOUT_STEP_HANDLERS = {
+    "monitoring": _checkout_step_monitoring,
+    "carting": _checkout_step_carting,
+    "shipping": _checkout_step_shipping,
+    "payment": _checkout_step_payment,
+    "submitting": _checkout_step_submitting,
+}
+
+
+def _resolve_task_binding_context(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: int,
+    monitor_id: int,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    context = {
+        "profile": config.get("profile"),
+        "account": config.get("account"),
+        "payment": config.get("payment"),
+    }
+    errors: list[str] = []
+    binding = conn.execute(
+        """
+        select * from task_profile_bindings
+        where workspace_id = ? and monitor_id = ?
+        """,
+        (workspace_id, monitor_id),
+    ).fetchone()
+    if not binding:
+        return context, errors
+
+    if binding["checkout_profile_id"] is None:
+        errors.append("binding_profile_missing")
+    else:
+        profile = conn.execute(
+            "select * from checkout_profiles where id = ? and workspace_id = ?",
+            (binding["checkout_profile_id"], workspace_id),
+        ).fetchone()
+        if not profile:
+            errors.append("binding_profile_not_found")
+        else:
+            context["profile"] = profile["name"]
+
+    if binding["retailer_account_id"] is None:
+        errors.append("binding_account_missing")
+    else:
+        account = conn.execute(
+            "select * from retailer_accounts where id = ? and workspace_id = ?",
+            (binding["retailer_account_id"], workspace_id),
+        ).fetchone()
+        if not account:
+            errors.append("binding_account_not_found")
+        else:
+            context["account"] = account["email"] or account["username"] or f"account-{account['id']}"
+
+    if binding["payment_method_id"] is None:
+        errors.append("binding_payment_missing")
+    else:
+        payment = conn.execute(
+            "select * from payment_methods where id = ? and workspace_id = ?",
+            (binding["payment_method_id"], workspace_id),
+        ).fetchone()
+        if not payment:
+            errors.append("binding_payment_not_found")
+        else:
+            context["payment"] = payment["label"]
+
+    return context, errors
+
+
+def _validate_checkout_context_for_step(step: str, context: dict[str, Any], binding_errors: list[str]) -> str | None:
+    if step not in {"payment", "submitting"}:
+        return None
+    if binding_errors:
+        return binding_errors[0]
+    if not context.get("profile"):
+        return "missing_profile_binding_or_config"
+    if not context.get("account"):
+        return "missing_account_binding_or_config"
+    if not context.get("payment"):
+        return "missing_payment_binding_or_config"
+    return None
+
+
+def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqlite3.Row | None:
+    conn = db()
+    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+    if not task:
+        conn.close()
+        return None
+
+    config_raw = task["task_config"] or "{}"
+    try:
+        config = json.loads(config_raw)
+    except (TypeError, json.JSONDecodeError):
+        config = {}
+    binding_context, binding_errors = _resolve_task_binding_context(
+        conn,
+        workspace_id=workspace_id,
+        monitor_id=task["monitor_id"],
+        config=config,
+    )
+    config.update(binding_context)
+    monitor = conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (task["monitor_id"], workspace_id),
+    ).fetchone()
+
+    for step in CHECKOUT_STEP_SEQUENCE:
+        context_error = _validate_checkout_context_for_step(step, config, binding_errors)
+        if context_error:
+            transition_checkout_task(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                requested_state="failed",
+                reason=f"{step}:validation",
+                error_text=context_error,
+            )
+            record_task_log(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                monitor_id=task["monitor_id"],
+                level="error",
+                event_type="binding_validation_failed",
+                message=f"Checkout validation failed before {step}",
+                payload={"error_code": context_error},
+            )
+            conn.commit()
+            failed = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+            conn.close()
+            return failed
+
+        transitioned = transition_checkout_task(
+            conn,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            requested_state=step,
+            reason="checkout_step_start",
+        )
+        if not transitioned:
+            conn.close()
+            return None
+        policy = CHECKOUT_STEP_RETRY_POLICY[step]
+        for attempt_number in range(1, policy["max_attempts"] + 1):
+            try:
+                CHECKOUT_STEP_HANDLERS[step](conn, transitioned, monitor, config, attempt_number)
+                record_checkout_attempt(
+                    conn,
+                    task_id=task_id,
+                    workspace_id=workspace_id,
+                    monitor_id=task["monitor_id"],
+                    state=step,
+                    status="step_success",
+                    details={"attempt_number": attempt_number},
+                )
+                record_task_log(
+                    conn,
+                    task_id=task_id,
+                    workspace_id=workspace_id,
+                    monitor_id=task["monitor_id"],
+                    level="info",
+                    event_type="step_success",
+                    message=f"{step} succeeded",
+                    payload={"attempt_number": attempt_number},
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                retryable, taxonomy = _classify_checkout_step_failure(step, exc, attempt_number)
+                record_checkout_attempt(
+                    conn,
+                    task_id=task_id,
+                    workspace_id=workspace_id,
+                    monitor_id=task["monitor_id"],
+                    state=step,
+                    status="step_failure",
+                    details={"attempt_number": attempt_number, "taxonomy": taxonomy, "retryable": retryable},
+                    error_text=f"{taxonomy}:{exc}",
+                )
+                record_task_log(
+                    conn,
+                    task_id=task_id,
+                    workspace_id=workspace_id,
+                    monitor_id=task["monitor_id"],
+                    level="warning" if retryable else "error",
+                    event_type="step_failure",
+                    message=f"{step} failed ({taxonomy})",
+                    payload={"attempt_number": attempt_number, "retryable": retryable},
+                )
+                if retryable:
+                    continue
+                transition_checkout_task(
+                    conn,
+                    task_id=task_id,
+                    workspace_id=workspace_id,
+                    requested_state="failed",
+                    reason=f"{step}:{taxonomy}",
+                    error_text=f"{taxonomy}:{exc}",
+                )
+                conn.commit()
+                failed = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+                conn.close()
+                return failed
+
+    transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        requested_state="success",
+        reason="checkout_complete",
+    )
+    conn.commit()
+    done = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+    conn.close()
+    return done
+
+
+def enqueue_checkout_for_monitor(
+    monitor: sqlite3.Row, result: MonitorResult, *, reason: str = "in_stock_detected"
+) -> int | None:
+    if not result.in_stock:
+        return None
+    conn = db()
+    existing = conn.execute(
 def create_secret(
     conn: sqlite3.Connection,
     workspace_id: int,
@@ -3232,6 +3711,7 @@ def serialize_task_ui(row: sqlite3.Row | None) -> dict[str, Any] | None:
     state = "running" if current_state == "monitoring" else ("idle" if current_state == "queued" else current_state)
     return {
         "id": payload["id"],
+        "current_state": current_state,
         "state": state,
         "retries": 0,
         "last_step": current_state,
@@ -4800,16 +5280,16 @@ def api_update_monitor(monitor_id: int):
         return jsonify({"error": "enabled is required"}), 400
 
     conn = db()
+    conn.execute("update monitors set enabled = ? where id = ? and workspace_id = ?", (int(bool(enabled)), monitor_id, workspace_id))
+    conn.commit()
+    row = conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (monitor_id, workspace_id),
+    ).fetchone()
     row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     if not row:
         conn.close()
         return jsonify({"error": "Monitor not found"}), 404
-    conn.execute(
-        "update monitors set enabled = ? where id = ? and workspace_id = ?",
-        (int(bool(enabled)), monitor_id, workspace_id),
-    )
-    conn.commit()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
     return jsonify(dict(row))
 
@@ -5237,6 +5717,19 @@ def api_create_checkout_captcha_challenge(task_id: int):
     return jsonify(serialize_challenge(updated)), 201
 
 
+@app.get("/api/checkout/tasks")
+@require_auth
+def api_list_checkout_tasks():
+    conn = db()
+    rows = conn.execute(
+        "select * from checkout_tasks where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_task_ui(row) for row in rows])
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/start")
 @app.get("/api/checkout/tasks/<int:task_id>/captcha-challenges")
 @require_auth
 def api_list_checkout_captcha_challenges(task_id: int):
@@ -5260,6 +5753,16 @@ def api_list_checkout_captcha_challenges(task_id: int):
     return jsonify([serialize_challenge(row) for row in rows])
 
 
+@app.post("/api/checkout/tasks/<int:task_id>/run")
+@require_auth
+def api_run_checkout_task(task_id: int):
+    row = execute_checkout_task_state_machine(task_id, current_workspace_id())
+    if not row:
+        return jsonify({"error": "Checkout task not found"}), 404
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/pause")
 @app.post("/api/checkout/captcha-challenges/<int:challenge_id>/manual-solve")
 @require_auth
 def api_submit_manual_captcha_solution(challenge_id: int):
@@ -5320,6 +5823,53 @@ def api_issue_captcha_handoff_token(challenge_id: int):
     return jsonify({"ok": True, "challenge_id": challenge_id, "handoff_token": token})
 
 
+@app.get("/api/checkout/tasks/<int:task_id>/attempts")
+@require_auth
+def api_checkout_task_attempts(task_id: int):
+    conn = db()
+    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    include_created = request.args.get("include_created", "").strip().lower() in {"1", "true", "yes"}
+    if include_created:
+        attempts = conn.execute(
+            """
+            select id, task_id, state, status, error_text, created_at
+            from checkout_attempts
+            where task_id = ?
+            order by id desc
+            """,
+            (task_id,),
+        ).fetchall()
+    else:
+        attempts = conn.execute(
+            """
+            select id, task_id, state, status, error_text, created_at
+            from checkout_attempts
+            where task_id = ?
+              and status != 'created'
+            order by id desc
+            """,
+            (task_id,),
+        ).fetchall()
+    conn.close()
+    return jsonify(
+        [
+            {
+                "id": a["id"],
+                "task_id": a["task_id"],
+                "state": a["state"],
+                "step": a["status"],
+                "error": a["error_text"],
+                "created_at": a["created_at"],
+            }
+            for a in attempts
+        ]
+    )
+
+
+@app.get("/api/checkout/tasks/<int:task_id>/state")
 @app.post("/api/internal/checkout/captcha-handoffs/consume")
 @require_auth
 def api_consume_captcha_handoff_token():

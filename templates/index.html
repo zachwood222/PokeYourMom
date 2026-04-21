@@ -747,6 +747,8 @@
           <td>${taskErrorLabel(task.last_error)}</td>
           <td class="actions">
             <button onclick="startTask(${task.id})">Start</button>
+            <button onclick="runTask(${task.id})">Run</button>
+            <button onclick="pauseTask(${task.id})">Pause</button>
             <button onclick="stopTask(${task.id})">Stop</button>
             <button onclick="selectTask(${task.id})">Logs</button>
           </td>
@@ -771,6 +773,17 @@
 
     async function stopTask(id) {
       await apiFetch(`/api/checkout/tasks/${id}/stop`, {method: 'POST'});
+      await loadTasks();
+    }
+
+    async function runTask(id) {
+      await apiFetch(`/api/checkout/tasks/${id}/run`, {method: 'POST'});
+      await loadTasks();
+      await loadTaskAttempts(id);
+    }
+
+    async function pauseTask(id) {
+      await apiFetch(`/api/checkout/tasks/${id}/pause`, {method: 'POST'});
       await loadTasks();
     }
 
