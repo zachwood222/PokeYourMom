@@ -817,6 +817,13 @@ def current_workspace_id() -> int:
     return workspace_id
 
 
+def current_user_context() -> dict[str, Any]:
+    user = getattr(g, "current_user", None)
+    if not user:
+        raise RuntimeError("Missing user context")
+    return dict(user)
+
+
 def get_workspace_for_user(user_id: int) -> sqlite3.Row | None:
     conn = db()
     row = conn.execute(
@@ -867,10 +874,19 @@ def get_workspace(workspace_id: int) -> sqlite3.Row:
     return row
 
 
+def get_default_workspace() -> sqlite3.Row:
+    conn = db()
+    row = conn.execute("select * from workspaces order by id asc limit 1").fetchone()
+    conn.close()
+    if not row:
+        raise ValueError("Workspace not found")
+    return row
+
+
 def get_workspace_for_request() -> sqlite3.Row:
     workspace = getattr(g, "current_workspace", None)
     if workspace is None:
-        workspace = get_workspace(1)
+        workspace = get_default_workspace()
     return workspace
 
 
@@ -1017,7 +1033,7 @@ def require_api_auth() -> tuple[dict[str, str], int] | None:
     else:
         token = _token_from_request()
         if token and token == API_AUTH_TOKEN:
-            _set_auth_context(DEFAULT_USER, get_workspace(1))
+            _set_auth_context(DEFAULT_USER, get_default_workspace())
         else:
             return jsonify({"error": "Unauthorized"}), 401
 
@@ -1903,6 +1919,14 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return payload
 
 
+def redact_webhook_url(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 12:
+        return "***"
+    return f"{value[:8]}...{value[-4:]}"
+
+
 def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
@@ -2672,7 +2696,7 @@ def api_billing_stripe_webhook():
 @require_auth
 def api_workspace():
     row = get_workspace(current_workspace_id())
-    return jsonify({"workspace": dict(row), "user": dict(g.current_user)})
+    return jsonify({"workspace": dict(row), "user": current_user_context()})
 
 
 @app.post("/api/workspace/plan")
@@ -2730,6 +2754,27 @@ def api_list_monitors():
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+def get_monitor_for_workspace(
+    conn: sqlite3.Connection, monitor_id: int, workspace_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (monitor_id, workspace_id),
+    ).fetchone()
+
+
+@app.get("/api/monitors/<int:monitor_id>")
+@require_auth
+def api_get_monitor(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    conn.close()
+    if not row:
+        return jsonify({"error": "Monitor not found"}), 404
+    return jsonify(dict(row))
 
 
 @app.post("/api/tasks")
@@ -3161,15 +3206,16 @@ def api_update_monitor(monitor_id: int):
         return jsonify({"error": "enabled is required"}), 400
 
     conn = db()
-    conn.execute("update monitors set enabled = ? where id = ? and workspace_id = ?", (int(bool(enabled)), monitor_id, workspace_id))
-    conn.commit()
-    row = conn.execute(
-        "select * from monitors where id = ? and workspace_id = ?",
-        (monitor_id, workspace_id),
-    ).fetchone()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     if not row:
         conn.close()
         return jsonify({"error": "Monitor not found"}), 404
+    conn.execute(
+        "update monitors set enabled = ? where id = ? and workspace_id = ?",
+        (int(bool(enabled)), monitor_id, workspace_id),
+    )
+    conn.commit()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
     return jsonify(dict(row))
 
@@ -3179,10 +3225,11 @@ def api_update_monitor(monitor_id: int):
 def api_delete_monitor(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
-    conn.execute(
-        "delete from monitors where id = ? and workspace_id = ?",
-        (monitor_id, current_workspace_id()),
-    )
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+    conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -3193,10 +3240,7 @@ def api_delete_monitor(monitor_id: int):
 def api_check_monitor(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
-    row = conn.execute(
-        "select * from monitors where id = ? and workspace_id = ?",
-        (monitor_id, current_workspace_id()),
-    ).fetchone()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
     if not row:
         return jsonify({"error": "Monitor not found"}), 404
