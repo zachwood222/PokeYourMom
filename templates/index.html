@@ -1284,6 +1284,7 @@
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td>${task.id}</td>
+          <td><input type="checkbox" class="task-select" value="${task.id}" /></td>
           <td>${task.monitor_id || '-'}</td>
           <td>${task.retailer}</td>
           <td>${statePill(task.state)}</td>
@@ -1292,6 +1293,7 @@
           <td>${taskErrorLabel(task.last_error)}</td>
           <td class="actions">
             <button onclick="startTask(${task.id})">Start</button>
+            <button onclick="startTaskNow(${task.id})" title="Override waiting_for_queue when monitor misses queue.">Start Now</button>
             <button onclick="runTask(${task.id})">Run</button>
             <button onclick="pauseTask(${task.id})">Pause</button>
             <button onclick="stopTask(${task.id})">Stop</button>
@@ -1329,6 +1331,31 @@
 
     async function startTask(id) {
       await apiFetch(`/api/checkout/tasks/${id}/start`, {method: 'POST'});
+      await loadTasks();
+    }
+
+    async function startTaskNow(id) {
+      await apiFetch('/api/checkout/tasks/start-now', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({task_ids: [id]})
+      });
+      await loadTasks();
+    }
+
+    async function startSelectedTasksNow() {
+      const ids = Array.from(document.querySelectorAll('.task-select:checked'))
+        .map((el) => Number(el.value))
+        .filter((id) => Number.isInteger(id) && id > 0);
+      if (ids.length === 0) {
+        alert('Select at least one task to use Start Now override.');
+        return;
+      }
+      await apiFetch('/api/checkout/tasks/start-now', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({task_ids: ids})
+      });
       await loadTasks();
     }
 
