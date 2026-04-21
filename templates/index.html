@@ -1050,6 +1050,11 @@
       if (taskErrorEl) taskErrorEl.textContent = taskValidationError || '';
       if (taskValidationError) return;
       const monitorId = Number(monitorIdRaw);
+      const taskName = (document.getElementById('task_name')?.value || '').trim();
+      const mode = (document.getElementById('task_mode')?.value || 'default').trim();
+      const site = (document.getElementById('task_site')?.value || 'us').trim();
+      const monitoredRetailer = getSelectedTaskMonitorRetailer();
+
       if (!Number.isInteger(monitorId) || monitorId <= 0) {
         alert('Select a valid monitor before creating a task.');
         return;
@@ -1096,7 +1101,6 @@
             break;
           }
         }
-
         await loadTasks();
         updateTaskCreateSummary();
       } catch (error) {
@@ -1443,6 +1447,7 @@
       const rows = await apiFetch('/api/monitors').then(r => r.json());
       const taskMonitorSelect = document.getElementById('task_monitor_id');
       const tbody = document.getElementById('monitors');
+      taskMonitorsById = new Map(Array.isArray(rows) ? rows.map((m) => [Number(m.id), m]) : []);
       if (!Array.isArray(rows)) {
         if (taskMonitorSelect) {
           taskMonitorSelect.innerHTML = '<option disabled selected>Unable to load monitors (check API auth)</option>';
@@ -1460,6 +1465,7 @@
             .map((m) => `<option value="${m.id}">#${m.id} ${m.retailer} - ${m.product_url}</option>`)
             .join('');
         }
+        taskMonitorSelect.onchange = () => updateTaskModeFields();
       }
       tbody.innerHTML = '';
       for (const r of rows) {
@@ -1767,6 +1773,7 @@
     loadMeta();
     loadWebhooks();
     loadMonitors();
+    updateTaskModeFields();
     loadTasks();
     loadDashboardSummary();
     startClock();

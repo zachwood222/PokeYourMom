@@ -101,6 +101,21 @@ RETAILER_CATEGORY_SUPPORT = {
 POKEMON_CENTER_TASK_GROUP_SCHEMA_VERSION = 2
 POKEMON_CENTER_SITES = {"us", "ca", "uk"}
 POKEMON_CENTER_MODES = {"default", "create_account", "newsletter_subscribe"}
+POKEMON_CENTER_MODE_DESCRIPTIONS = {
+    "default": "Standard checkout flow with monitor, queue wait, shipping, and payment.",
+    "create_account": "Create a new account profile and subscribe it to newsletters.",
+    "newsletter_subscribe": "Subscribe an existing account to newsletters only.",
+}
+POKEMON_CENTER_MODE_SITE_SUPPORT = {
+    "default": {"us", "ca", "uk"},
+    "create_account": {"us"},
+    "newsletter_subscribe": {"us"},
+}
+POKEMON_CENTER_REQUIRED_FIELDS_BY_MODE = {
+    "default": set(),
+    "create_account": {"profile_email", "profile_first_name", "profile_last_name", "account_output_target"},
+    "newsletter_subscribe": {"existing_account_source"},
+}
 POKEMON_CENTER_DEFAULT_TASK_FIELDS = {
     "site": "us",
     "mode": "default",
@@ -112,6 +127,14 @@ POKEMON_CENTER_DEFAULT_TASK_FIELDS = {
     "wait_for_queue": False,
     "loop_checkout": False,
 }
+
+POKEMON_CENTER_CREATE_ACCOUNT_FIELDS = (
+    "profile_email",
+    "profile_first_name",
+    "profile_last_name",
+    "account_output_target",
+)
+POKEMON_CENTER_NEWSLETTER_FIELDS = ("existing_account_source",)
 DEFAULT_WORKSPACE = {
     "name": "My Workspace",
     "plan": DEFAULT_PLAN if DEFAULT_PLAN in PLAN_LIMITS else "basic",
@@ -703,6 +726,30 @@ def _is_pokemon_center_task_config(task_config: dict[str, Any], monitor_row: sql
     )
 
 
+def _pokemon_center_mode(config: dict[str, Any]) -> str:
+    mode = str(config.get("mode") or POKEMON_CENTER_DEFAULT_TASK_FIELDS["mode"]).strip().lower()
+    return mode if mode in POKEMON_CENTER_MODES else POKEMON_CENTER_DEFAULT_TASK_FIELDS["mode"]
+
+
+def validate_pokemon_center_mode_site(mode: str, site: str) -> str | None:
+    supported_sites = POKEMON_CENTER_MODE_SITE_SUPPORT.get(mode, POKEMON_CENTER_MODE_SITE_SUPPORT["default"])
+    if site not in supported_sites:
+        return f"Unsupported site '{site}' for mode '{mode}'"
+    return None
+
+
+def validate_pokemon_center_mode_requirements(config: dict[str, Any]) -> str | None:
+    mode = _pokemon_center_mode(config)
+    missing_fields = []
+    for field in sorted(POKEMON_CENTER_REQUIRED_FIELDS_BY_MODE.get(mode, set())):
+        value = config.get(field)
+        if value is None or str(value).strip() == "":
+            missing_fields.append(field)
+    if missing_fields:
+        return f"Missing required fields for mode '{mode}': {', '.join(missing_fields)}"
+    return None
+
+
 def normalize_task_config_for_monitor(
     task_config: dict[str, Any] | None,
     *,
@@ -740,6 +787,23 @@ def normalize_task_config_for_monitor(
 
     normalized["wait_for_queue"] = bool(normalized.get("wait_for_queue", POKEMON_CENTER_DEFAULT_TASK_FIELDS["wait_for_queue"]))
     normalized["loop_checkout"] = bool(normalized.get("loop_checkout", POKEMON_CENTER_DEFAULT_TASK_FIELDS["loop_checkout"]))
+
+    for field_name in (*POKEMON_CENTER_CREATE_ACCOUNT_FIELDS, *POKEMON_CENTER_NEWSLETTER_FIELDS):
+        value = normalized.get(field_name)
+        normalized[field_name] = str(value).strip() if value is not None else ""
+
+    mode = normalized["mode"]
+    if mode == "create_account":
+        normalized["existing_account_source"] = ""
+        normalized["profile"] = None
+        normalized["payment"] = None
+    elif mode == "newsletter_subscribe":
+        normalized["profile_email"] = ""
+        normalized["profile_first_name"] = ""
+        normalized["profile_last_name"] = ""
+        normalized["account_output_target"] = ""
+        normalized["profile"] = None
+        normalized["payment"] = None
 
     products = normalized.get("products")
     if isinstance(products, list):
@@ -3260,6 +3324,46 @@ def _validate_checkout_context_for_step(step: str, context: dict[str, Any], bind
     return None
 
 
+def _run_account_mode_pipeline(
+    conn: sqlite3.Connection,
+    *,
+    task: sqlite3.Row,
+    workspace_id: int,
+    mode: str,
+) -> sqlite3.Row:
+    mode_steps = ["monitoring", "submitting"] if mode == "newsletter_subscribe" else ["monitoring", "shipping", "submitting"]
+    for step in mode_steps:
+        transitioned = transition_checkout_task(
+            conn,
+            task_id=task["id"],
+            workspace_id=workspace_id,
+            requested_state=step,
+            reason=f"{mode}_step_start",
+        )
+        if transitioned:
+            record_task_log(
+                conn,
+                task_id=task["id"],
+                workspace_id=workspace_id,
+                monitor_id=task["monitor_id"],
+                level="info",
+                event_type=f"{mode}_{step}",
+                message=f"{mode} step '{step}' completed",
+                payload={"mode": mode},
+            )
+    transition_checkout_task(
+        conn,
+        task_id=task["id"],
+        workspace_id=workspace_id,
+        requested_state="success",
+        reason=f"{mode}_complete",
+    )
+    conn.commit()
+    done = get_checkout_task_for_workspace(conn, task["id"], workspace_id)
+    assert done is not None
+    return done
+
+
 def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqlite3.Row | None:
     conn = db()
     task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
@@ -3272,6 +3376,80 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
         config = json.loads(config_raw)
     except (TypeError, json.JSONDecodeError):
         config = {}
+    mode = _pokemon_center_mode(config) if str((monitor["retailer"] if monitor else "") or "").strip().lower() == "pokemoncenter" else "default"
+    if monitor and monitor["retailer"] == "pokemoncenter":
+        site_error = validate_pokemon_center_mode_site(mode, str(config.get("site") or "").strip().lower())
+        if site_error:
+            transition_checkout_task(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                requested_state="failed",
+                reason=f"{mode}:validation",
+                error_text=site_error,
+            )
+            conn.commit()
+            failed = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+            conn.close()
+            return failed
+        requirement_error = validate_pokemon_center_mode_requirements(config)
+        if requirement_error:
+            transition_checkout_task(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                requested_state="failed",
+                reason=f"{mode}:validation",
+                error_text=requirement_error,
+            )
+            conn.commit()
+            failed = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+            conn.close()
+            return failed
+    if mode in {"create_account", "newsletter_subscribe"}:
+        done = _run_account_mode_pipeline(conn, task=task, workspace_id=workspace_id, mode=mode)
+        conn.close()
+        return done
+
+    monitor = conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (task["monitor_id"], workspace_id),
+    ).fetchone()
+    mode = _pokemon_center_mode(config) if str((monitor["retailer"] if monitor else "") or "").strip().lower() == "pokemoncenter" else "default"
+    if monitor and monitor["retailer"] == "pokemoncenter":
+        site_error = validate_pokemon_center_mode_site(mode, str(config.get("site") or "").strip().lower())
+        if site_error:
+            transition_checkout_task(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                requested_state="failed",
+                reason=f"{mode}:validation",
+                error_text=site_error,
+            )
+            conn.commit()
+            failed = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+            conn.close()
+            return failed
+        requirement_error = validate_pokemon_center_mode_requirements(config)
+        if requirement_error:
+            transition_checkout_task(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                requested_state="failed",
+                reason=f"{mode}:validation",
+                error_text=requirement_error,
+            )
+            conn.commit()
+            failed = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+            conn.close()
+            return failed
+    if mode in {"create_account", "newsletter_subscribe"}:
+        done = _run_account_mode_pipeline(conn, task=task, workspace_id=workspace_id, mode=mode)
+        conn.close()
+        return done
+
     binding_context, binding_errors = _resolve_task_binding_context(
         conn,
         workspace_id=workspace_id,
@@ -3279,10 +3457,6 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
         config=config,
     )
     config.update(binding_context)
-    monitor = conn.execute(
-        "select * from monitors where id = ? and workspace_id = ?",
-        (task["monitor_id"], workspace_id),
-    ).fetchone()
 
     transition_checkout_task(
         conn,
@@ -3713,6 +3887,45 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
         config = json.loads(config_raw)
     except (TypeError, json.JSONDecodeError):
         config = {}
+    monitor = conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (task["monitor_id"], workspace_id),
+    ).fetchone()
+    mode = _pokemon_center_mode(config) if str((monitor["retailer"] if monitor else "") or "").strip().lower() == "pokemoncenter" else "default"
+    if monitor and monitor["retailer"] == "pokemoncenter":
+        site_error = validate_pokemon_center_mode_site(mode, str(config.get("site") or "").strip().lower())
+        if site_error:
+            transition_checkout_task(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                requested_state="failed",
+                reason=f"{mode}:validation",
+                error_text=site_error,
+            )
+            conn.commit()
+            failed = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+            conn.close()
+            return failed
+        requirement_error = validate_pokemon_center_mode_requirements(config)
+        if requirement_error:
+            transition_checkout_task(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                requested_state="failed",
+                reason=f"{mode}:validation",
+                error_text=requirement_error,
+            )
+            conn.commit()
+            failed = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+            conn.close()
+            return failed
+    if mode in {"create_account", "newsletter_subscribe"}:
+        done = _run_account_mode_pipeline(conn, task=task, workspace_id=workspace_id, mode=mode)
+        conn.close()
+        return done
+
     binding_context, binding_errors = _resolve_task_binding_context(
         conn,
         workspace_id=workspace_id,
@@ -3720,10 +3933,6 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
         config=config,
     )
     config.update(binding_context)
-    monitor = conn.execute(
-        "select * from monitors where id = ? and workspace_id = ?",
-        (task["monitor_id"], workspace_id),
-    ).fetchone()
 
     transition_checkout_task(
         conn,
@@ -3870,6 +4079,7 @@ def enqueue_checkout_for_monitor(
         conn,
         workspace_id=monitor["workspace_id"],
         monitor_id=monitor["id"],
+        mode="default",
     )
     if not binding_ok:
         log(
@@ -3964,8 +4174,10 @@ def _checkout_binding_for_monitor(
 
 
 def _require_checkout_binding(
-    conn: sqlite3.Connection, *, workspace_id: int, monitor_id: int
+    conn: sqlite3.Connection, *, workspace_id: int, monitor_id: int, mode: str
 ) -> tuple[bool, str | None]:
+    if mode in {"create_account", "newsletter_subscribe"}:
+        return True, None
     binding = _checkout_binding_for_monitor(conn, workspace_id=workspace_id, monitor_id=monitor_id)
     if not binding:
         return False, "Task binding is required before creating checkout tasks"
@@ -5828,18 +6040,33 @@ def api_create_checkout_task():
     if not monitor:
         conn.close()
         return jsonify({"error": "Monitor not found"}), 404
+    initial_state = body.get("initial_state", "queued")
+    raw_task_config = body.get("task_config") if isinstance(body.get("task_config"), dict) else None
+    normalized_task_config = normalize_task_config_for_monitor(raw_task_config, monitor_row=monitor)
+    if monitor["retailer"] != "pokemoncenter" and _pokemon_center_mode(normalized_task_config) != "default":
+        conn.close()
+        return jsonify({"error": "Selected mode is only supported for pokemoncenter monitors"}), 400
+    if monitor["retailer"] == "pokemoncenter":
+        mode = _pokemon_center_mode(normalized_task_config)
+        site = str(normalized_task_config.get("site") or "").strip().lower()
+        site_validation_error = validate_pokemon_center_mode_site(mode, site)
+        if site_validation_error:
+            conn.close()
+            return jsonify({"error": site_validation_error}), 400
+        field_validation_error = validate_pokemon_center_mode_requirements(normalized_task_config)
+        if field_validation_error:
+            conn.close()
+            return jsonify({"error": field_validation_error}), 400
+
     binding_ok, binding_error = _require_checkout_binding(
         conn,
         workspace_id=workspace_id,
         monitor_id=int(monitor_id),
+        mode=_pokemon_center_mode(normalized_task_config),
     )
     if not binding_ok:
         conn.close()
         return jsonify({"error": binding_error}), 400
-
-    initial_state = body.get("initial_state", "queued")
-    raw_task_config = body.get("task_config") if isinstance(body.get("task_config"), dict) else None
-    normalized_task_config = normalize_task_config_for_monitor(raw_task_config, monitor_row=monitor)
     try:
         task = create_checkout_task(
             conn,
