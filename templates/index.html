@@ -164,6 +164,150 @@
       font-size: 11px;
       margin-right: 6px;
     }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      border: 1px solid #2a3856;
+      background: #162036;
+      color: #c6d3eb;
+      text-transform: capitalize;
+      white-space: nowrap;
+    }
+    .status-badge::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+      opacity: 0.9;
+    }
+    .status-badge.info {
+      background: rgba(54, 94, 214, 0.2);
+      border-color: #2f4da1;
+      color: #8fb3ff;
+    }
+    .status-badge.success {
+      background: rgba(38, 117, 76, 0.24);
+      border-color: #226345;
+      color: #6ff2bc;
+    }
+    .status-badge.warning {
+      background: rgba(122, 92, 31, 0.25);
+      border-color: #77581f;
+      color: #f7c661;
+    }
+    .status-badge.danger {
+      background: rgba(128, 49, 49, 0.26);
+      border-color: #804242;
+      color: #ff8b8b;
+    }
+    .status-badge.neutral {
+      background: rgba(56, 72, 103, 0.26);
+      border-color: #354563;
+      color: #b7c4dc;
+    }
+    .metric-row {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .metric-tile {
+      background: #10192b;
+      border: 1px solid #27334d;
+      border-radius: 10px;
+      padding: 10px;
+      text-align: center;
+    }
+    .metric-tile .value {
+      display: block;
+      font-size: 24px;
+      font-weight: 700;
+      line-height: 1.1;
+      margin-bottom: 4px;
+    }
+    .metric-tile .label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+    .metric-tile.info .value { color: #80a7ff; }
+    .metric-tile.success .value { color: #6ff2bc; }
+    .metric-tile.warning .value { color: #f7c661; }
+    .inline-action-group {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .inline-action-group button {
+      width: auto;
+      min-width: 96px;
+      font-size: 12px;
+      padding-inline: 14px;
+    }
+    .btn-primary {
+      background: linear-gradient(180deg, #f7be39, #e0a319);
+      border-color: #d69a16;
+      color: #19150b;
+    }
+    .btn-danger {
+      background: linear-gradient(180deg, #72313a, #5f232b);
+      border-color: #8f3f49;
+      color: #ffd8dc;
+    }
+    .dense-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 8px;
+    }
+    .dense-form-row {
+      background: #0f1729;
+      border: 1px solid #263652;
+      border-radius: 10px;
+      padding: 10px;
+    }
+    .dense-form-row label {
+      margin-top: 0;
+      margin-bottom: 6px;
+    }
+    .dense-form-row .helper {
+      margin-top: 5px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .task-card {
+      margin-top: 14px;
+      padding: 0;
+      overflow: hidden;
+    }
+    .task-card-header,
+    .task-card-body {
+      padding: 12px 14px;
+    }
+    .task-card-header {
+      border-bottom: 1px solid #1f2a3d;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .task-card-title {
+      margin: 0;
+      font-size: 14px;
+    }
+    .task-card-tags {
+      margin-top: 6px;
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
 
     .warn { color: #f7b955; font-size: 13px; }
     .config-warn {
@@ -188,7 +332,9 @@
 
     @media (max-width: 740px) {
       .row, .grid, .kpi-grid { grid-template-columns: 1fr; }
+      .metric-row, .dense-grid { grid-template-columns: 1fr; }
       .top-nav { width: 100%; overflow-x: auto; padding-bottom: 4px; }
+      .inline-action-group { justify-content: flex-start; }
     }
   </style>
 </head>
@@ -297,18 +443,35 @@
       <section id="tab-monitors" class="tab">
         <h1>Task Controls</h1>
         <div class="card">
+          <h2 class="section-title">Task Overview</h2>
+          <div class="metric-row">
+            <div class="metric-tile"><span id="metric_total" class="value">0</span><span class="label">Total</span></div>
+            <div class="metric-tile info"><span id="metric_running" class="value">0</span><span class="label">Running</span></div>
+            <div class="metric-tile warning"><span id="metric_queued" class="value">0</span><span class="label">Queued</span></div>
+            <div class="metric-tile success"><span id="metric_success" class="value">0</span><span class="label">Success</span></div>
+          </div>
+          <div class="inline-action-group">
+            <button onclick="startAllTasks()">Start All</button>
+            <button class="btn-danger" onclick="stopAllTasks()">Stop All</button>
+            <button class="btn-primary" onclick="setTab('monitors')">Create Task</button>
+          </div>
+        </div>
+
+        <div class="card">
           <h2>Create Automation Task</h2>
-          <div class="row">
-            <div>
+          <div class="dense-grid">
+            <div class="dense-form-row">
               <label>Monitor</label>
               <select id="task_monitor_id"></select>
+              <div class="helper">Choose a monitor source for this automation task.</div>
             </div>
-            <div>
+            <div class="dense-form-row">
               <label>Task Name (Optional)</label>
               <input id="task_name" placeholder="Walmart checkout task" />
+              <div class="helper">Readable label shown in task cards and log entries.</div>
             </div>
           </div>
-          <button style="margin-top:10px;" onclick="createTask()">Create Task</button>
+          <button class="btn-primary" style="margin-top:10px;" onclick="createTask()">Create Task</button>
         </div>
 
         <div class="card" style="margin-top:14px;">
@@ -323,6 +486,25 @@
           <h2 class="section-title">Per-Task Log Panel</h2>
           <div class="small" id="task_log_title">Select a task to inspect attempts.</div>
           <div id="task_logs" class="logs task-log-panel"></div>
+        </div>
+
+        <div class="card task-card">
+          <div class="task-card-header">
+            <div>
+              <h3 class="task-card-title">Task Card Pattern</h3>
+              <div class="task-card-tags">
+                <span class="status-badge info">Queue Race</span>
+                <span class="status-badge success">Monitoring</span>
+              </div>
+            </div>
+            <div class="inline-action-group">
+              <button>Start</button>
+              <button class="btn-danger">Stop</button>
+            </div>
+          </div>
+          <div class="task-card-body">
+            <div class="small">Reusable shell for header + tags + mode + metrics + logs.</div>
+          </div>
         </div>
 
         <div class="card" style="margin-top:14px;">
@@ -732,17 +914,52 @@
       return value ? value : '-';
     }
 
+    function taskStateTone(state) {
+      const normalized = (state || '').toLowerCase();
+      if (['success', 'verification_code_received'].includes(normalized)) return 'success';
+      if (['failed'].includes(normalized)) return 'danger';
+      if (['queued', 'carting', 'shipping', 'payment', 'submitting'].includes(normalized)) return 'warning';
+      if (['monitoring', 'running'].includes(normalized)) return 'info';
+      return 'neutral';
+    }
+
+    function renderStatusBadge(state) {
+      const tone = taskStateTone(state);
+      const label = state || 'unknown';
+      return `<span class="status-badge ${tone}">${label.replaceAll('_', ' ')}</span>`;
+    }
+
+    function renderTaskMetrics(rows) {
+      const counts = {
+        total: rows.length,
+        running: 0,
+        queued: 0,
+        success: 0,
+      };
+      for (const task of rows) {
+        const state = (task.state || '').toLowerCase();
+        if (state === 'monitoring' || state === 'running') counts.running += 1;
+        if (state === 'queued') counts.queued += 1;
+        if (state === 'success') counts.success += 1;
+      }
+      document.getElementById('metric_total').textContent = counts.total;
+      document.getElementById('metric_running').textContent = counts.running;
+      document.getElementById('metric_queued').textContent = counts.queued;
+      document.getElementById('metric_success').textContent = counts.success;
+    }
+
     function renderTaskTable() {
       const tbody = document.getElementById('tasks');
       tbody.innerHTML = '';
       const rows = Array.from(taskMap.values()).sort((a, b) => b.id - a.id);
+      renderTaskMetrics(rows);
       for (const task of rows) {
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td>${task.id}</td>
           <td>${task.monitor_id || '-'}</td>
           <td>${task.retailer}</td>
-          <td>${task.state}</td>
+          <td>${renderStatusBadge(task.state)}</td>
           <td>${task.last_transition_at || '-'}</td>
           <td>${taskErrorLabel(task.last_error)}</td>
           <td class="actions">
@@ -755,6 +972,22 @@
         `;
         tbody.appendChild(tr);
       }
+    }
+
+    async function startAllTasks() {
+      const ids = Array.from(taskMap.keys());
+      for (const id of ids) {
+        await apiFetch(`/api/checkout/tasks/${id}/start`, {method: 'POST'});
+      }
+      await loadTasks();
+    }
+
+    async function stopAllTasks() {
+      const ids = Array.from(taskMap.keys());
+      for (const id of ids) {
+        await apiFetch(`/api/checkout/tasks/${id}/stop`, {method: 'POST'});
+      }
+      await loadTasks();
     }
 
     async function loadTasks() {
