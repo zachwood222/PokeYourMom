@@ -310,6 +310,47 @@
               <input id="task_name" placeholder="Walmart checkout task" />
             </div>
           </div>
+          <div class="row">
+            <div>
+              <label>Mode</label>
+              <select id="task_mode" onchange="updateTaskModeFields()">
+                <option value="default">default</option>
+                <option value="create_account">create_account</option>
+                <option value="newsletter_subscribe">newsletter_subscribe</option>
+              </select>
+              <p id="task_mode_description" class="small"></p>
+            </div>
+            <div>
+              <label>Site</label>
+              <select id="task_site">
+                <option value="us">us</option>
+                <option value="ca">ca</option>
+                <option value="uk">uk</option>
+              </select>
+            </div>
+          </div>
+          <div id="task_create_account_fields" class="row" style="display:none;">
+            <div>
+              <label>Profile Email</label>
+              <input id="task_profile_email" placeholder="name@example.com" />
+            </div>
+            <div>
+              <label>First Name</label>
+              <input id="task_profile_first_name" placeholder="Ash" />
+            </div>
+            <div>
+              <label>Last Name</label>
+              <input id="task_profile_last_name" placeholder="Ketchum" />
+            </div>
+            <div>
+              <label>Account Output Target</label>
+              <input id="task_account_output_target" placeholder="accounts/pokemoncenter-us.csv" />
+            </div>
+          </div>
+          <div id="task_newsletter_fields" style="display:none;">
+            <label>Existing Account Source</label>
+            <input id="task_existing_account_source" placeholder="accounts/pokemoncenter-us.csv" />
+          </div>
           <div id="create_task_error" class="inline-error"></div>
           <button style="margin-top:10px;" onclick="createTask()">Create Task</button>
         </div>
@@ -734,79 +775,94 @@
     }
 
     async function createTask() {
-      const monitorId = (document.getElementById('task_monitor_id')?.value || '').trim();
-      const taskName = (document.getElementById('task_name')?.value || '').trim();
-
-      if (!monitorId) {
-        alert('Select a monitor before creating a task.');
-      const taskInput = document.getElementById('task_url')?.value || '';
-      const taskValidationError = validateMonitorInputClient(taskInput, {isEditFlow: false, existingProductCount: 0});
       const taskErrorEl = document.getElementById('create_task_error');
-      if (taskErrorEl) taskErrorEl.textContent = taskValidationError || '';
-      if (taskValidationError) return;
-
-      const taskPayload = {
-        retailer: document.getElementById('task_retailer').value,
-        product_url: document.getElementById('task_url').value,
-        profile: document.getElementById('task_profile').value,
-        account: document.getElementById('task_account').value,
-        payment: document.getElementById('task_payment').value,
-      };
-
-      const monitorPayload = {
-        retailer: taskPayload.retailer,
-        product_url: taskPayload.product_url,
-        poll_interval_seconds: Number(document.getElementById('poll_interval').value),
-      };
-      const monitorRes = await apiFetch('/api/monitors', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(monitorPayload))
-      });
-      const monitor = await monitorRes.json();
-      if (monitor.error) {
-        alert(monitor.error);
-      const monitorField = document.getElementById('task_monitor_id');
-      const taskNameField = document.getElementById('task_name');
-      const monitorIdRaw = monitorField?.value || '';
+      if (taskErrorEl) taskErrorEl.textContent = '';
+      const monitorIdRaw = (document.getElementById('task_monitor_id')?.value || '').trim();
       const monitorId = Number(monitorIdRaw);
+      const taskName = (document.getElementById('task_name')?.value || '').trim();
+      const mode = (document.getElementById('task_mode')?.value || 'default').trim();
+      const site = (document.getElementById('task_site')?.value || 'us').trim();
+      const monitoredRetailer = getSelectedTaskMonitorRetailer();
+
       if (!Number.isInteger(monitorId) || monitorId <= 0) {
         alert('Select a valid monitor before creating a task.');
         return;
       }
 
-      const payload = {
-        monitor_id: monitorId,
-        initial_state: 'queued',
-      };
-
-      if (taskName) {
-        payload.task_name = taskName;
+      if (monitoredRetailer === 'pokemoncenter' && !validateModeSiteCompatibility(mode, site)) {
+        if (taskErrorEl) taskErrorEl.textContent = `Mode '${mode}' does not support site '${site}'.`;
+        return;
       }
 
+      const taskConfig = {
+        mode,
+        site,
+        profile_email: (document.getElementById('task_profile_email')?.value || '').trim(),
+        profile_first_name: (document.getElementById('task_profile_first_name')?.value || '').trim(),
+        profile_last_name: (document.getElementById('task_profile_last_name')?.value || '').trim(),
+        account_output_target: (document.getElementById('task_account_output_target')?.value || '').trim(),
+        existing_account_source: (document.getElementById('task_existing_account_source')?.value || '').trim(),
+      };
+      const requiredValidationError = validateModeRequiredFields(mode, taskConfig);
+      if (requiredValidationError) {
+        if (taskErrorEl) taskErrorEl.textContent = requiredValidationError;
+        return;
+      }
+
+      const payload = {monitor_id: monitorId, initial_state: 'queued', task_config: taskConfig};
+      if (taskName) payload.task_name = taskName;
+
       try {
-        const res = await apiFetch('/api/checkout/tasks', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(appendCaptchaToken(payload))
-        });
-
-        let data = null;
-        try {
-          data = await res.json();
-        } catch (error) {
-          alert(`Failed to parse task API response: ${error?.message || error}`);
-          return;
-        }
-
+        const res = await apiFetch('/api/checkout/tasks', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))});
+        const data = await res.json();
         if (!res.ok || data?.error) {
           alert(data?.error || `Failed to create task (HTTP ${res.status}).`);
           return;
         }
-
         await loadTasks();
         selectTask(data.id);
       } catch (error) {
         alert(`Failed to create task due to a network or fetch error: ${error?.message || error}`);
       }
+    }
+
+    const TASK_MODE_DESCRIPTIONS = {
+      default: 'Full checkout config (monitor + queue + checkout).',
+      create_account: 'Create account identity and subscribe to newsletter.',
+      newsletter_subscribe: 'Use an existing account source and subscribe only.',
+    };
+    const TASK_MODE_SITE_SUPPORT = {default: ['us', 'ca', 'uk'], create_account: ['us'], newsletter_subscribe: ['us']};
+    const TASK_MODE_REQUIRED_FIELDS = {
+      default: [],
+      create_account: ['profile_email', 'profile_first_name', 'profile_last_name', 'account_output_target'],
+      newsletter_subscribe: ['existing_account_source'],
+    };
+    let taskMonitorsById = new Map();
+
+    function getSelectedTaskMonitorRetailer() {
+      const monitorIdRaw = (document.getElementById('task_monitor_id')?.value || '').trim();
+      const monitor = taskMonitorsById.get(Number(monitorIdRaw));
+      return monitor?.retailer || '';
+    }
+
+    function validateModeSiteCompatibility(mode, site) {
+      return (TASK_MODE_SITE_SUPPORT[mode] || TASK_MODE_SITE_SUPPORT.default).includes(site);
+    }
+
+    function validateModeRequiredFields(mode, taskConfig) {
+      const required = TASK_MODE_REQUIRED_FIELDS[mode] || [];
+      const missing = required.filter((field) => !(taskConfig[field] || '').trim());
+      return missing.length ? `Missing required fields for mode '${mode}': ${missing.join(', ')}` : '';
+    }
+
+    function updateTaskModeFields() {
+      const mode = (document.getElementById('task_mode')?.value || 'default').trim();
+      const createAccount = document.getElementById('task_create_account_fields');
+      const newsletter = document.getElementById('task_newsletter_fields');
+      const desc = document.getElementById('task_mode_description');
+      if (desc) desc.textContent = TASK_MODE_DESCRIPTIONS[mode] || TASK_MODE_DESCRIPTIONS.default;
+      if (createAccount) createAccount.style.display = mode === 'create_account' ? '' : 'none';
+      if (newsletter) newsletter.style.display = mode === 'newsletter_subscribe' ? '' : 'none';
     }
 
     function validateMonitorInputClient(rawInput, options = {}) {
@@ -915,6 +971,7 @@
       const rows = await apiFetch('/api/monitors').then(r => r.json());
       const taskMonitorSelect = document.getElementById('task_monitor_id');
       const tbody = document.getElementById('monitors');
+      taskMonitorsById = new Map(Array.isArray(rows) ? rows.map((m) => [Number(m.id), m]) : []);
       if (!Array.isArray(rows)) {
         if (taskMonitorSelect) {
           taskMonitorSelect.innerHTML = '<option disabled selected>Unable to load monitors (check API auth)</option>';
@@ -932,6 +989,7 @@
             .map((m) => `<option value="${m.id}">#${m.id} ${m.retailer} - ${m.product_url}</option>`)
             .join('');
         }
+        taskMonitorSelect.onchange = () => updateTaskModeFields();
       }
       tbody.innerHTML = '';
       for (const r of rows) {
@@ -1107,6 +1165,7 @@
     loadMeta();
     loadWebhooks();
     loadMonitors();
+    updateTaskModeFields();
     loadTasks();
     loadDashboardSummary();
     startClock();
