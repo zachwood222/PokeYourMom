@@ -1,6 +1,7 @@
 # Task Creation Guide
 
-A **task** maps to a monitor row in the `monitors` table.
+Canonical task lifecycle is handled by `/api/checkout/tasks*`.
+A checkout task references a monitor (`monitor_id`) and stores task metadata in `checkout_tasks`.
 
 ## Required fields
 
@@ -38,3 +39,29 @@ curl -X POST http://localhost:5000/api/monitors \
     "msrp_cents": 499
   }'
 ```
+
+## Checkout task lifecycle (canonical API)
+
+After creating a monitor, use its `id` to create/manage checkout tasks:
+
+```bash
+curl -X POST http://localhost:5000/api/checkout/tasks \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer dev-token' \
+  -d '{
+    "monitor_id": 1,
+    "task_name": "Target task",
+    "task_config": {
+      "profile": "default",
+      "account": "acct-1",
+      "payment": "visa"
+    }
+  }'
+```
+
+Lifecycle endpoints:
+
+- `POST /api/checkout/tasks/<id>/start`
+- `POST /api/checkout/tasks/<id>/pause`
+- `POST /api/checkout/tasks/<id>/stop`
+- `GET /api/checkout/tasks/<id>/state`

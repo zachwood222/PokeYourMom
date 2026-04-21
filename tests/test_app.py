@@ -1326,6 +1326,35 @@ def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
     assert members_count == 1
 
 
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
 def test_api_routes_require_auth(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -1460,63 +1489,84 @@ def test_captcha_provider_errors_fail_safely(tmp_path, monkeypatch):
     assert resp.status_code == 403
     assert resp.get_json()["error"] == "CAPTCHA verification failed"
     assert resp.get_json()["reason"] == "provider_request_failed"
-def test_create_list_task_and_attempts_endpoint(tmp_path, monkeypatch):
+def test_create_checkout_task_and_read_state_endpoint(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
 
-    create_resp = client.post(
-        "/api/tasks",
+    create_monitor_resp = client.post(
+        "/api/monitors",
         json={
             "retailer": "walmart",
-            "url": "https://www.walmart.com/ip/sku",
-            "profile": "profile-main",
-            "account": "acc-primary",
-            "payment": "visa-4242",
+            "product_url": "https://www.walmart.com/ip/sku",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    assert create_monitor_resp.status_code == 201
+    monitor_id = create_monitor_resp.get_json()["id"]
+
+    create_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor_id,
+            "task_name": "Smoke task",
+            "task_config": {"profile": "profile-main", "account": "acc-primary", "payment": "visa-4242"},
         },
         headers=_auth_headers(),
     )
     assert create_resp.status_code == 201
     created = create_resp.get_json()
-    assert created["state"] == "idle"
     task_id = created["id"]
+    assert created["monitor_id"] == monitor_id
+    assert created["current_state"] == "queued"
 
-    list_resp = client.get("/api/tasks", headers=_auth_headers())
-    assert list_resp.status_code == 200
-    tasks = list_resp.get_json()
-    assert len(tasks) == 1
-    assert tasks[0]["id"] == task_id
-
-    attempts_resp = client.get(f"/api/tasks/{task_id}/attempts", headers=_auth_headers())
-    assert attempts_resp.status_code == 200
-    assert attempts_resp.get_json() == []
+    state_resp = client.get(f"/api/checkout/tasks/{task_id}/state", headers=_auth_headers())
+    assert state_resp.status_code == 200
+    state_payload = state_resp.get_json()
+    assert state_payload["task_id"] == task_id
+    assert state_payload["current_state"] == "queued"
+    assert state_payload["last_attempt"] is not None
 
 
-def test_start_and_stop_task(tmp_path, monkeypatch):
+def test_checkout_task_lifecycle_start_pause_stop(tmp_path, monkeypatch):
     monkeypatch.setenv("TASK_STEP_DELAY_SECONDS", "0.01")
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
 
-    create_resp = client.post(
-        "/api/tasks",
+    create_monitor_resp = client.post(
+        "/api/monitors",
         json={
             "retailer": "target",
-            "url": "https://www.target.com/p/abc",
-            "profile": "default",
-            "account": "acct-1",
-            "payment": "amex",
+            "product_url": "https://www.target.com/p/abc",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    assert create_monitor_resp.status_code == 201
+    monitor_id = create_monitor_resp.get_json()["id"]
+
+    create_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor_id,
+            "task_name": "Lifecycle task",
+            "task_config": {"profile": "default", "account": "acct-1", "payment": "amex"},
         },
         headers=_auth_headers(),
     )
     task_id = create_resp.get_json()["id"]
 
-    start_resp = client.post(f"/api/tasks/{task_id}/start", headers=_auth_headers())
+    start_resp = client.post(f"/api/checkout/tasks/{task_id}/start", headers=_auth_headers())
     assert start_resp.status_code == 200
-    started_task = start_resp.get_json()["task"]
-    assert started_task["state"] in {"queued", "running"}
+    assert start_resp.get_json()["task"]["current_state"] == "monitoring"
 
-    stop_resp = client.post(f"/api/tasks/{task_id}/stop", headers=_auth_headers())
+    pause_resp = client.post(f"/api/checkout/tasks/{task_id}/pause", headers=_auth_headers())
+    assert pause_resp.status_code == 200
+    assert pause_resp.get_json()["task"]["current_state"] == "paused"
+
+    stop_resp = client.post(f"/api/checkout/tasks/{task_id}/stop", headers=_auth_headers())
     assert stop_resp.status_code == 200
-    assert stop_resp.get_json()["task"]["state"] == "stopped"
+    assert stop_resp.get_json()["task"]["current_state"] == "stopped"
 
 
 def test_stripe_webhook_valid_signature_accepted(tmp_path, monkeypatch):

@@ -4465,26 +4465,16 @@ def api_stop_task(task_id: int):
     return jsonify({"ok": True, "task": payload})
 
 
-@app.get("/api/tasks/<int:task_id>/attempts")
+@app.get("/api/monitors/<int:monitor_id>")
 @require_auth
-def api_task_attempts(task_id: int):
-    workspace_id = current_workspace_id()
+def api_get_monitor(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
     conn = db()
-    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
-    if not task:
-        conn.close()
-        return jsonify({"error": "Task not found"}), 404
-    attempts = conn.execute(
-        """
-        select * from checkout_attempts
-        where workspace_id = ? and task_id = ?
-          and status != 'created'
-        order by id desc
-        """,
-        (workspace_id, task_id),
-    ).fetchall()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
-    return jsonify([dict(row) for row in attempts])
+    if not row:
+        return jsonify({"error": "Monitor not found"}), 404
+    return jsonify(dict(row))
 
 
 @app.get("/api/dashboard/summary")
