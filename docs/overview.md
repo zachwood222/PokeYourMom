@@ -37,10 +37,22 @@ Stock Sentinel is a Flask-based monitor and alert bot for retailer product avail
 ## Runtime flow
 
 1. Operator adds monitors and webhooks in the dashboard.
-2. Poll loop evaluates each enabled monitor on its interval.
-3. Eligibility logic applies stock markers + optional keyword/price/MSRP filters.
-4. Eligible checks are deduplicated and inserted into `events`.
-5. Event payloads are delivered to all enabled webhooks and logged in `deliveries`.
+2. Optional checkout tasks are created via `POST /api/checkout/tasks` using an existing monitor id.
+3. Task lifecycle uses canonical checkout endpoints (`/api/checkout/tasks/<id>/start|pause|stop|state`).
+4. Poll loop evaluates each enabled monitor on its interval.
+5. Eligibility logic applies stock markers + optional keyword/price/MSRP filters.
+6. Eligible checks are deduplicated and inserted into `events`.
+7. Event payloads are delivered to all enabled webhooks and logged in `deliveries`.
+
+## Canonical checkout task API
+
+- Create task: `POST /api/checkout/tasks`
+- Start task: `POST /api/checkout/tasks/<id>/start`
+- Pause task: `POST /api/checkout/tasks/<id>/pause`
+- Stop task: `POST /api/checkout/tasks/<id>/stop`
+- Inspect state: `GET /api/checkout/tasks/<id>/state`
+
+Legacy `/api/tasks*` compatibility endpoints have been removed; use `/api/checkout/tasks*` as the single source of truth for task lifecycle.
 
 ## Workspace usage limits API
 
