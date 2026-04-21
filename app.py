@@ -3232,6 +3232,39 @@ def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
     return str(webhook["webhook_url"] or "")
 
 
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
 def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None

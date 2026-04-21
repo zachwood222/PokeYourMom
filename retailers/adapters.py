@@ -304,6 +304,7 @@ class BestBuyAdapter(DefaultRetailerAdapter):
             '"buttonstate":"add to cart"',
             '"shipping":"available"',
             "ready for pickup today",
+            "available for pickup today",
         ]
         out_markers = [
             '"buttonstate":"sold out"',
@@ -311,6 +312,7 @@ class BestBuyAdapter(DefaultRetailerAdapter):
             '"shipping":"unavailable"',
             "sold out",
             "coming soon",
+            "sold out online",
         ]
         has_in = any(marker in text for marker in in_markers)
         has_out = any(marker in text for marker in out_markers)
