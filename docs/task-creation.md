@@ -1,9 +1,9 @@
-# Task Creation Guide
+# Checkout Task Creation Guide
 
 Canonical task lifecycle is handled by `/api/checkout/tasks*`.
 A checkout task references a monitor (`monitor_id`) and stores task metadata in `checkout_tasks`.
 
-## Required fields
+## Canonical API flow
 
 - `retailer`: one of `walmart`, `target`, `bestbuy`, `pokemoncenter`
   - aliases accepted for Pokemon Center: `pokemon-center`, `pokemon_center`, `pokemon center`
@@ -28,6 +28,7 @@ A checkout task references a monitor (`monitor_id`) and stores task metadata in 
 
 ```bash
 curl -X POST http://localhost:5000/api/monitors \
+  -H 'Authorization: Bearer dev-token' \
   -H 'Content-Type: application/json' \
   -d '{
     "retailer": "target",

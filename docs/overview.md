@@ -1,6 +1,6 @@
 # Stock Sentinel Documentation
 
-Stock Sentinel is a Flask-based monitor and alert bot for retailer product availability.
+Stock Sentinel is a Flask-based monitor, alert, and experimental checkout task bot for retailer product availability.
 
 ## UI Overview
 
@@ -91,7 +91,7 @@ Best practice: after a drop, filter to **Checkout Details** to identify where ti
 ## Architecture at a glance
 
 - **Web app/API:** Flask (`app.py`) provides dashboard routes and JSON endpoints.
-- **Storage:** SQLite tables for workspaces, monitors, events, webhooks, delivery results, and billing schema state.
+- **Storage:** SQLite tables for workspaces, monitors, checkout tasks (`checkout_tasks`, `checkout_attempts`, `task_logs`), events, webhooks, delivery results, and billing schema state.
 - **Background checks:** in-process monitor loop polls enabled monitors and emits events.
 - **Notifications:** Discord webhooks receive rich embeds when a monitor is eligible.
 

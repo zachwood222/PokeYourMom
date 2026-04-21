@@ -1,8 +1,8 @@
 # Stock Sentinel
 
-Stock Sentinel is a starter Flask app for **retailer stock monitoring + Discord webhook alerts**.
+Stock Sentinel is a Flask app for **retailer stock monitoring + Discord webhook alerts + an experimental checkout workflow**.
 
-> This project intentionally does **not** implement auto-checkout or anti-bot bypass behavior.
+> Checkout support is experimental and workflow-focused; this project does **not** implement anti-bot bypass behavior.
 
 ## Features
 

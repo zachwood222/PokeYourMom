@@ -129,6 +129,15 @@ CHECKOUT_TASK_STATES = {
     "stopped",
 }
 
+CHECKOUT_STEP_SEQUENCE = ["monitoring", "carting", "shipping", "payment", "submitting"]
+CHECKOUT_STEP_RETRY_POLICY = {
+    "monitoring": {"max_attempts": 3},
+    "carting": {"max_attempts": 3},
+    "shipping": {"max_attempts": 2},
+    "payment": {"max_attempts": 2},
+    "submitting": {"max_attempts": 2},
+}
+
 MAILBOX_SECRET_TYPES = {"mailbox_password", "mailbox_oauth_refresh_token", "mailbox_oauth_access_token"}
 OTP_ERROR_TIMEOUT = "OTP_TIMEOUT"
 OTP_ERROR_PROVIDER = "OTP_PROVIDER_ERROR"
@@ -2892,6 +2901,82 @@ CHECKOUT_STEP_HANDLERS = {
 }
 
 
+def _resolve_task_binding_context(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: int,
+    monitor_id: int,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    context = {
+        "profile": config.get("profile"),
+        "account": config.get("account"),
+        "payment": config.get("payment"),
+    }
+    errors: list[str] = []
+    binding = conn.execute(
+        """
+        select * from task_profile_bindings
+        where workspace_id = ? and monitor_id = ?
+        """,
+        (workspace_id, monitor_id),
+    ).fetchone()
+    if not binding:
+        return context, errors
+
+    if binding["checkout_profile_id"] is None:
+        errors.append("binding_profile_missing")
+    else:
+        profile = conn.execute(
+            "select * from checkout_profiles where id = ? and workspace_id = ?",
+            (binding["checkout_profile_id"], workspace_id),
+        ).fetchone()
+        if not profile:
+            errors.append("binding_profile_not_found")
+        else:
+            context["profile"] = profile["name"]
+
+    if binding["retailer_account_id"] is None:
+        errors.append("binding_account_missing")
+    else:
+        account = conn.execute(
+            "select * from retailer_accounts where id = ? and workspace_id = ?",
+            (binding["retailer_account_id"], workspace_id),
+        ).fetchone()
+        if not account:
+            errors.append("binding_account_not_found")
+        else:
+            context["account"] = account["email"] or account["username"] or f"account-{account['id']}"
+
+    if binding["payment_method_id"] is None:
+        errors.append("binding_payment_missing")
+    else:
+        payment = conn.execute(
+            "select * from payment_methods where id = ? and workspace_id = ?",
+            (binding["payment_method_id"], workspace_id),
+        ).fetchone()
+        if not payment:
+            errors.append("binding_payment_not_found")
+        else:
+            context["payment"] = payment["label"]
+
+    return context, errors
+
+
+def _validate_checkout_context_for_step(step: str, context: dict[str, Any], binding_errors: list[str]) -> str | None:
+    if step not in {"payment", "submitting"}:
+        return None
+    if binding_errors:
+        return binding_errors[0]
+    if not context.get("profile"):
+        return "missing_profile_binding_or_config"
+    if not context.get("account"):
+        return "missing_account_binding_or_config"
+    if not context.get("payment"):
+        return "missing_payment_binding_or_config"
+    return None
+
+
 def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqlite3.Row | None:
     conn = db()
     task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
@@ -2904,12 +2989,44 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
         config = json.loads(config_raw)
     except (TypeError, json.JSONDecodeError):
         config = {}
+    binding_context, binding_errors = _resolve_task_binding_context(
+        conn,
+        workspace_id=workspace_id,
+        monitor_id=task["monitor_id"],
+        config=config,
+    )
+    config.update(binding_context)
     monitor = conn.execute(
         "select * from monitors where id = ? and workspace_id = ?",
         (task["monitor_id"], workspace_id),
     ).fetchone()
 
     for step in CHECKOUT_STEP_SEQUENCE:
+        context_error = _validate_checkout_context_for_step(step, config, binding_errors)
+        if context_error:
+            transition_checkout_task(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                requested_state="failed",
+                reason=f"{step}:validation",
+                error_text=context_error,
+            )
+            record_task_log(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                monitor_id=task["monitor_id"],
+                level="error",
+                event_type="binding_validation_failed",
+                message=f"Checkout validation failed before {step}",
+                payload={"error_code": context_error},
+            )
+            conn.commit()
+            failed = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+            conn.close()
+            return failed
+
         transitioned = transition_checkout_task(
             conn,
             task_id=task_id,
@@ -3163,15 +3280,29 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return payload
 
 
-def redact_webhook_url(value: str) -> str:
-    if not value:
-        return ""
-    if len(value) <= 12:
-        return "***"
-    return f"{value[:8]}...{value[-4:]}"
 def serialize_task_ui(row: sqlite3.Row | None) -> dict[str, Any] | None:
     payload = serialize_checkout_task(row)
     if payload is None:
+        return None
+    config = payload.get("task_config") or {}
+    current_state = str(payload.get("current_state") or "queued")
+    state = "running" if current_state == "monitoring" else ("idle" if current_state == "queued" else current_state)
+    return {
+        "id": payload["id"],
+        "state": state,
+        "retries": 0,
+        "last_step": current_state,
+        "last_error": payload.get("last_error"),
+        "retailer": config.get("retailer"),
+        "product_url": config.get("product_url"),
+        "profile": config.get("profile"),
+        "account": config.get("account"),
+        "payment": config.get("payment"),
+    }
+
+
+def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
         return None
     config = payload.get("task_config") or {}
     current_state = str(payload.get("current_state") or "queued")
@@ -3985,6 +4116,7 @@ def worker_loop() -> None:
             conn.commit()
             conn.close()
         if not job:
+            time.sleep(WORKER_IDLE_SLEEP_SECONDS)
             idle_jitter = random.uniform(0.0, max(WORKER_IDLE_SLEEP_JITTER_SECONDS, 0.0))
             time.sleep(WORKER_IDLE_SLEEP_SECONDS + idle_jitter)
         else:
@@ -4725,36 +4857,7 @@ def api_update_monitor(monitor_id: int):
         return jsonify({"error": "enabled is required"}), 400
 
     conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.execute("update monitors set enabled = ? where id = ? and workspace_id = ?", (int(bool(enabled)), monitor_id, workspace_id))
-    updates: dict[str, Any] = {}
-    try:
-        if enabled is not None:
-            updates["enabled"] = int(bool(enabled))
-        if "proxy_url" in body:
-            updates["proxy_url"] = (body.get("proxy_url") or "").strip() or None
-        if "session_task_key" in body:
-            session_task_key = (body.get("session_task_key") or "").strip() or None
-            if session_task_key and len(session_task_key) > 80:
-                raise ValueError("session_task_key must be <= 80 chars")
-            updates["session_task_key"] = session_task_key
-        if "session_metadata" in body:
-            session_metadata = _validate_json_object(body.get("session_metadata"), field_name="session_metadata")
-            updates["session_metadata"] = json.dumps(session_metadata) if session_metadata is not None else None
-        if "behavior_metadata" in body:
-            behavior_metadata = _validate_behavior_policy(body.get("behavior_metadata"))
-            updates["behavior_metadata"] = json.dumps(behavior_metadata) if behavior_metadata is not None else None
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    if not updates:
-        return jsonify({"error": "No updatable fields provided"}), 400
-
-    conn = db()
-    set_clause = ", ".join(f"{column} = ?" for column in updates)
-    conn.execute(
-        f"update monitors set {set_clause} where id = ? and workspace_id = ?",
-        (*updates.values(), monitor_id, workspace_id),
-    )
     conn.commit()
     row = conn.execute(
         "select * from monitors where id = ? and workspace_id = ?",
@@ -4763,12 +4866,6 @@ def api_update_monitor(monitor_id: int):
     if not row:
         conn.close()
         return jsonify({"error": "Monitor not found"}), 404
-    conn.execute(
-        "update monitors set enabled = ? where id = ? and workspace_id = ?",
-        (int(bool(enabled)), monitor_id, workspace_id),
-    )
-    conn.commit()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
     return jsonify(dict(row))
 
@@ -4931,6 +5028,18 @@ def api_list_checkout_tasks():
     return jsonify([serialize_task_ui(row) for row in rows])
 
 
+@app.get("/api/checkout/tasks")
+@require_auth
+def api_list_checkout_tasks():
+    conn = db()
+    rows = conn.execute(
+        "select * from checkout_tasks where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_task_ui(row) for row in rows])
+
+
 @app.post("/api/checkout/tasks/<int:task_id>/start")
 @require_auth
 def api_start_checkout_task(task_id: int):
@@ -4950,6 +5059,15 @@ def api_start_checkout_task(task_id: int):
     payload = serialize_checkout_task_summary(row)
     socketio.emit("task_update", payload)
     return jsonify({"ok": True, "task": payload})
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/run")
+@require_auth
+def api_run_checkout_task(task_id: int):
+    row = execute_checkout_task_state_machine(task_id, current_workspace_id())
+    if not row:
+        return jsonify({"error": "Checkout task not found"}), 404
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
 
 
 @app.post("/api/checkout/tasks/<int:task_id>/run")
@@ -5012,6 +5130,39 @@ def api_stop_checkout_task(task_id: int):
     return jsonify({"ok": True, "task": payload})
 
 
+
+
+@app.get("/api/checkout/tasks/<int:task_id>/attempts")
+@require_auth
+def api_checkout_task_attempts(task_id: int):
+    conn = db()
+    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    attempts = conn.execute(
+        """
+        select id, task_id, state, status, error_text, created_at
+        from checkout_attempts
+        where task_id = ?
+        order by id desc
+        """,
+        (task_id,),
+    ).fetchall()
+    conn.close()
+    return jsonify(
+        [
+            {
+                "id": a["id"],
+                "task_id": a["task_id"],
+                "state": a["state"],
+                "step": a["status"],
+                "error": a["error_text"],
+                "created_at": a["created_at"],
+            }
+            for a in attempts
+        ]
+    )
 
 
 @app.get("/api/checkout/tasks/<int:task_id>/attempts")
@@ -6180,7 +6331,7 @@ if __name__ == "__main__":
     init_db()
     validate_startup_configuration()
     log(
-        "Legal/ethical note: this project provides stock monitoring + alerts only. Auto-checkout is intentionally not implemented.",
+        "Legal/ethical note: this project provides stock monitoring + alerts and an experimental checkout workflow.",
         level="warning",
     )
     listen_port = int(os.getenv("PORT", "5000"))
