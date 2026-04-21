@@ -2154,10 +2154,11 @@ def create_event_and_deliver(
             continue
         status, code, body = "queued", None, ""
         try:
+            target_url = resolve_webhook_url(conn, hook)
             req = perform_request(
                 task_key=f"webhook-{hook['id']}",
                 method="POST",
-                url=hook["webhook_url"],
+                url=target_url,
                 workspace_id=monitor["workspace_id"],
                 proxy_url=None,
                 timeout=8,
@@ -6105,10 +6106,11 @@ def api_test_webhook(webhook_id: int):
     started = time.perf_counter()
     conn = db()
     try:
+        target_url = resolve_webhook_url(conn, hook)
         req = perform_request(
             task_key=f"webhook-test-{webhook_id}",
             method="POST",
-            url=hook["webhook_url"],
+            url=target_url,
             workspace_id=workspace_id,
             proxy_url=None,
             timeout=8,
