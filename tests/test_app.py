@@ -41,6 +41,59 @@ def _stripe_signature(payload: str, secret: str, timestamp: int | None = None) -
     return f"t={ts},v1={digest}"
 
 
+def test_format_log_entry_has_structured_shape(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    entry = app_module.format_log_entry(
+        level="WARNING",
+        message="monitor check failed",
+        workspace_id=12,
+        monitor_id=34,
+        correlation_id="cid-123",
+    )
+
+    assert set(entry.keys()) == {
+        "timestamp",
+        "level",
+        "message",
+        "workspace_id",
+        "monitor_id",
+        "correlation_id",
+    }
+    assert entry["level"] == "warning"
+    assert entry["message"] == "monitor check failed"
+    assert entry["workspace_id"] == 12
+    assert entry["monitor_id"] == 34
+    assert entry["correlation_id"] == "cid-123"
+
+
+def test_log_outputs_json_and_emits_socket_event(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    printed = []
+    emitted = []
+
+    monkeypatch.setattr("builtins.print", lambda value: printed.append(value))
+    monkeypatch.setattr(app_module.socketio, "emit", lambda event, payload: emitted.append((event, payload)))
+
+    app_module.log(
+        "webhook target https://discord.com/api/webhooks/abc123",
+        level="WARNING",
+        workspace_id=2,
+        monitor_id=9,
+        correlation_id="corr-9",
+    )
+
+    assert len(printed) == 1
+    printed_entry = json.loads(printed[0])
+    assert printed_entry["level"] == "warning"
+    assert printed_entry["workspace_id"] == 2
+    assert printed_entry["monitor_id"] == 9
+    assert printed_entry["correlation_id"] == "corr-9"
+    assert "***redacted***" in printed_entry["message"]
+
+    assert emitted == [("log", printed_entry)]
+
+
 def test_protected_endpoint_requires_auth(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
