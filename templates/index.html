@@ -167,6 +167,20 @@
 
     .warn { color: #f7b955; font-size: 13px; }
     .inline-error { color: #ff8e8e; font-size: 12px; margin-top: 8px; }
+    .assist-candidate-list { margin-top: 10px; display: grid; gap: 8px; }
+    .assist-candidate-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      border: 1px solid #2a3856;
+      border-radius: 8px;
+      background: #111827;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+    .assist-candidate-item button { width: auto; }
     .config-warn {
       display: none;
       margin: 16px;
@@ -368,6 +382,18 @@
             {% endif %}
             <div id="monitor_input_error" class="inline-error"></div>
             <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
+
+            <div class="card" style="margin-top:14px;">
+              <h2 class="section-title">Manage Products • Paste Monitor Payload</h2>
+              <p class="small">Optional local-only parser for Discord/webhook snippets. No webhook API integration required.</p>
+              <label class="small">Paste webhook text</label>
+              <textarea id="monitor_payload_input" rows="4" style="width:100%;padding:9px 10px;border-radius:8px;border:1px solid #233049;background:var(--surface-soft);color:var(--text);" placeholder="SKU 1234567890 | PID 12-34567-890"></textarea>
+              <div class="actions" style="margin-top:10px;">
+                <button onclick="parseMonitorPayloadCandidates()">Parse PID Candidates</button>
+              </div>
+              <div id="monitor_payload_status" class="small"></div>
+              <div id="monitor_payload_candidates" class="assist-candidate-list"></div>
+            </div>
           </div>
 
           <div class="card">
@@ -833,6 +859,86 @@
         }
       }
       return null;
+    }
+
+    function normalizePidCandidate(raw) {
+      const digits = String(raw || '').replace(/\D/g, '');
+      if (digits.length !== 10) return null;
+      return `${digits.slice(0, 2)}-${digits.slice(2, 7)}-${digits.slice(7, 10)}`;
+    }
+
+    function extractPidCandidatesFromMonitorPayload(rawText) {
+      const text = String(rawText || '');
+      const candidates = new Set();
+      const pidRegex = /\b\d{2}-\d{5}-\d{3}\b/g;
+      const skuRegex = /\b\d{10}\b/g;
+      for (const match of text.match(pidRegex) || []) {
+        const normalized = normalizePidCandidate(match);
+        if (normalized) candidates.add(normalized);
+      }
+      for (const match of text.match(skuRegex) || []) {
+        const normalized = normalizePidCandidate(match);
+        if (normalized) candidates.add(normalized);
+      }
+      return Array.from(candidates);
+    }
+
+    function renderMonitorPayloadCandidates(candidates) {
+      const container = document.getElementById('monitor_payload_candidates');
+      const status = document.getElementById('monitor_payload_status');
+      container.innerHTML = '';
+      if (!candidates.length) {
+        status.textContent = 'No PID candidates found.';
+        return;
+      }
+      status.textContent = `Found ${candidates.length} candidate(s). Use "Apply to Group" for selected monitors.`;
+      for (const pid of candidates) {
+        const row = document.createElement('div');
+        row.className = 'assist-candidate-item';
+        row.innerHTML = `
+          <span>${pid}</span>
+          <button onclick="applyMonitorAssistPid('${pid}')">Apply to Group</button>
+        `;
+        container.appendChild(row);
+      }
+    }
+
+    function parseMonitorPayloadCandidates() {
+      const raw = document.getElementById('monitor_payload_input')?.value || '';
+      const candidates = extractPidCandidatesFromMonitorPayload(raw);
+      renderMonitorPayloadCandidates(candidates);
+      if (candidates.length) {
+        const productUrl = document.getElementById('product_url');
+        if (productUrl) {
+          productUrl.value = `https://www.pokemoncenter.com/product/${candidates[0]}`;
+        }
+      }
+    }
+
+    async function applyMonitorAssistPid(pid) {
+      const monitor_ids = selectedMonitorIds();
+      if (!monitor_ids.length) {
+        alert('Select at least one monitor in Monitor List before applying a PID.');
+        return;
+      }
+      const res = await apiFetch('/api/monitors/monitor-assist/apply', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({monitor_ids, pid}),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        alert(data.error || `Failed to apply PID (HTTP ${res.status})`);
+        return;
+      }
+      const productUrl = document.getElementById('product_url');
+      if (productUrl) {
+        productUrl.value = data.product_url || `https://www.pokemoncenter.com/product/${pid}`;
+      }
+      alert(`Applied ${pid} to ${data.updated_monitors || 0} monitor(s).`);
+      await loadMonitors();
+      await loadTasks();
+      if (selectedTaskId) await loadTaskAttempts(selectedTaskId);
     }
 
     function taskErrorLabel(value) {

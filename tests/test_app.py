@@ -4983,3 +4983,56 @@ def test_create_event_and_deliver_resolves_secret_backed_webhook_url(tmp_path, m
 
     assert captured["task_key"].startswith("webhook-")
     assert captured["url"] == resolved_url
+
+
+def test_monitor_assist_apply_updates_monitor_and_logs_task_history(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    monitor_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "pokemoncenter",
+            "product_url": "12-34567-111",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    monitor_id = monitor_resp.get_json()["id"]
+
+    create_task_resp = client.post(
+        "/api/checkout/tasks",
+        json={"monitor_id": monitor_id, "task_config": {"profile": "p1", "account": "a1", "payment": "pm1"}},
+        headers=_auth_headers(),
+    )
+    task_id = create_task_resp.get_json()["id"]
+
+    apply_resp = client.post(
+        "/api/monitors/monitor-assist/apply",
+        json={"monitor_ids": [monitor_id], "pid": "12-34567-890"},
+        headers=_auth_headers(),
+    )
+    assert apply_resp.status_code == 200
+    payload = apply_resp.get_json()
+    assert payload["updated_monitors"] == 1
+    assert payload["updated_tasks"] == 1
+    assert payload["product_url"] == "https://www.pokemoncenter.com/product/12-34567-890"
+
+    conn = sqlite3.connect(tmp_path / "test.db")
+    conn.row_factory = sqlite3.Row
+    monitor_row = conn.execute("select product_url from monitors where id = ?", (monitor_id,)).fetchone()
+    attempt_row = conn.execute(
+        """
+        select step, error_text
+        from checkout_attempts
+        where task_id = ?
+        order by id desc
+        limit 1
+        """,
+        (task_id,),
+    ).fetchone()
+    conn.close()
+
+    assert monitor_row["product_url"] == "https://www.pokemoncenter.com/product/12-34567-890"
+    assert attempt_row["step"] == "PID updated from monitor assist"
+    assert attempt_row["error_text"] == "PID updated from monitor assist"
