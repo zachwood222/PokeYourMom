@@ -98,7 +98,7 @@ RETAILER_CATEGORY_SUPPORT = {
     "walmart": {"pokemon"},
     "bestbuy": {"pokemon"},
 }
-POKEMON_CENTER_TASK_GROUP_SCHEMA_VERSION = 2
+POKEMON_CENTER_TASK_GROUP_SCHEMA_VERSION = 3
 POKEMON_CENTER_SITES = {"us", "ca", "uk"}
 POKEMON_CENTER_MODES = {"default", "create_account", "newsletter_subscribe"}
 POKEMON_CENTER_DEFAULT_TASK_FIELDS = {
@@ -111,6 +111,11 @@ POKEMON_CENTER_DEFAULT_TASK_FIELDS = {
     "discount_code": None,
     "wait_for_queue": False,
     "loop_checkout": False,
+    "group_limits": {
+        "max_retries": None,
+        "antibot_event_threshold": 3,
+        "antibot_cooldown_seconds": 60,
+    },
 }
 DEFAULT_WORKSPACE = {
     "name": "My Workspace",
@@ -152,6 +157,12 @@ CHECKOUT_STEP_RETRY_POLICY = {
     "shipping": {"max_attempts": 2},
     "payment": {"max_attempts": 2},
     "submitting": {"max_attempts": 2},
+}
+CHECKOUT_RETRY_PRESETS = {
+    "antibot": {"max_attempts": 4, "base_backoff_seconds": 1.5},
+    "network": {"max_attempts": 3, "base_backoff_seconds": 0.5},
+    "decline": {"max_attempts": 1, "base_backoff_seconds": 0.0},
+    "other": {"max_attempts": 2, "base_backoff_seconds": 0.25},
 }
 
 MAILBOX_SECRET_TYPES = {"mailbox_password", "mailbox_oauth_refresh_token", "mailbox_oauth_access_token"}
@@ -706,6 +717,20 @@ def normalize_task_config_for_monitor(
 
     normalized["wait_for_queue"] = bool(normalized.get("wait_for_queue", POKEMON_CENTER_DEFAULT_TASK_FIELDS["wait_for_queue"]))
     normalized["loop_checkout"] = bool(normalized.get("loop_checkout", POKEMON_CENTER_DEFAULT_TASK_FIELDS["loop_checkout"]))
+    raw_limits = normalized.get("group_limits") if isinstance(normalized.get("group_limits"), dict) else {}
+    default_limits = POKEMON_CENTER_DEFAULT_TASK_FIELDS["group_limits"]
+    max_retries = _coerce_optional_int(raw_limits.get("max_retries"))
+    antibot_threshold = _coerce_optional_int(raw_limits.get("antibot_event_threshold"))
+    antibot_cooldown_seconds = _coerce_optional_int(raw_limits.get("antibot_cooldown_seconds"))
+    normalized["group_limits"] = {
+        "max_retries": max_retries,
+        "antibot_event_threshold": antibot_threshold if antibot_threshold and antibot_threshold > 0 else default_limits["antibot_event_threshold"],
+        "antibot_cooldown_seconds": (
+            antibot_cooldown_seconds
+            if antibot_cooldown_seconds is not None
+            else default_limits["antibot_cooldown_seconds"]
+        ),
+    }
 
     products = normalized.get("products")
     if isinstance(products, list):
@@ -732,7 +757,7 @@ def run_pokemon_center_task_group_config_migration(conn: sqlite3.Connection) -> 
         )
         """
     )
-    migration_key = "2026_04_21_checkout_task_group_pokemoncenter_defaults_v2"
+    migration_key = "2026_04_21_checkout_task_group_pokemoncenter_defaults_v3"
     already_applied = conn.execute(
         "select 1 from schema_migrations where key = ?",
         (migration_key,),
@@ -2782,14 +2807,14 @@ def transition_checkout_task(
         state=normalized_state,
         status="transition",
         details={"reason": reason},
-        error_text=transition_error,
+        error_text=error_text,
     )
     record_task_log(
         conn,
         task_id=task_id,
         workspace_id=workspace_id,
         monitor_id=row["monitor_id"],
-        level="info" if not transition_error else "error",
+        level="info" if not error_text else "error",
         event_type="state_transition",
         message=f"Task transitioned to {normalized_state}",
         payload={"reason": reason},
@@ -2915,6 +2940,10 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return payload
 
 
+def serialize_checkout_task_summary(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    return serialize_checkout_task(row)
+
+
 def redact_webhook_url(value: str) -> str:
     if not value:
         return ""
@@ -2939,6 +2968,53 @@ def _classify_checkout_step_failure(step: str, exc: Exception, attempt_number: i
     if isinstance(exc, (CheckoutRetryableError, requests.RequestException, TimeoutError, ConnectionError, sqlite3.OperationalError)):
         return True, "retryable_exception"
     return False, "terminal_unclassified"
+
+
+def _derive_status_signal(exc: Exception) -> str:
+    message = str(exc).strip().lower()
+    if "datadome" in message:
+        return "antibot_datadome_challenge"
+    if "incapsula" in message:
+        return "antibot_incapsula_challenge"
+    if "queue_reentry" in message or "session_ip_change" in message:
+        return "queue_reentry_session_or_ip_change"
+    if "decline" in message or "payment_declined" in message:
+        return "decline"
+    return "generic_failure"
+
+
+def _failure_class_from_signal(signal: str, retryable: bool) -> str:
+    if signal.startswith("antibot_") or signal == "queue_reentry_session_or_ip_change":
+        return "antibot"
+    if signal == "decline":
+        return "decline"
+    if retryable:
+        return "network"
+    return "other"
+
+
+def _status_hint_for_signal(signal: str) -> str | None:
+    if signal.startswith("antibot_"):
+        return "likely proxy reputation issue"
+    if signal == "queue_reentry_session_or_ip_change":
+        return "session expired, task requeued"
+    return None
+
+
+def _compute_retry_preset(
+    *,
+    step: str,
+    failure_class: str,
+    task_config: dict[str, Any],
+) -> dict[str, float | int]:
+    step_policy = CHECKOUT_STEP_RETRY_POLICY[step]
+    preset = dict(CHECKOUT_RETRY_PRESETS.get(failure_class, CHECKOUT_RETRY_PRESETS["other"]))
+    max_attempts = min(int(step_policy["max_attempts"]), int(preset["max_attempts"]))
+    group_limits = task_config.get("group_limits") if isinstance(task_config.get("group_limits"), dict) else {}
+    group_max = _coerce_optional_int(group_limits.get("max_retries"))
+    if group_max is not None and group_max > 0:
+        max_attempts = min(max_attempts, group_max)
+    return {"max_attempts": max(1, max_attempts), "base_backoff_seconds": float(preset["base_backoff_seconds"])}
 
 
 def _checkout_step_monitoring(
@@ -2985,9 +3061,10 @@ def _checkout_step_payment(
     fail_step = str(config.get("simulate_fail_step") or "")
     fail_times = int(config.get("simulate_fail_times") or 0)
     if fail_step == "payment" and attempt_number <= fail_times:
+        fail_error = str(config.get("simulate_fail_error") or "simulated_payment_failure")
         if bool(config.get("simulate_retryable", True)):
-            raise CheckoutRetryableError("simulated_payment_failure")
-        raise ValueError("simulated_payment_terminal_failure")
+            raise CheckoutRetryableError(fail_error)
+        raise ValueError(fail_error or "simulated_payment_terminal_failure")
 
 
 def _checkout_step_submitting(
@@ -3109,6 +3186,16 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
         (task["monitor_id"], workspace_id),
     ).fetchone()
 
+    antibot_events = 0
+    group_limits = config.get("group_limits") if isinstance(config.get("group_limits"), dict) else {}
+    antibot_threshold = _coerce_optional_int(group_limits.get("antibot_event_threshold")) or 3
+    antibot_cooldown_seconds = _coerce_optional_int(group_limits.get("antibot_cooldown_seconds")) or 0
+
+    antibot_events = 0
+    group_limits = config.get("group_limits") if isinstance(config.get("group_limits"), dict) else {}
+    antibot_threshold = _coerce_optional_int(group_limits.get("antibot_event_threshold")) or 3
+    antibot_cooldown_seconds = _coerce_optional_int(group_limits.get("antibot_cooldown_seconds")) or 0
+
     for step in CHECKOUT_STEP_SEQUENCE:
         context_error = _validate_checkout_context_for_step(step, config, binding_errors)
         if context_error:
@@ -3145,8 +3232,8 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
         if not transitioned:
             conn.close()
             return None
-        policy = CHECKOUT_STEP_RETRY_POLICY[step]
-        for attempt_number in range(1, policy["max_attempts"] + 1):
+        step_policy = CHECKOUT_STEP_RETRY_POLICY[step]
+        for attempt_number in range(1, step_policy["max_attempts"] + 1):
             try:
                 CHECKOUT_STEP_HANDLERS[step](conn, transitioned, monitor, config, attempt_number)
                 record_checkout_attempt(
@@ -3171,6 +3258,14 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
                 break
             except Exception as exc:  # noqa: BLE001
                 retryable, taxonomy = _classify_checkout_step_failure(step, exc, attempt_number)
+                status_signal = _derive_status_signal(exc)
+                failure_class = _failure_class_from_signal(status_signal, retryable)
+                retry_preset = _compute_retry_preset(step=step, failure_class=failure_class, task_config=config)
+                hint = _status_hint_for_signal(status_signal)
+                should_retry = retryable and attempt_number < int(retry_preset["max_attempts"])
+                backoff_seconds = float(retry_preset["base_backoff_seconds"]) * (2 ** max(attempt_number - 1, 0)) if should_retry else 0.0
+                if failure_class == "antibot":
+                    antibot_events += 1
                 record_checkout_attempt(
                     conn,
                     task_id=task_id,
@@ -3178,7 +3273,23 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
                     monitor_id=task["monitor_id"],
                     state=step,
                     status="step_failure",
-                    details={"attempt_number": attempt_number, "taxonomy": taxonomy, "retryable": retryable},
+                    details={
+                        "attempt_number": attempt_number,
+                        "taxonomy": taxonomy,
+                        "retryable": should_retry,
+                        "status_signal": status_signal,
+                        "failure_class": failure_class,
+                        "status_hint": hint,
+                        "retry_preset": retry_preset,
+                        "scheduled_backoff_seconds": round(backoff_seconds, 2),
+                        "failure_reason": {
+                            "step": step,
+                            "taxonomy": taxonomy,
+                            "status_signal": status_signal,
+                            "failure_class": failure_class,
+                            "exception_type": type(exc).__name__,
+                        },
+                    },
                     error_text=f"{taxonomy}:{exc}",
                 )
                 record_task_log(
@@ -3186,12 +3297,32 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
                     task_id=task_id,
                     workspace_id=workspace_id,
                     monitor_id=task["monitor_id"],
-                    level="warning" if retryable else "error",
+                    level="warning" if should_retry else "error",
                     event_type="step_failure",
-                    message=f"{step} failed ({taxonomy})",
-                    payload={"attempt_number": attempt_number, "retryable": retryable},
+                    message=f"{step} failed ({status_signal})",
+                    payload={
+                        "attempt_number": attempt_number,
+                        "retryable": should_retry,
+                        "failure_class": failure_class,
+                        "status_hint": hint,
+                    },
                 )
-                if retryable:
+                if failure_class == "antibot" and antibot_events >= antibot_threshold and antibot_cooldown_seconds > 0:
+                    transition_checkout_task(
+                        conn,
+                        task_id=task_id,
+                        workspace_id=workspace_id,
+                        requested_state="failed",
+                        reason=f"{step}:antibot_cooldown",
+                        error_text=f"antibot cooldown active for {antibot_cooldown_seconds}s",
+                    )
+                    conn.commit()
+                    failed = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+                    conn.close()
+                    return failed
+                if should_retry:
+                    if backoff_seconds > 0:
+                        time.sleep(min(backoff_seconds, 0.05))
                     continue
                 transition_checkout_task(
                     conn,
@@ -3403,9 +3534,10 @@ def _checkout_step_payment(
     fail_step = str(config.get("simulate_fail_step") or "")
     fail_times = int(config.get("simulate_fail_times") or 0)
     if fail_step == "payment" and attempt_number <= fail_times:
+        fail_error = str(config.get("simulate_fail_error") or "simulated_payment_failure")
         if bool(config.get("simulate_retryable", True)):
-            raise CheckoutRetryableError("simulated_payment_failure")
-        raise ValueError("simulated_payment_terminal_failure")
+            raise CheckoutRetryableError(fail_error)
+        raise ValueError(fail_error or "simulated_payment_terminal_failure")
 
 
 def _checkout_step_submitting(
@@ -3527,6 +3659,11 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
         (task["monitor_id"], workspace_id),
     ).fetchone()
 
+    antibot_events = 0
+    group_limits = config.get("group_limits") if isinstance(config.get("group_limits"), dict) else {}
+    antibot_threshold = _coerce_optional_int(group_limits.get("antibot_event_threshold")) or 3
+    antibot_cooldown_seconds = _coerce_optional_int(group_limits.get("antibot_cooldown_seconds")) or 0
+
     for step in CHECKOUT_STEP_SEQUENCE:
         context_error = _validate_checkout_context_for_step(step, config, binding_errors)
         if context_error:
@@ -3563,8 +3700,8 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
         if not transitioned:
             conn.close()
             return None
-        policy = CHECKOUT_STEP_RETRY_POLICY[step]
-        for attempt_number in range(1, policy["max_attempts"] + 1):
+        step_policy = CHECKOUT_STEP_RETRY_POLICY[step]
+        for attempt_number in range(1, step_policy["max_attempts"] + 1):
             try:
                 CHECKOUT_STEP_HANDLERS[step](conn, transitioned, monitor, config, attempt_number)
                 record_checkout_attempt(
@@ -3589,6 +3726,14 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
                 break
             except Exception as exc:  # noqa: BLE001
                 retryable, taxonomy = _classify_checkout_step_failure(step, exc, attempt_number)
+                status_signal = _derive_status_signal(exc)
+                failure_class = _failure_class_from_signal(status_signal, retryable)
+                retry_preset = _compute_retry_preset(step=step, failure_class=failure_class, task_config=config)
+                hint = _status_hint_for_signal(status_signal)
+                should_retry = retryable and attempt_number < int(retry_preset["max_attempts"])
+                backoff_seconds = float(retry_preset["base_backoff_seconds"]) * (2 ** max(attempt_number - 1, 0)) if should_retry else 0.0
+                if failure_class == "antibot":
+                    antibot_events += 1
                 record_checkout_attempt(
                     conn,
                     task_id=task_id,
@@ -3596,7 +3741,23 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
                     monitor_id=task["monitor_id"],
                     state=step,
                     status="step_failure",
-                    details={"attempt_number": attempt_number, "taxonomy": taxonomy, "retryable": retryable},
+                    details={
+                        "attempt_number": attempt_number,
+                        "taxonomy": taxonomy,
+                        "retryable": should_retry,
+                        "status_signal": status_signal,
+                        "failure_class": failure_class,
+                        "status_hint": hint,
+                        "retry_preset": retry_preset,
+                        "scheduled_backoff_seconds": round(backoff_seconds, 2),
+                        "failure_reason": {
+                            "step": step,
+                            "taxonomy": taxonomy,
+                            "status_signal": status_signal,
+                            "failure_class": failure_class,
+                            "exception_type": type(exc).__name__,
+                        },
+                    },
                     error_text=f"{taxonomy}:{exc}",
                 )
                 record_task_log(
@@ -3604,12 +3765,32 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
                     task_id=task_id,
                     workspace_id=workspace_id,
                     monitor_id=task["monitor_id"],
-                    level="warning" if retryable else "error",
+                    level="warning" if should_retry else "error",
                     event_type="step_failure",
-                    message=f"{step} failed ({taxonomy})",
-                    payload={"attempt_number": attempt_number, "retryable": retryable},
+                    message=f"{step} failed ({status_signal})",
+                    payload={
+                        "attempt_number": attempt_number,
+                        "retryable": should_retry,
+                        "failure_class": failure_class,
+                        "status_hint": hint,
+                    },
                 )
-                if retryable:
+                if failure_class == "antibot" and antibot_events >= antibot_threshold and antibot_cooldown_seconds > 0:
+                    transition_checkout_task(
+                        conn,
+                        task_id=task_id,
+                        workspace_id=workspace_id,
+                        requested_state="failed",
+                        reason=f"{step}:antibot_cooldown",
+                        error_text=f"antibot cooldown active for {antibot_cooldown_seconds}s",
+                    )
+                    conn.commit()
+                    failed = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+                    conn.close()
+                    return failed
+                if should_retry:
+                    if backoff_seconds > 0:
+                        time.sleep(min(backoff_seconds, 0.05))
                     continue
                 transition_checkout_task(
                     conn,
@@ -5560,7 +5741,7 @@ def api_checkout_task_attempts(task_id: int):
         return jsonify({"error": "Checkout task not found"}), 404
     attempts = conn.execute(
         """
-        select *
+        select id, task_id, state, status, details, error_text, created_at
         from checkout_attempts
         where task_id = ? and workspace_id = ?
         order by id desc
@@ -5568,7 +5749,20 @@ def api_checkout_task_attempts(task_id: int):
         (task_id, current_workspace_id()),
     ).fetchall()
     conn.close()
-    return jsonify([dict(row) for row in attempts])
+    return jsonify(
+        [
+            {
+                "id": row["id"],
+                "task_id": row["task_id"],
+                "state": row["state"],
+                "step": row["status"],
+                "details": parse_json_object(row["details"]),
+                "error": row["error_text"],
+                "created_at": row["created_at"],
+            }
+            for row in attempts
+        ]
+    )
 
 
 
@@ -5723,7 +5917,7 @@ def api_checkout_task_attempts_dup1(task_id: int):
         return jsonify({"error": "Checkout task not found"}), 404
     attempts = conn.execute(
         """
-        select id, task_id, state, status, error_text, created_at
+        select id, task_id, state, status, details, error_text, created_at
         from checkout_attempts
         where task_id = ?
         order by id desc
@@ -5738,6 +5932,7 @@ def api_checkout_task_attempts_dup1(task_id: int):
                 "task_id": a["task_id"],
                 "state": a["state"],
                 "step": a["status"],
+                "details": parse_json_object(a["details"]),
                 "error": a["error_text"],
                 "created_at": a["created_at"],
             }
@@ -5756,7 +5951,7 @@ def api_checkout_task_attempts_dup2(task_id: int):
         return jsonify({"error": "Checkout task not found"}), 404
     attempts = conn.execute(
         """
-        select id, task_id, state, status, error_text, created_at
+        select id, task_id, state, status, details, error_text, created_at
         from checkout_attempts
         where task_id = ?
         order by id desc
@@ -5771,6 +5966,7 @@ def api_checkout_task_attempts_dup2(task_id: int):
                 "task_id": a["task_id"],
                 "state": a["state"],
                 "step": a["status"],
+                "details": parse_json_object(a["details"]),
                 "error": a["error_text"],
                 "created_at": a["created_at"],
             }
@@ -6020,7 +6216,7 @@ def api_checkout_task_attempts_dup4(task_id: int):
     if include_created:
         attempts = conn.execute(
             """
-            select id, task_id, state, status, error_text, created_at
+            select id, task_id, state, status, details, error_text, created_at
             from checkout_attempts
             where task_id = ?
             order by id desc
@@ -6030,7 +6226,7 @@ def api_checkout_task_attempts_dup4(task_id: int):
     else:
         attempts = conn.execute(
             """
-            select id, task_id, state, status, error_text, created_at
+            select id, task_id, state, status, details, error_text, created_at
             from checkout_attempts
             where task_id = ?
               and status != 'created'
@@ -6046,6 +6242,7 @@ def api_checkout_task_attempts_dup4(task_id: int):
                 "task_id": a["task_id"],
                 "state": a["state"],
                 "step": a["status"],
+                "details": parse_json_object(a["details"]),
                 "error": a["error_text"],
                 "created_at": a["created_at"],
             }
