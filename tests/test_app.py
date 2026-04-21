@@ -1268,6 +1268,35 @@ def test_fetch_monitor_uses_workspace_proxy_and_default_session_task_key(tmp_pat
     assert captured["backoff_factor"] == 0.35
 
 
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
 def test_api_routes_require_auth(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
