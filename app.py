@@ -56,6 +56,7 @@ DEFAULT_PLAN = os.getenv("DEFAULT_PLAN", "basic")
 POKEMON_MSRP_BUFFER_CENTS = int(os.getenv("POKEMON_MSRP_BUFFER_CENTS", "1000"))
 APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
 RELEASE_CHANNEL = os.getenv("RELEASE_CHANNEL", "stable")
+CORRELATION_ID_HEADER = "X-Correlation-ID"
 _api_auth_token_raw = os.getenv("API_AUTH_TOKEN")
 API_AUTH_TOKEN = _api_auth_token_raw.strip() if _api_auth_token_raw is not None else "dev-token"
 SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY", "local-dev-secret-key")
@@ -1721,7 +1722,7 @@ def _captcha_token_from_request() -> str:
 
 @app.before_request
 def require_api_auth() -> tuple[dict[str, str], int] | None:
-    incoming_correlation_id = (request.headers.get("X-Correlation-ID") or "").strip()
+    incoming_correlation_id = (request.headers.get(CORRELATION_ID_HEADER) or "").strip()
     g.correlation_id = incoming_correlation_id or str(uuid4())
     if request.path == "/api/billing/stripe/webhook":
         return None
@@ -1764,7 +1765,7 @@ def require_api_auth() -> tuple[dict[str, str], int] | None:
 def add_correlation_id_header(response):
     correlation_id = getattr(g, "correlation_id", None)
     if correlation_id:
-        response.headers["X-Correlation-ID"] = correlation_id
+        response.headers[CORRELATION_ID_HEADER] = correlation_id
     if request.path.startswith("/api/") and response.is_json:
         try:
             payload = response.get_json(silent=True)
@@ -4772,6 +4773,12 @@ def api_update_monitor(monitor_id: int):
     if not row:
         conn.close()
         return jsonify({"error": "Monitor not found"}), 404
+    conn.execute(
+        "update monitors set enabled = ? where id = ? and workspace_id = ?",
+        (int(bool(enabled)), monitor_id, workspace_id),
+    )
+    conn.commit()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
     return jsonify(dict(row))
 
