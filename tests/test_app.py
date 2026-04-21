@@ -3001,6 +3001,35 @@ def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
     assert members_count == 1
 
 
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
 def test_api_routes_require_auth(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -3902,6 +3931,19 @@ def test_walmart_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch
     assert out_stock.price_cents == 2488
     assert out_stock.availability_reason == "walmart_marker_out_of_stock"
     assert out_stock.parser_confidence == 0.98
+
+
+def test_walmart_parser_uses_default_fallback_for_unknown_markup_fixture(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    unknown_html = load_fixture_html("walmart", "unknown_markup")
+
+    walmart_result = app_module.evaluate_page(unknown_html, retailer="walmart")
+    default_result = app_module.default_parser(unknown_html)
+
+    assert walmart_result.in_stock == default_result.in_stock
+    assert walmart_result.status_text == default_result.status_text
+    assert walmart_result.availability_reason == default_result.availability_reason
+    assert walmart_result.parser_confidence == default_result.parser_confidence
 
 
 def test_target_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch):
