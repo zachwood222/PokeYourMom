@@ -164,6 +164,22 @@
       font-size: 11px;
       margin-right: 6px;
     }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid #2a3856;
+      background: #1a2438;
+      font-size: 11px;
+      line-height: 1.6;
+    }
+    .status-badge--queue { border-color: #4f689b; color: #b9ccff; }
+    .status-badge--captcha { border-color: #7d5ad1; color: #ceb8ff; }
+    .status-badge--antibot { border-color: #d68a3c; color: #ffd9aa; }
+    .status-badge--success { border-color: #2f8f67; color: #89f6c8; }
+    .status-badge--decline { border-color: #b14d58; color: #ffc4cb; }
 
     .warn { color: #f7b955; font-size: 13px; }
     .inline-error { color: #ff8e8e; font-size: 12px; margin-top: 8px; }
@@ -317,7 +333,7 @@
         <div class="card" style="margin-top:14px;">
           <h2 class="section-title">Live Task Table</h2>
           <table>
-            <thead><tr><th>ID</th><th>Monitor</th><th>Retailer</th><th>State</th><th>Last Transition</th><th>Last Error</th><th>Actions</th></tr></thead>
+            <thead><tr><th>ID</th><th>Monitor</th><th>Retailer</th><th>Status</th><th>Last Transition</th><th>Last Error</th><th>Actions</th></tr></thead>
             <tbody id="tasks"></tbody>
           </table>
         </div>
@@ -839,6 +855,23 @@
       return value ? value : '-';
     }
 
+    function statusBadgeMeta(state) {
+      const normalized = String(state || 'idle');
+      if (['waiting_for_queue', 'in_queue', 'requeued'].includes(normalized)) return {cls: 'status-badge--queue', icon: '⏳'};
+      if (normalized === 'solving_hcaptcha') return {cls: 'status-badge--captcha', icon: '🧩'};
+      if (['antibot_datadome', 'antibot_incapsula'].includes(normalized)) return {cls: 'status-badge--antibot', icon: '🛡️'};
+      if (normalized === 'success') return {cls: 'status-badge--success', icon: '✅'};
+      if (['decline', 'error'].includes(normalized)) return {cls: 'status-badge--decline', icon: '⛔'};
+      return {cls: '', icon: '•'};
+    }
+
+    function renderStatusBadge(task) {
+      const state = String(task.current_state || task.state || 'idle');
+      const label = task.status_label || state.replaceAll('_', ' ').replace(/\b\w/g, c => c.toUpperCase());
+      const meta = statusBadgeMeta(state);
+      return `<span class="status-badge ${meta.cls}" title="${state}"><span>${meta.icon}</span><span>${label}</span></span>`;
+    }
+
     function renderTaskTable() {
       const tbody = document.getElementById('tasks');
       tbody.innerHTML = '';
@@ -849,7 +882,7 @@
           <td>${task.id}</td>
           <td>${task.monitor_id || '-'}</td>
           <td>${task.retailer}</td>
-          <td>${task.state}</td>
+          <td>${renderStatusBadge(task)}</td>
           <td>${task.last_transition_at || '-'}</td>
           <td>${taskErrorLabel(task.last_error)}</td>
           <td class="actions">
