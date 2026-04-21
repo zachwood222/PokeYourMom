@@ -142,6 +142,24 @@
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { padding: 8px; border-bottom: 1px solid #222e44; text-align: left; }
     thead th { color: #b1bfd5; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .task-table-scroller { max-height: 560px; overflow: auto; border: 1px solid #222e44; border-radius: 10px; }
+    .task-table-scroller table { margin: 0; }
+    .task-table-scroller thead th { position: sticky; top: 0; background: #111827; z-index: 3; }
+    .task-table-scroller td { min-height: 48px; vertical-align: middle; }
+    .status-chip-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 10px; }
+    .status-chip {
+      width: auto;
+      padding: 5px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      text-transform: lowercase;
+      letter-spacing: 0.02em;
+    }
+    .status-chip.active { border-color: #4f689b; background: #1b2741; color: #eef2ff; }
+    .task-table-toolbar { display: grid; grid-template-columns: 1fr 200px; gap: 10px; align-items: center; }
+    .task-bulk-actions { margin: 10px 0; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .task-bulk-actions > * { width: auto; }
+    .task-checkbox-col { width: 36px; }
 
     .logs {
       height: 400px;
@@ -316,10 +334,43 @@
 
         <div class="card" style="margin-top:14px;">
           <h2 class="section-title">Live Task Table</h2>
-          <table>
-            <thead><tr><th>ID</th><th>Monitor</th><th>Retailer</th><th>State</th><th>Last Transition</th><th>Last Error</th><th>Actions</th></tr></thead>
-            <tbody id="tasks"></tbody>
-          </table>
+          <div class="task-table-toolbar">
+            <div class="small" id="task_selection_summary">0 selected</div>
+            <select id="task_sort" onchange="onTaskSortChange()">
+              <option value="id_desc">Sort: newest first</option>
+              <option value="id_asc">Sort: oldest first</option>
+              <option value="status_asc">Sort: status A→Z</option>
+              <option value="status_desc">Sort: status Z→A</option>
+            </select>
+          </div>
+          <div id="task_status_filters" class="status-chip-row"></div>
+          <div class="task-bulk-actions">
+            <button onclick="bulkTaskControl('start')">Start selected</button>
+            <button onclick="bulkTaskControl('stop')">Stop selected</button>
+            <button onclick="bulkToggleWaitForQueue()">Toggle wait-for-queue</button>
+            <input id="bulk_queue_delay" type="number" min="0" placeholder="Queue entry delay (ms)" />
+            <button onclick="bulkSetQueueDelay()">Set queue delay</button>
+            <input id="bulk_promo_code" placeholder="Promo code" />
+            <button onclick="bulkApplyPromoCode()">Apply promo code</button>
+          </div>
+          <div id="task_table_scroller" class="task-table-scroller" onscroll="onTaskTableScroll()">
+            <table>
+              <thead>
+                <tr>
+                  <th class="task-checkbox-col"><input type="checkbox" id="task_select_all" onchange="toggleSelectAllTasks(event)" /></th>
+                  <th>ID</th>
+                  <th>Items / SKU(s)</th>
+                  <th>Profile</th>
+                  <th>Proxy</th>
+                  <th>Start On Queue</th>
+                  <th>Loop Checkout</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="tasks"></tbody>
+            </table>
+          </div>
         </div>
 
         <div class="card" style="margin-top:14px;">
@@ -489,6 +540,12 @@
     let loopRunning = false;
     let selectedTaskId = null;
     let taskMap = new Map();
+    let selectedTaskIds = new Set();
+    let taskStatusFilter = new Set();
+    let taskSortMode = 'id_desc';
+    const TASK_VIRTUALIZATION_THRESHOLD = 120;
+    const TASK_VIRTUAL_ROW_HEIGHT = 52;
+    const TASK_VIRTUAL_BUFFER = 8;
     const toArray = (value, key) => Array.isArray(value) ? value : (value && Array.isArray(value[key]) ? value[key] : []);
     function getCaptchaToken() {
       return (document.getElementById('captcha_token')?.value || "").trim();
@@ -839,29 +896,241 @@
       return value ? value : '-';
     }
 
+    function parseTaskConfig(task) {
+      const raw = task?.task_config;
+      if (!raw) return {};
+      if (typeof raw === 'object') return raw;
+      if (typeof raw !== 'string') return {};
+      try {
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+      } catch (error) {
+        return {};
+      }
+    }
+
+    function collectTaskRows() {
+      const rows = Array.from(taskMap.values());
+      const filteredRows = rows.filter((task) => {
+        if (taskStatusFilter.size === 0) return true;
+        const state = String(task.current_state || task.state || 'queued');
+        return taskStatusFilter.has(state);
+      });
+      const sorted = filteredRows.sort((a, b) => {
+        const aState = String(a.current_state || a.state || 'queued');
+        const bState = String(b.current_state || b.state || 'queued');
+        if (taskSortMode === 'id_asc') return a.id - b.id;
+        if (taskSortMode === 'status_asc') return aState.localeCompare(bState) || (b.id - a.id);
+        if (taskSortMode === 'status_desc') return bState.localeCompare(aState) || (b.id - a.id);
+        return b.id - a.id;
+      });
+      return sorted;
+    }
+
+    function taskItemsLabel(task) {
+      const config = parseTaskConfig(task);
+      const products = Array.isArray(config.products) ? config.products : [];
+      if (products.length) {
+        return products.map((item) => item?.pid || item?.sku || '-').join(', ');
+      }
+      return config.monitor_input || config.product_url || task.product_url || '-';
+    }
+
+    function taskProfileLabel(task) {
+      const config = parseTaskConfig(task);
+      return config.profile || task.profile || '-';
+    }
+
+    function taskProxyLabel(task) {
+      const config = parseTaskConfig(task);
+      return config.proxy_group || config.proxy || '-';
+    }
+
+    function taskBoolFlag(task, key) {
+      const config = parseTaskConfig(task);
+      return !!config[key] ? 'Yes' : 'No';
+    }
+
+    function updateTaskSelectionSummary() {
+      const el = document.getElementById('task_selection_summary');
+      if (el) el.textContent = `${selectedTaskIds.size} selected`;
+      const selectAll = document.getElementById('task_select_all');
+      const rows = collectTaskRows();
+      if (selectAll) {
+        selectAll.checked = rows.length > 0 && rows.every((row) => selectedTaskIds.has(row.id));
+      }
+    }
+
+    function renderStatusChips() {
+      const container = document.getElementById('task_status_filters');
+      if (!container) return;
+      const statuses = Array.from(new Set(Array.from(taskMap.values()).map((task) => String(task.current_state || task.state || 'queued')))).sort();
+      const chips = statuses.map((status) => {
+        const active = taskStatusFilter.has(status) ? 'active' : '';
+        return `<button class="status-chip ${active}" onclick="toggleTaskStatusFilter('${status}')">${status}</button>`;
+      });
+      container.innerHTML = `<button class="status-chip ${taskStatusFilter.size === 0 ? 'active' : ''}" onclick="clearTaskStatusFilters()">all</button>${chips.join('')}`;
+    }
+
+    function toggleTaskStatusFilter(status) {
+      if (taskStatusFilter.has(status)) taskStatusFilter.delete(status);
+      else taskStatusFilter.add(status);
+      renderTaskTable();
+    }
+
+    function clearTaskStatusFilters() {
+      taskStatusFilter.clear();
+      renderTaskTable();
+    }
+
+    function onTaskSortChange() {
+      const sort = document.getElementById('task_sort');
+      taskSortMode = sort?.value || 'id_desc';
+      renderTaskTable();
+    }
+
+    function onTaskTableScroll() {
+      renderTaskTable(true);
+    }
+
+    function toggleTaskSelected(taskId, checked) {
+      if (checked) selectedTaskIds.add(taskId);
+      else selectedTaskIds.delete(taskId);
+      updateTaskSelectionSummary();
+    }
+
+    function toggleSelectAllTasks(event) {
+      const rows = collectTaskRows();
+      const checked = !!event?.target?.checked;
+      if (checked) rows.forEach((task) => selectedTaskIds.add(task.id));
+      else rows.forEach((task) => selectedTaskIds.delete(task.id));
+      renderTaskTable();
+    }
+
+    async function bulkTaskControl(action) {
+      const ids = Array.from(selectedTaskIds);
+      if (!ids.length) return;
+      for (const id of ids) {
+        if (action === 'start') await startTask(id);
+        if (action === 'stop') await stopTask(id);
+      }
+      await loadTasks();
+    }
+
+    function applyLocalTaskConfigPatch(taskId, patch) {
+      const task = taskMap.get(taskId);
+      if (!task) return;
+      const config = {...parseTaskConfig(task), ...patch};
+      task.task_config = config;
+      taskMap.set(taskId, task);
+    }
+
+    function bulkToggleWaitForQueue() {
+      const ids = Array.from(selectedTaskIds);
+      for (const id of ids) {
+        const config = parseTaskConfig(taskMap.get(id));
+        applyLocalTaskConfigPatch(id, {wait_for_queue: !config.wait_for_queue});
+      }
+      renderTaskTable();
+    }
+
+    function bulkSetQueueDelay() {
+      const value = Number(document.getElementById('bulk_queue_delay')?.value || 0);
+      if (!Number.isFinite(value) || value < 0) {
+        alert('Queue delay must be a number >= 0');
+        return;
+      }
+      const ids = Array.from(selectedTaskIds);
+      for (const id of ids) applyLocalTaskConfigPatch(id, {queue_entry_delay_ms: value});
+      renderTaskTable();
+    }
+
+    function bulkApplyPromoCode() {
+      const promoCode = (document.getElementById('bulk_promo_code')?.value || '').trim();
+      if (!promoCode) {
+        alert('Enter a promo code first.');
+        return;
+      }
+      const ids = Array.from(selectedTaskIds);
+      for (const id of ids) applyLocalTaskConfigPatch(id, {promo_code: promoCode});
+      renderTaskTable();
+    }
+
+    function taskActionStartStop(taskId, state) {
+      if (state === 'monitoring' || state === 'running') return stopTask(taskId);
+      return startTask(taskId);
+    }
+
+    async function editMonitorInput(taskId) {
+      const task = taskMap.get(taskId);
+      if (!task) return;
+      const config = parseTaskConfig(task);
+      const currentValue = config.monitor_input || config.product_url || task.product_url || '';
+      const nextValue = prompt('Update monitor input / PID list', currentValue);
+      if (nextValue === null) return;
+      applyLocalTaskConfigPatch(taskId, {monitor_input: nextValue.trim()});
+      renderTaskTable();
+    }
+
+    async function copyTaskPids(taskId) {
+      const task = taskMap.get(taskId);
+      if (!task) return;
+      const text = taskItemsLabel(task);
+      await navigator.clipboard.writeText(text);
+    }
+
+    async function retryDecline(taskId) {
+      await runTask(taskId);
+      await loadTaskAttempts(taskId);
+    }
+
     function renderTaskTable() {
       const tbody = document.getElementById('tasks');
       tbody.innerHTML = '';
-      const rows = Array.from(taskMap.values()).sort((a, b) => b.id - a.id);
-      for (const task of rows) {
+      const rows = collectTaskRows();
+      const scroller = document.getElementById('task_table_scroller');
+      let start = 0;
+      let end = rows.length;
+      const useVirtualization = rows.length >= TASK_VIRTUALIZATION_THRESHOLD && !!scroller;
+      if (useVirtualization) {
+        const scrollTop = scroller.scrollTop || 0;
+        const viewport = scroller.clientHeight || 560;
+        start = Math.max(0, Math.floor(scrollTop / TASK_VIRTUAL_ROW_HEIGHT) - TASK_VIRTUAL_BUFFER);
+        end = Math.min(rows.length, Math.ceil((scrollTop + viewport) / TASK_VIRTUAL_ROW_HEIGHT) + TASK_VIRTUAL_BUFFER);
+        const topSpacer = document.createElement('tr');
+        topSpacer.innerHTML = `<td colspan="9" style="height:${start * TASK_VIRTUAL_ROW_HEIGHT}px; padding:0; border:0;"></td>`;
+        tbody.appendChild(topSpacer);
+      }
+      for (const task of rows.slice(start, end)) {
+        const state = String(task.current_state || task.state || 'queued');
+        const primaryActionLabel = state === 'monitoring' || state === 'running' ? 'Stop' : 'Start';
         const tr = document.createElement('tr');
         tr.innerHTML = `
+          <td><input type="checkbox" ${selectedTaskIds.has(task.id) ? 'checked' : ''} onchange="toggleTaskSelected(${task.id}, this.checked)" /></td>
           <td>${task.id}</td>
-          <td>${task.monitor_id || '-'}</td>
-          <td>${task.retailer}</td>
-          <td>${task.state}</td>
-          <td>${task.last_transition_at || '-'}</td>
-          <td>${taskErrorLabel(task.last_error)}</td>
+          <td title="${taskItemsLabel(task)}">${taskItemsLabel(task)}</td>
+          <td>${taskProfileLabel(task)}</td>
+          <td>${taskProxyLabel(task)}</td>
+          <td>${taskBoolFlag(task, 'wait_for_queue')}</td>
+          <td>${taskBoolFlag(task, 'loop_checkout')}</td>
+          <td><span class="pill">${state}</span></td>
           <td class="actions">
-            <button onclick="startTask(${task.id})">Start</button>
-            <button onclick="runTask(${task.id})">Run</button>
-            <button onclick="pauseTask(${task.id})">Pause</button>
-            <button onclick="stopTask(${task.id})">Stop</button>
+            <button onclick="taskActionStartStop(${task.id}, '${state}')">${primaryActionLabel}</button>
+            <button onclick="editMonitorInput(${task.id})">Edit Input</button>
+            <button onclick="copyTaskPids(${task.id})">Copy PID(s)</button>
+            <button onclick="retryDecline(${task.id})">Retry Decline</button>
             <button onclick="selectTask(${task.id})">Logs</button>
           </td>
         `;
         tbody.appendChild(tr);
       }
+      if (useVirtualization) {
+        const bottomSpacer = document.createElement('tr');
+        bottomSpacer.innerHTML = `<td colspan="9" style="height:${Math.max(0, (rows.length - end) * TASK_VIRTUAL_ROW_HEIGHT)}px; padding:0; border:0;"></td>`;
+        tbody.appendChild(bottomSpacer);
+      }
+      renderStatusChips();
+      updateTaskSelectionSummary();
     }
 
     async function loadTasks() {
