@@ -218,6 +218,45 @@ def test_create_monitor_accepts_pokemon_center_alias(tmp_path, monkeypatch):
 
     assert resp.status_code == 201
     assert payload["retailer"] == "pokemoncenter"
+    assert payload["category"] == "pokemon"
+
+
+def test_create_monitor_validates_category(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "category": "model_kits",
+            "product_url": "https://www.target.com/p/example",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "Unsupported category 'model_kits'"
+
+
+def test_create_monitor_validates_retailer_category_combo(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "category": "sports_cards",
+            "product_url": "https://www.walmart.com/ip/example",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "Retailer 'walmart' does not support category 'sports_cards'"
 
 
 def test_captcha_valid_token_allows_protected_post(tmp_path, monkeypatch):
@@ -253,6 +292,79 @@ def test_captcha_valid_token_allows_protected_post(tmp_path, monkeypatch):
     )
 
     assert resp.status_code == 201
+
+
+def test_create_monitor_validates_behavior_metadata_retailer_profiles(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+            "behavior_metadata": {
+                "jitter_ratio": 0.25,
+                "retailer_profiles": {
+                    "invalid-retailer": {"base_delay_seconds": 0.5},
+                },
+            },
+        },
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 400
+    assert "unsupported retailer" in resp.get_json()["error"]
+
+
+def test_workspace_behavior_metadata_can_be_patched(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    response = client.patch(
+        "/api/workspace",
+        json={
+            "behavior_metadata": {
+                "profile": "safer_default",
+                "base_delay_seconds": 0.3,
+                "retailer_profiles": {"target": {"base_delay_seconds": 0.4}},
+            }
+        },
+        headers=_auth_headers(),
+    )
+    assert response.status_code == 200
+    workspace = response.get_json()["workspace"]
+    payload = json.loads(workspace["behavior_metadata"])
+    assert payload["profile"] == "safer_default"
+    assert payload["retailer_profiles"]["target"]["base_delay_seconds"] == 0.4
+
+
+def test_update_monitor_allows_behavior_and_session_metadata(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    created = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "bestbuy",
+            "product_url": "https://example.com/bb",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    monitor_id = created.get_json()["id"]
+    patched = client.patch(
+        f"/api/monitors/{monitor_id}",
+        json={
+            "enabled": False,
+            "session_metadata": {"cookie_profile": "A"},
+            "behavior_metadata": {"base_delay_seconds": 0.45, "jitter_ratio": 0.1},
+        },
+        headers=_auth_headers(),
+    )
+    assert patched.status_code == 200
+    payload = patched.get_json()
+    assert payload["enabled"] == 0
+    assert json.loads(payload["session_metadata"])["cookie_profile"] == "A"
+    assert json.loads(payload["behavior_metadata"])["base_delay_seconds"] == 0.45
 
 
 def test_captcha_invalid_or_missing_token_rejects_protected_post(tmp_path, monkeypatch):
@@ -687,6 +799,120 @@ def test_keyword_and_max_price_filter_block_event(tmp_path, monkeypatch):
     assert posted_payloads == []
 
 
+def test_create_event_and_deliver_uses_shared_request_helper_only(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    captured = {}
+
+    class DummyResponse:
+        status_code = 204
+        text = ""
+        ok = True
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    def fail_direct_post(*_args, **_kwargs):
+        raise AssertionError("direct requests.post should not be used for webhook delivery")
+
+    monkeypatch.setattr(app_module.requests, "post", fail_direct_post)
+
+    conn = app_module.db()
+    conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/p', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor = conn.execute("select * from monitors order by id desc limit 1").fetchone()
+    conn.execute(
+        "insert into webhooks(workspace_id, name, webhook_url, created_at) values (1, 'Main', 'https://discord.com/api/webhooks/test', ?)",
+        (app_module.utc_now(),),
+    )
+    conn.commit()
+    conn.close()
+
+    result = app_module.MonitorResult(
+        in_stock=True,
+        price_cents=2500,
+        title="Pokemon Product",
+        status_text="in_stock",
+        keyword_matched=True,
+    )
+    app_module.create_event_and_deliver(monitor, result, eligible=True)
+
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://discord.com/api/webhooks/test"
+    assert captured["retry_total"] == 1
+    assert captured["backoff_factor"] == 0.2
+
+
+def test_evaluate_page_sets_keyword_and_price_fields(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    captured = {}
+
+    class DummyResponse:
+        status_code = 204
+        text = ""
+        ok = True
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    def fail_direct_post(*_args, **_kwargs):
+        raise AssertionError("direct requests.post should not be used for webhook delivery")
+
+    monkeypatch.setattr(app_module.requests, "post", fail_direct_post)
+
+    conn = app_module.db()
+    conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/p', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor = conn.execute("select * from monitors order by id desc limit 1").fetchone()
+    conn.execute(
+        "insert into webhooks(workspace_id, name, webhook_url, created_at) values (1, 'Main', 'https://discord.com/api/webhooks/test', ?)",
+        (app_module.utc_now(),),
+    )
+    conn.commit()
+    conn.close()
+
+    result = app_module.MonitorResult(
+        in_stock=True,
+        price_cents=2500,
+        title="Pokemon Product",
+        status_text="in_stock",
+        keyword_matched=True,
+    )
+    app_module.create_event_and_deliver(monitor, result, eligible=True)
+
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://discord.com/api/webhooks/test"
+    assert captured["retry_total"] == 1
+    assert captured["backoff_factor"] == 0.2
+
+
 def test_evaluate_page_sets_keyword_and_price_fields(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
 
@@ -768,8 +994,630 @@ def test_init_db_migrates_existing_monitors_table_with_msrp_column(tmp_path, mon
     assert "proxy_url" in columns
     assert "session_task_key" in columns
     assert "session_metadata" in columns
+    assert "behavior_metadata" in columns
     assert "proxy_url" in workspace_columns
     assert "session_metadata" in workspace_columns
+    assert "behavior_metadata" in workspace_columns
+
+
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
+def test_fetch_monitor_uses_monitor_proxy_override_and_session_task_key(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    class DummyResponse:
+        status_code = 200
+        text = "<html><title>Item</title><body>in stock add to cart $19.99</body></html>"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    captured = {}
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    conn.execute("update workspaces set proxy_url = ? where id = 1", ("http://workspace-proxy:8080",))
+    cur = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, proxy_url, session_task_key, created_at
+        ) values (1, 'target', 'https://example.com/item', 20, 'http://monitor-proxy:9090', 'session-custom-1', ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor = conn.execute("select * from monitors where id = ?", (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+
+    result = app_module.fetch_monitor(monitor)
+
+    assert result.in_stock is True
+    assert captured["task_key"] == "session-custom-1"
+    assert captured["proxy_url"] == "http://monitor-proxy:9090"
+    assert captured["retry_total"] == 2
+    assert captured["backoff_factor"] == 0.35
+
+
+def test_fetch_monitor_uses_workspace_proxy_and_default_session_task_key(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    class DummyResponse:
+        status_code = 200
+        text = "<html><title>Item</title><body>out of stock $29.99</body></html>"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    captured = {}
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    conn.execute("update workspaces set proxy_url = ? where id = 1", ("http://workspace-proxy:8080",))
+    cur = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, proxy_url, session_task_key, created_at
+        ) values (1, 'walmart', 'https://example.com/item2', 20, null, null, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor_id = int(cur.lastrowid)
+    monitor = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
+    conn.commit()
+    conn.close()
+
+    result = app_module.fetch_monitor(monitor)
+
+    assert result.in_stock is False
+    assert captured["task_key"] == f"monitor-{monitor_id}"
+    assert captured["proxy_url"] == "http://workspace-proxy:8080"
+    assert captured["retry_total"] == 2
+    assert captured["backoff_factor"] == 0.35
+
+
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
+def test_fetch_monitor_uses_monitor_proxy_override_and_session_task_key(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    class DummyResponse:
+        status_code = 200
+        text = "<html><title>Item</title><body>in stock add to cart $19.99</body></html>"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    captured = {}
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    conn.execute("update workspaces set proxy_url = ? where id = 1", ("http://workspace-proxy:8080",))
+    cur = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, proxy_url, session_task_key, created_at
+        ) values (1, 'target', 'https://example.com/item', 20, 'http://monitor-proxy:9090', 'session-custom-1', ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor = conn.execute("select * from monitors where id = ?", (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+
+    result = app_module.fetch_monitor(monitor)
+
+    assert result.in_stock is True
+    assert captured["task_key"] == "session-custom-1"
+    assert captured["proxy_url"] == "http://monitor-proxy:9090"
+    assert captured["retry_total"] == 2
+    assert captured["backoff_factor"] == 0.35
+
+
+def test_fetch_monitor_uses_workspace_proxy_and_default_session_task_key(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    class DummyResponse:
+        status_code = 200
+        text = "<html><title>Item</title><body>out of stock $29.99</body></html>"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    captured = {}
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    conn.execute("update workspaces set proxy_url = ? where id = 1", ("http://workspace-proxy:8080",))
+    cur = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, proxy_url, session_task_key, created_at
+        ) values (1, 'walmart', 'https://example.com/item2', 20, null, null, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor_id = int(cur.lastrowid)
+    monitor = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
+    conn.commit()
+    conn.close()
+
+    result = app_module.fetch_monitor(monitor)
+
+    assert result.in_stock is False
+    assert captured["task_key"] == f"monitor-{monitor_id}"
+    assert captured["proxy_url"] == "http://workspace-proxy:8080"
+    assert captured["retry_total"] == 2
+    assert captured["backoff_factor"] == 0.35
+
+
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
+def test_fetch_monitor_uses_monitor_proxy_override_and_session_task_key(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    class DummyResponse:
+        status_code = 200
+        text = "<html><title>Item</title><body>in stock add to cart $19.99</body></html>"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    captured = {}
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    conn.execute("update workspaces set proxy_url = ? where id = 1", ("http://workspace-proxy:8080",))
+    cur = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, proxy_url, session_task_key, created_at
+        ) values (1, 'target', 'https://example.com/item', 20, 'http://monitor-proxy:9090', 'session-custom-1', ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor = conn.execute("select * from monitors where id = ?", (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+
+    result = app_module.fetch_monitor(monitor)
+
+    assert result.in_stock is True
+    assert captured["task_key"] == "session-custom-1"
+    assert captured["proxy_url"] == "http://monitor-proxy:9090"
+    assert captured["retry_total"] == 2
+    assert captured["backoff_factor"] == 0.35
+
+
+def test_fetch_monitor_uses_workspace_proxy_and_default_session_task_key(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    class DummyResponse:
+        status_code = 200
+        text = "<html><title>Item</title><body>out of stock $29.99</body></html>"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    captured = {}
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    conn.execute("update workspaces set proxy_url = ? where id = 1", ("http://workspace-proxy:8080",))
+    cur = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, proxy_url, session_task_key, created_at
+        ) values (1, 'walmart', 'https://example.com/item2', 20, null, null, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor_id = int(cur.lastrowid)
+    monitor = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
+    conn.commit()
+    conn.close()
+
+    result = app_module.fetch_monitor(monitor)
+
+    assert result.in_stock is False
+    assert captured["task_key"] == f"monitor-{monitor_id}"
+    assert captured["proxy_url"] == "http://workspace-proxy:8080"
+    assert captured["retry_total"] == 2
+    assert captured["backoff_factor"] == 0.35
+
+
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
+def test_fetch_monitor_uses_monitor_proxy_override_and_session_task_key(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    class DummyResponse:
+        status_code = 200
+        text = "<html><title>Item</title><body>in stock add to cart $19.99</body></html>"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    captured = {}
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    conn.execute("update workspaces set proxy_url = ? where id = 1", ("http://workspace-proxy:8080",))
+    cur = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, proxy_url, session_task_key, created_at
+        ) values (1, 'target', 'https://example.com/item', 20, 'http://monitor-proxy:9090', 'session-custom-1', ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor = conn.execute("select * from monitors where id = ?", (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+
+    result = app_module.fetch_monitor(monitor)
+
+    assert result.in_stock is True
+    assert captured["task_key"] == "session-custom-1"
+    assert captured["proxy_url"] == "http://monitor-proxy:9090"
+    assert captured["retry_total"] == 2
+    assert captured["backoff_factor"] == 0.35
+
+
+def test_fetch_monitor_uses_workspace_proxy_and_default_session_task_key(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    class DummyResponse:
+        status_code = 200
+        text = "<html><title>Item</title><body>out of stock $29.99</body></html>"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    captured = {}
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    conn.execute("update workspaces set proxy_url = ? where id = 1", ("http://workspace-proxy:8080",))
+    cur = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, proxy_url, session_task_key, created_at
+        ) values (1, 'walmart', 'https://example.com/item2', 20, null, null, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor_id = int(cur.lastrowid)
+    monitor = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
+    conn.commit()
+    conn.close()
+
+    result = app_module.fetch_monitor(monitor)
+
+    assert result.in_stock is False
+    assert captured["task_key"] == f"monitor-{monitor_id}"
+    assert captured["proxy_url"] == "http://workspace-proxy:8080"
+    assert captured["retry_total"] == 2
+    assert captured["backoff_factor"] == 0.35
 
 
 def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
@@ -1000,6 +1848,24 @@ def test_checkout_task_lifecycle_start_pause_stop(tmp_path, monkeypatch):
         },
         headers=_auth_headers(),
     )
+    monitor = create_monitor_resp.get_json()
+    assert create_monitor_resp.status_code == 201
+
+    create_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor["id"],
+            "task_config": {
+                "retailer": "target",
+                "product_url": "https://www.target.com/p/abc",
+                "profile": "default",
+                "account": "acct-1",
+                "payment": "amex",
+            },
+        },
+        headers=_auth_headers(),
+    )
+    assert create_resp.status_code == 201
     task_id = create_resp.get_json()["id"]
 
     start_resp = client.post(f"/api/checkout/tasks/{task_id}/start", headers=_auth_headers())
@@ -1305,6 +2171,47 @@ def test_ops_metrics_returns_expected_schema_and_non_negative_counts(tmp_path, m
     assert payload["alerts_created_total"] == 1
     assert payload["webhook_sent_total"] == 1
     assert payload["webhook_failed_total"] == 1
+def test_webhook_test_endpoint_uses_shared_request_helper(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    captured = {}
+
+    class DummyResponse:
+        status_code = 204
+        text = ""
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    cur = conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, created_at)
+        values (1, 'Main', 'https://discord.com/api/webhooks/test-endpoint', ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    webhook_id = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+
+    resp = client.post(f"/api/webhooks/{webhook_id}/test", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["ok"] is True
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://discord.com/api/webhooks/test-endpoint"
+    assert captured["task_key"] == f"webhook-test-{webhook_id}"
 
 
 def test_monitor_failure_trends_returns_seeded_counts(tmp_path, monkeypatch):
@@ -1676,6 +2583,38 @@ def test_check_monitor_api_includes_reason_and_confidence_for_ambiguous_markup(t
     assert payload["parser_confidence"] == 0.2
 
 
+def test_check_monitor_notify_failures_do_not_clobber_persisted_state(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    monitor_id = _seed_monitor(app_module)
+    expected = app_module.MonitorResult(
+        in_stock=True,
+        price_cents=1999,
+        title="Pokemon Product",
+        status_text="in_stock",
+        availability_reason="marker_in_stock",
+        parser_confidence=0.91,
+        keyword_matched=True,
+    )
+
+    monkeypatch.setattr(app_module, "fetch_monitor", lambda monitor: expected)
+    monkeypatch.setattr(app_module, "create_event_and_deliver", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("notify down")))
+
+    resp = client.post(f"/api/monitors/{monitor_id}/check", headers=_auth_headers())
+    payload = resp.get_json()
+    assert resp.status_code == 200
+    assert payload["ok"] is True
+    assert payload["eligible_for_alert"] is True
+
+    conn = app_module.db()
+    row = conn.execute("select failure_streak, last_error, last_price_cents, last_in_stock from monitors where id = ?", (monitor_id,)).fetchone()
+    conn.close()
+    assert row["failure_streak"] == 0
+    assert row["last_error"] is None
+    assert row["last_price_cents"] == 1999
+    assert row["last_in_stock"] == 1
+
+
 def test_billing_sync_upgrade_relaxes_plan_limits(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -1844,6 +2783,24 @@ def test_init_db_creates_checkout_tables(tmp_path, monkeypatch):
     assert tables == {"checkout_tasks", "checkout_attempts", "task_logs"}
 
 
+def test_init_db_creates_proxy_tables(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    conn = app_module.db()
+    tables = {
+        row["name"]
+        for row in conn.execute(
+            "select name from sqlite_master where type = 'table' and name in ('proxies', 'proxy_leases')"
+        ).fetchall()
+    }
+    monitor_columns = {row["name"] for row in conn.execute("pragma table_info(monitors)").fetchall()}
+    conn.close()
+
+    assert tables == {"proxies", "proxy_leases"}
+    assert {"proxy_type", "proxy_region", "proxy_residential_only", "proxy_sticky_session_seconds"}.issubset(
+        monitor_columns
+    )
+
+
 def test_check_monitor_enqueues_checkout_task_for_eligible_stock(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -1860,6 +2817,23 @@ def test_check_monitor_enqueues_checkout_task_for_eligible_stock(tmp_path, monke
     )
     monitor = create_resp.get_json()
     assert create_resp.status_code == 201
+    account_resp = client.post(
+        "/api/accounts",
+        json={
+            "retailer": "target",
+            "username": "target-user",
+            "encrypted_credential_ref": "cred-ref",
+            "proxy_url": "http://proxy-1.local:8080",
+        },
+        headers=_auth_headers(),
+    )
+    assert account_resp.status_code == 201
+    binding_resp = client.post(
+        "/api/task-profile-bindings",
+        json={"monitor_id": monitor["id"], "retailer_account_id": account_resp.get_json()["id"]},
+        headers=_auth_headers(),
+    )
+    assert binding_resp.status_code == 201
 
     def fake_fetch(_monitor):
         return app_module.MonitorResult(
@@ -1908,6 +2882,18 @@ def test_checkout_task_lifecycle_routes(tmp_path, monkeypatch):
     )
     monitor = create_monitor_resp.get_json()
     assert create_monitor_resp.status_code == 201
+    account_resp = client.post(
+        "/api/accounts",
+        json={"retailer": "walmart", "username": "w-user", "encrypted_credential_ref": "cred-ref"},
+        headers=_auth_headers(),
+    )
+    assert account_resp.status_code == 201
+    binding_resp = client.post(
+        "/api/task-profile-bindings",
+        json={"monitor_id": monitor["id"], "retailer_account_id": account_resp.get_json()["id"]},
+        headers=_auth_headers(),
+    )
+    assert binding_resp.status_code == 201
 
     create_task_resp = client.post(
         "/api/checkout/tasks",
@@ -1934,3 +2920,400 @@ def test_checkout_task_lifecycle_routes(tmp_path, monkeypatch):
     payload = state_resp.get_json()
     assert payload["current_state"] == "stopped"
     assert payload["last_error"] is None
+
+
+def test_checkout_run_transitions_all_steps_and_marks_success(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_monitor_resp = client.post(
+        "/api/monitors",
+        json={"retailer": "walmart", "product_url": "https://example.com/item-run", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
+    )
+    monitor = create_monitor_resp.get_json()
+    assert create_monitor_resp.status_code == 201
+
+    create_task_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor["id"],
+            "task_name": "Checkout Run",
+            "task_config": {
+                "retailer": "walmart",
+                "product_url": "https://example.com/item-run",
+                "profile": "default-profile",
+                "account": "acc-primary",
+                "payment": "visa-4242",
+            },
+        },
+        headers=_auth_headers(),
+    )
+    task = create_task_resp.get_json()
+    run_resp = client.post(f"/api/checkout/tasks/{task['id']}/run", headers=_auth_headers())
+    assert run_resp.status_code == 200
+    assert run_resp.get_json()["task"]["current_state"] == "success"
+
+    conn = app_module.db()
+    steps = {
+        row["state"]
+        for row in conn.execute(
+            "select state from checkout_attempts where task_id = ? and status = 'step_success'",
+            (task["id"],),
+        ).fetchall()
+    }
+    log_events = {
+        row["event_type"]
+        for row in conn.execute("select event_type from task_logs where task_id = ?", (task["id"],)).fetchall()
+    }
+    conn.close()
+
+    assert steps == {"monitoring", "carting", "shipping", "payment", "submitting"}
+    assert "state_transition" in log_events
+    assert "step_success" in log_events
+
+
+def test_checkout_run_retries_payment_and_terminal_failure_taxonomy(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_monitor_resp = client.post(
+        "/api/monitors",
+        json={"retailer": "target", "product_url": "https://example.com/item-fail", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
+    )
+    monitor = create_monitor_resp.get_json()
+
+    create_task_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor["id"],
+            "task_name": "Checkout Fail",
+            "task_config": {
+                "retailer": "target",
+                "product_url": "https://example.com/item-fail",
+                "profile": "default-profile",
+                "account": "acc-primary",
+                "payment": "visa-4242",
+                "simulate_fail_step": "payment",
+                "simulate_fail_times": 5,
+                "simulate_retryable": True,
+            },
+        },
+        headers=_auth_headers(),
+    )
+    task = create_task_resp.get_json()
+
+    run_resp = client.post(f"/api/checkout/tasks/{task['id']}/run", headers=_auth_headers())
+    payload = run_resp.get_json()
+    assert run_resp.status_code == 200
+    assert payload["task"]["current_state"] == "failed"
+    assert "terminal_max_attempts_exceeded" in (payload["task"]["last_error"] or "")
+
+    conn = app_module.db()
+    payment_failures = conn.execute(
+        """
+        select count(*) as c
+        from checkout_attempts
+        where task_id = ? and state = 'payment' and status = 'step_failure'
+        """,
+        (task["id"],),
+    ).fetchone()["c"]
+    conn.close()
+    assert payment_failures == app_module.CHECKOUT_STEP_RETRY_POLICY["payment"]["max_attempts"]
+
+
+def test_checkout_run_uses_task_profile_bindings_for_execution_context(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_monitor_resp = client.post(
+        "/api/monitors",
+        json={"retailer": "target", "product_url": "https://example.com/item-binding", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
+    )
+    monitor = create_monitor_resp.get_json()
+
+    create_task_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor["id"],
+            "task_name": "Checkout Bound",
+            "task_config": {"retailer": "target", "product_url": "https://example.com/item-binding"},
+        },
+        headers=_auth_headers(),
+    )
+    task = create_task_resp.get_json()
+
+    conn = app_module.db()
+    cur = conn.execute(
+        """
+        insert into checkout_profiles(workspace_id, name, email, phone, shipping_address_json, billing_address_json, created_at, updated_at)
+        values (1, 'profile-bound', 'profile@example.com', '5551112222', ?, ?, ?, ?)
+        """,
+        (
+            json.dumps({"line1": "1 Main", "city": "Austin", "state": "TX", "postal_code": "78701", "country": "US"}),
+            json.dumps({"line1": "1 Main", "city": "Austin", "state": "TX", "postal_code": "78701", "country": "US"}),
+            app_module.utc_now(),
+            app_module.utc_now(),
+        ),
+    )
+    profile_id = int(cur.lastrowid)
+    cur = conn.execute(
+        """
+        insert into retailer_accounts(workspace_id, retailer, username, email, encrypted_credential_ref, session_status, created_at, updated_at)
+        values (1, 'target', 'bound-user', 'bound@example.com', 'enc-ref', 'active', ?, ?)
+        """,
+        (app_module.utc_now(), app_module.utc_now()),
+    )
+    account_id = int(cur.lastrowid)
+    cur = conn.execute(
+        """
+        insert into payment_methods(workspace_id, label, provider, token_reference, billing_profile_id, created_at, updated_at)
+        values (1, 'visa-bound', 'stripe', 'tok_test', ?, ?, ?)
+        """,
+        (profile_id, app_module.utc_now(), app_module.utc_now()),
+    )
+    payment_id = int(cur.lastrowid)
+    conn.execute(
+        """
+        insert into task_profile_bindings(workspace_id, monitor_id, checkout_profile_id, retailer_account_id, payment_method_id, created_at, updated_at)
+        values (1, ?, ?, ?, ?, ?, ?)
+        """,
+        (monitor["id"], profile_id, account_id, payment_id, app_module.utc_now(), app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    run_resp = client.post(f"/api/checkout/tasks/{task['id']}/run", headers=_auth_headers())
+    assert run_resp.status_code == 200
+    assert run_resp.get_json()["task"]["current_state"] == "success"
+
+
+def test_checkout_run_fails_fast_with_actionable_binding_error(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_monitor_resp = client.post(
+        "/api/monitors",
+        json={"retailer": "bestbuy", "product_url": "https://example.com/item-binding-fail", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
+    )
+    monitor = create_monitor_resp.get_json()
+
+    create_task_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor["id"],
+            "task_name": "Checkout Bound Fail",
+            "task_config": {"retailer": "bestbuy", "product_url": "https://example.com/item-binding-fail"},
+        },
+        headers=_auth_headers(),
+    )
+    task = create_task_resp.get_json()
+
+    conn = app_module.db()
+    cur = conn.execute(
+        """
+        insert into checkout_profiles(workspace_id, name, email, phone, shipping_address_json, billing_address_json, created_at, updated_at)
+        values (1, 'profile-bound', 'profile@example.com', '5551112222', ?, ?, ?, ?)
+        """,
+        (
+            json.dumps({"line1": "1 Main", "city": "Austin", "state": "TX", "postal_code": "78701", "country": "US"}),
+            json.dumps({"line1": "1 Main", "city": "Austin", "state": "TX", "postal_code": "78701", "country": "US"}),
+            app_module.utc_now(),
+            app_module.utc_now(),
+        ),
+    )
+    profile_id = int(cur.lastrowid)
+    cur = conn.execute(
+        """
+        insert into retailer_accounts(workspace_id, retailer, username, email, encrypted_credential_ref, session_status, created_at, updated_at)
+        values (1, 'bestbuy', 'bound-user', 'bound@example.com', 'enc-ref', 'active', ?, ?)
+        """,
+        (app_module.utc_now(), app_module.utc_now()),
+    )
+    account_id = int(cur.lastrowid)
+    conn.execute(
+        """
+        insert into task_profile_bindings(workspace_id, monitor_id, checkout_profile_id, retailer_account_id, payment_method_id, created_at, updated_at)
+        values (1, ?, ?, ?, null, ?, ?)
+        """,
+        (monitor["id"], profile_id, account_id, app_module.utc_now(), app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    run_resp = client.post(f"/api/checkout/tasks/{task['id']}/run", headers=_auth_headers())
+    payload = run_resp.get_json()
+    assert run_resp.status_code == 200
+    assert payload["task"]["current_state"] == "failed"
+    assert payload["task"]["last_error"] == "binding_payment_missing"
+
+
+def test_queue_enqueues_single_active_job_per_monitor(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    conn = app_module.db()
+    cur = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, enabled, created_at)
+        values (1, 'target', 'https://example.com/queue-one', 20, 1, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor = conn.execute("select * from monitors where id = ?", (cur.lastrowid,)).fetchone()
+    queue = app_module.SQLiteJobQueue(conn, worker_id="test-worker")
+    now_iso = app_module.utc_now()
+
+    queue.enqueue_monitor_check_if_due(monitor, now_iso=now_iso)
+    queue.enqueue_monitor_check_if_due(monitor, now_iso=now_iso)
+    conn.commit()
+
+    count = conn.execute(
+        "select count(*) as c from jobs where monitor_id = ? and status in ('queued', 'retrying', 'running')",
+        (monitor["id"],),
+    ).fetchone()["c"]
+    conn.close()
+
+    assert count == 1
+
+
+def test_queue_claim_due_job_recovers_from_stale_lock(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    conn = app_module.db()
+    now_iso = app_module.utc_now()
+    stale_locked_at = (
+        datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() - app_module.WORKER_LOCK_TIMEOUT_SECONDS - 5,
+            tz=timezone.utc,
+        ).isoformat()
+    )
+    cur = conn.execute(
+        """
+        insert into jobs(job_type, monitor_id, status, attempt_count, next_run_at, locked_by, locked_at, payload_json, created_at, updated_at)
+        values ('monitor_check', null, 'retrying', 1, ?, 'old-worker', ?, '{}', ?, ?)
+        """,
+        (now_iso, stale_locked_at, now_iso, now_iso),
+    )
+    conn.commit()
+    queue = app_module.SQLiteJobQueue(conn, worker_id="new-worker")
+    claimed = queue.claim_due_job(now_iso=now_iso)
+    row = conn.execute("select status, locked_by from jobs where id = ?", (cur.lastrowid,)).fetchone()
+    conn.close()
+
+    assert claimed is not None
+    assert claimed.id == cur.lastrowid
+    assert row["status"] == "running"
+    assert row["locked_by"] == "new-worker"
+
+
+def test_execute_monitor_job_transitions_retrying_and_failed(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    conn = app_module.db()
+    cur = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, enabled, created_at)
+        values (1, 'walmart', 'https://example.com/retry', 20, 1, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor_id = int(cur.lastrowid)
+
+    def fail_fetch(_monitor):
+        raise app_module.requests.RequestException("upstream timeout")
+
+    monkeypatch.setattr(app_module, "fetch_monitor", fail_fetch)
+
+    queue = app_module.SQLiteJobQueue(conn, worker_id="retry-worker")
+    now_iso = app_module.utc_now()
+    conn.execute(
+        """
+        insert into jobs(job_type, monitor_id, status, attempt_count, next_run_at, payload_json, created_at, updated_at)
+        values ('monitor_check', ?, 'queued', 0, ?, ?, ?, ?)
+        """,
+        (monitor_id, now_iso, json.dumps({"step_attempts": {}}), now_iso, now_iso),
+    )
+    conn.execute(
+        """
+        insert into jobs(job_type, monitor_id, status, attempt_count, next_run_at, payload_json, created_at, updated_at)
+        values ('monitor_check', ?, 'queued', 0, ?, ?, ?, ?)
+        """,
+        (monitor_id, now_iso, json.dumps({"step_attempts": {"fetch": 4}}), now_iso, now_iso),
+    )
+    conn.commit()
+
+    first = queue.claim_due_job(now_iso=now_iso)
+    assert first is not None
+    app_module.execute_monitor_job(queue, first, now_iso=now_iso)
+    conn.commit()
+
+    second = queue.claim_due_job(now_iso=now_iso)
+    assert second is not None
+    app_module.execute_monitor_job(queue, second, now_iso=now_iso)
+    conn.commit()
+
+    rows = conn.execute("select id, status, payload_json from jobs order by id asc").fetchall()
+    conn.close()
+
+    assert rows[0]["status"] == "retrying"
+    assert json.loads(rows[0]["payload_json"])["step_attempts"]["fetch"] == 1
+    assert rows[1]["status"] == "failed"
+
+
+def test_execute_monitor_job_completes_on_success(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    conn = app_module.db()
+    cur = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, enabled, created_at)
+        values (1, 'bestbuy', 'https://example.com/success', 20, 1, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor_id = int(cur.lastrowid)
+
+    monkeypatch.setattr(
+        app_module,
+        "fetch_monitor",
+        lambda _monitor: app_module.MonitorResult(
+            in_stock=False,
+            price_cents=1299,
+            title="Success Item",
+            status_text="out_or_unknown",
+        ),
+    )
+
+    queue = app_module.SQLiteJobQueue(conn, worker_id="success-worker")
+    now_iso = app_module.utc_now()
+    conn.execute(
+        """
+        insert into jobs(job_type, monitor_id, status, attempt_count, next_run_at, payload_json, created_at, updated_at)
+        values ('monitor_check', ?, 'queued', 0, ?, ?, ?, ?)
+        """,
+        (monitor_id, now_iso, json.dumps({"step_attempts": {}}), now_iso, now_iso),
+    )
+    conn.commit()
+
+    job = queue.claim_due_job(now_iso=now_iso)
+    assert job is not None
+    app_module.execute_monitor_job(queue, job, now_iso=now_iso)
+    conn.commit()
+    row = conn.execute("select status from jobs where id = ?", (job.id,)).fetchone()
+    conn.close()
+
+    assert row["status"] == "completed"
+
+
+def test_worker_loop_idles_when_no_jobs_available(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    sleep_calls = {"count": 0}
+
+    def fake_sleep(_seconds):
+        sleep_calls["count"] += 1
+        app_module.worker_running = False
+
+    monkeypatch.setattr(app_module.time, "sleep", fake_sleep)
+    app_module.worker_running = True
+    app_module.worker_loop()
+
+    assert sleep_calls["count"] == 1
