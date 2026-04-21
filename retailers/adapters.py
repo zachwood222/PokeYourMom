@@ -8,6 +8,8 @@ from typing import Any
 RETAILER_ALIASES = {
     "wal-mart": "walmart",
     "wal mart": "walmart",
+    "target.com": "target",
+    "target com": "target",
     "pokemon-center": "pokemoncenter",
     "pokemon_center": "pokemoncenter",
     "pokemon center": "pokemoncenter",
