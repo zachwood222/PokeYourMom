@@ -311,6 +311,48 @@
       font-size: 11px;
       color: var(--muted);
     }
+    .image-strip {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .image-strip figure {
+      margin: 0;
+      border-radius: 10px;
+      overflow: hidden;
+      border: 1px solid #2a3856;
+      background: #0d1422;
+    }
+    .image-strip img {
+      width: 100%;
+      height: 120px;
+      display: block;
+      object-fit: cover;
+      opacity: 0.88;
+    }
+    .image-strip figcaption {
+      font-size: 11px;
+      color: #c3d0e7;
+      padding: 7px 9px;
+    }
+    .profiles-layout {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      gap: 14px;
+    }
+    .profiles-stack {
+      display: grid;
+      gap: 12px;
+      align-content: start;
+    }
+    .table-shell {
+      max-height: 280px;
+      overflow: auto;
+      border: 1px solid #22314c;
+      border-radius: 10px;
+      margin-top: 10px;
+    }
     .task-card {
       margin-top: 14px;
       padding: 0;
@@ -404,6 +446,7 @@
     @media (max-width: 740px) {
       .row, .grid, .kpi-grid { grid-template-columns: 1fr; }
       .metric-row, .dense-grid { grid-template-columns: 1fr; }
+      .image-strip, .profiles-layout { grid-template-columns: 1fr; }
       .top-nav { width: 100%; overflow-x: auto; padding-bottom: 4px; }
       .inline-action-group { justify-content: flex-start; }
     }
@@ -416,6 +459,7 @@
       <nav class="top-nav">
         <button class="active" data-tab="home" onclick="setTab('home')">Analytics</button>
         <button data-tab="monitors" onclick="setTab('monitors')">Tasks</button>
+        <button data-tab="profiles" onclick="setTab('profiles')">Profiles</button>
         <button data-tab="webhooks" onclick="setTab('webhooks')">Proxies</button>
         <button data-tab="settings" onclick="setTab('settings')">Settings</button>
         <button data-tab="logs" onclick="setTab('logs')">Automation</button>
@@ -543,6 +587,16 @@
 
         <div class="card">
           <h2>Create Automation Task</h2>
+          <div class="image-strip">
+            <figure>
+              <img alt="Task queue redesign visual" src="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 900 280'%3E%3Cdefs%3E%3ClinearGradient id='a' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop stop-color='%230f1a33'/%3E%3Cstop offset='1' stop-color='%23214574'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='900' height='280' fill='url(%23a)'/%3E%3Cg fill='%23b6c7ff' opacity='.28'%3E%3Crect x='40' y='40' width='820' height='42' rx='10'/%3E%3Crect x='40' y='95' width='820' height='42' rx='10'/%3E%3Crect x='40' y='150' width='540' height='42' rx='10'/%3E%3C/g%3E%3Cg fill='%2378a0ff'%3E%3Ccircle cx='66' cy='62' r='7'/%3E%3Ccircle cx='66' cy='117' r='7'/%3E%3Ccircle cx='66' cy='172' r='7'/%3E%3C/g%3E%3C/svg%3E" />
+              <figcaption>Card-based task rows with compact status signals.</figcaption>
+            </figure>
+            <figure>
+              <img alt="Task editor redesign visual" src="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 900 280'%3E%3Cdefs%3E%3ClinearGradient id='b' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop stop-color='%23201844'/%3E%3Cstop offset='1' stop-color='%230e1020'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='900' height='280' fill='url(%23b)'/%3E%3Cg fill='%23e5d8ff' opacity='.22'%3E%3Crect x='36' y='36' width='400' height='56' rx='11'/%3E%3Crect x='454' y='36' width='410' height='56' rx='11'/%3E%3Crect x='36' y='112' width='260' height='46' rx='9'/%3E%3Crect x='312' y='112' width='260' height='46' rx='9'/%3E%3Crect x='588' y='112' width='276' height='46' rx='9'/%3E%3C/g%3E%3Crect x='36' y='182' width='160' height='58' rx='10' fill='%23684aff' opacity='.7'/%3E%3C/svg%3E" />
+              <figcaption>Modal-style task editor layout inspired by your mockup.</figcaption>
+            </figure>
+          </div>
           <div class="dense-grid">
             <div class="dense-form-row">
               <label>Monitor</label>
@@ -555,9 +609,58 @@
               <input id="task_name" placeholder="Walmart checkout task" />
               <div class="helper">Readable label shown in task cards and log entries.</div>
             </div>
+            <div class="dense-form-row">
+              <label>Task Count</label>
+              <div class="stepper">
+                <button type="button" onclick="adjustTaskCount(-1)">-</button>
+                <input id="task_count" type="number" min="1" max="100" value="1" />
+                <button type="button" onclick="adjustTaskCount(1)">+</button>
+              </div>
+              <div class="helper">Creates multiple tasks in one click.</div>
+            </div>
+            <div class="dense-form-row">
+              <label>Mode</label>
+              <select id="task_mode">
+                <option value="default">default</option>
+                <option value="safe">safe</option>
+                <option value="fast">fast</option>
+              </select>
+              <div class="helper">Select pacing profile for this run.</div>
+            </div>
+            <div class="dense-form-row">
+              <label>Profile Group</label>
+              <input id="task_profile_group" placeholder="main-profiles" />
+              <div class="helper">Matches account/profile pools used by the worker.</div>
+            </div>
+            <div class="dense-form-row">
+              <label>Proxy Group</label>
+              <input id="task_proxy_group" placeholder="resi-us-east" />
+              <div class="helper">Optional proxy pool label for queue + checkout.</div>
+            </div>
+            <div class="dense-form-row">
+              <label>Product URLs or PIDs</label>
+              <input id="task_products" placeholder="12-34567-890:1,98-76543-210:2" />
+            </div>
+            <div class="dense-form-row">
+              <label>Queue Delay (ms)</label>
+              <input id="task_queue_entry_delay_ms" type="number" min="0" placeholder="2500" />
+            </div>
+            <div class="dense-form-row">
+              <label>Promo Code</label>
+              <input id="task_promo_code" placeholder="SPRING24" />
+              <div id="task_promo_warning" class="inline-warn"></div>
+            </div>
           </div>
-          <button class="btn-primary" style="margin-top:10px;" onclick="createTask()">Create Task</button>
           <div id="create_task_error" class="inline-error"></div>
+          <div class="summary-panel">
+            <div class="summary-grid">
+              <div class="summary-item"><strong>Tasks</strong><span id="summary_task_count">1</span></div>
+              <div class="summary-item"><strong>Mode</strong><span id="summary_mode">default</span></div>
+              <div class="summary-item"><strong>Products</strong><span id="summary_products">monitor default</span></div>
+              <div class="summary-item"><strong>Profile Group</strong><span id="summary_profile_group">-</span></div>
+              <div class="summary-item"><strong>Proxy Group</strong><span id="summary_proxy_group">-</span></div>
+            </div>
+          </div>
           <div class="modal-footer">
             <button id="create_task_btn" onclick="createTask()" disabled>Create (1)</button>
           </div>
@@ -715,6 +818,67 @@
             <tbody id="manage_products_rows"></tbody>
           </table>
           <div id="manage_products_meta" class="small" style="margin-top: 8px;">No product preview loaded yet.</div>
+        </div>
+      </section>
+
+      <section id="tab-profiles" class="tab">
+        <h1>Profiles</h1>
+        <p class="small">Create reusable checkout vaults with shipping + billing, store logins, and tokenized PayPal/card references.</p>
+        <div class="profiles-layout">
+          <div class="card">
+            <h2 class="section-title">Create Profile Vault</h2>
+            <div class="dense-grid">
+              <div class="dense-form-row"><label>Profile Name</label><input id="profile_name" placeholder="Primary US" /></div>
+              <div class="dense-form-row"><label>Email</label><input id="profile_email" placeholder="you@example.com" /></div>
+              <div class="dense-form-row"><label>Phone</label><input id="profile_phone" placeholder="+1 555 123 4567" /></div>
+              <div class="dense-form-row"><label>Shipping Line 1</label><input id="shipping_line1" placeholder="123 Main St" /></div>
+              <div class="dense-form-row"><label>Shipping City</label><input id="shipping_city" placeholder="Los Angeles" /></div>
+              <div class="dense-form-row"><label>Shipping State</label><input id="shipping_state" placeholder="CA" /></div>
+              <div class="dense-form-row"><label>Shipping Postal Code</label><input id="shipping_postal" placeholder="90001" /></div>
+              <div class="dense-form-row"><label>Shipping Country</label><input id="shipping_country" value="US" /></div>
+              <div class="dense-form-row"><label>Billing Line 1</label><input id="billing_line1" placeholder="123 Main St" /></div>
+              <div class="dense-form-row"><label>Billing City</label><input id="billing_city" placeholder="Los Angeles" /></div>
+              <div class="dense-form-row"><label>Billing State</label><input id="billing_state" placeholder="CA" /></div>
+              <div class="dense-form-row"><label>Billing Postal Code</label><input id="billing_postal" placeholder="90001" /></div>
+              <div class="dense-form-row"><label>Billing Country</label><input id="billing_country" value="US" /></div>
+            </div>
+            <h3 style="margin-top:10px;">Store Login</h3>
+            <div class="dense-grid">
+              <div class="dense-form-row"><label>Retailer</label><select id="account_retailer"><option>walmart</option><option>target</option><option>bestbuy</option><option>pokemoncenter</option></select></div>
+              <div class="dense-form-row"><label>Username (optional)</label><input id="account_username" placeholder="username" /></div>
+              <div class="dense-form-row"><label>Login Email (optional)</label><input id="account_email" placeholder="login@example.com" /></div>
+              <div class="dense-form-row"><label>Credential Ref*</label><input id="account_credential_ref" placeholder="vault://enc/retailer-login-token" /></div>
+            </div>
+            <h3 style="margin-top:10px;">Payment Method</h3>
+            <div class="dense-grid">
+              <div class="dense-form-row"><label>Label</label><input id="payment_label" placeholder="PayPal Primary" /></div>
+              <div class="dense-form-row"><label>Provider</label><select id="payment_provider"><option value="paypal">paypal</option><option value="stripe_card">stripe_card</option><option value="adyen_card">adyen_card</option></select></div>
+              <div class="dense-form-row"><label>Token Reference*</label><input id="payment_token_reference" placeholder="tok_live_... / paypal_ba_..." /></div>
+            </div>
+            <p class="small">Security: raw card number/CVV is intentionally blocked. Save only tokenized references.</p>
+            <button class="btn-primary" onclick="createVaultProfile()">Save Profile Vault</button>
+            <div id="profiles_error" class="inline-error"></div>
+          </div>
+          <div class="profiles-stack">
+            <div class="card">
+              <h2 class="section-title">Saved Profiles</h2>
+              <div class="table-shell">
+                <table><thead><tr><th>ID</th><th>Name</th><th>Email</th></tr></thead><tbody id="profiles_list"></tbody></table>
+              </div>
+            </div>
+            <div class="card">
+              <h2 class="section-title">Store Logins</h2>
+              <div class="table-shell">
+                <table><thead><tr><th>ID</th><th>Retailer</th><th>User</th></tr></thead><tbody id="accounts_list"></tbody></table>
+              </div>
+            </div>
+            <div class="card">
+              <h2 class="section-title">Payments</h2>
+              <div class="table-shell">
+                <table><thead><tr><th>ID</th><th>Provider</th><th>Label</th></tr></thead><tbody id="payments_list"></tbody></table>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -1622,6 +1786,112 @@
       await loadWebhooks();
     }
 
+    function profileAddress(prefix) {
+      return {
+        line1: document.getElementById(`${prefix}_line1`)?.value || '',
+        city: document.getElementById(`${prefix}_city`)?.value || '',
+        state: document.getElementById(`${prefix}_state`)?.value || '',
+        postal_code: document.getElementById(`${prefix}_postal`)?.value || '',
+        country: document.getElementById(`${prefix}_country`)?.value || '',
+      };
+    }
+
+    async function loadProfilesPanel() {
+      const [profiles, accounts, payments] = await Promise.all([
+        apiFetch('/api/profiles').then(r => r.json()).catch(() => []),
+        apiFetch('/api/accounts').then(r => r.json()).catch(() => []),
+        apiFetch('/api/payments').then(r => r.json()).catch(() => []),
+      ]);
+
+      const profileBody = document.getElementById('profiles_list');
+      if (profileBody) {
+        profileBody.innerHTML = '';
+        for (const row of (Array.isArray(profiles) ? profiles : [])) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${row.id}</td><td>${row.name}</td><td>${row.email || '-'}</td>`;
+          profileBody.appendChild(tr);
+        }
+        if (!profileBody.innerHTML) profileBody.innerHTML = '<tr><td colspan="3">No profiles yet.</td></tr>';
+      }
+
+      const accountsBody = document.getElementById('accounts_list');
+      if (accountsBody) {
+        accountsBody.innerHTML = '';
+        for (const row of (Array.isArray(accounts) ? accounts : [])) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${row.id}</td><td>${row.retailer}</td><td>${row.username || row.email || '-'}</td>`;
+          accountsBody.appendChild(tr);
+        }
+        if (!accountsBody.innerHTML) accountsBody.innerHTML = '<tr><td colspan="3">No store logins yet.</td></tr>';
+      }
+
+      const paymentsBody = document.getElementById('payments_list');
+      if (paymentsBody) {
+        paymentsBody.innerHTML = '';
+        for (const row of (Array.isArray(payments) ? payments : [])) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${row.id}</td><td>${row.provider || '-'}</td><td>${row.label}</td>`;
+          paymentsBody.appendChild(tr);
+        }
+        if (!paymentsBody.innerHTML) paymentsBody.innerHTML = '<tr><td colspan="3">No payment methods yet.</td></tr>';
+      }
+    }
+
+    async function createVaultProfile() {
+      const errorEl = document.getElementById('profiles_error');
+      if (errorEl) errorEl.textContent = '';
+      const payload = {
+        name: document.getElementById('profile_name')?.value || '',
+        email: document.getElementById('profile_email')?.value || '',
+        phone: document.getElementById('profile_phone')?.value || '',
+        shipping_address: profileAddress('shipping'),
+        billing_address: profileAddress('billing'),
+      };
+      const profileRes = await apiFetch('/api/profiles', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken(payload)),
+      });
+      const profileData = await profileRes.json();
+      if (!profileRes.ok || profileData.error) {
+        if (errorEl) errorEl.textContent = profileData.error || `Failed to save profile (HTTP ${profileRes.status})`;
+        return;
+      }
+
+      const accountCredential = (document.getElementById('account_credential_ref')?.value || '').trim();
+      const accountEmail = (document.getElementById('account_email')?.value || '').trim();
+      const accountUsername = (document.getElementById('account_username')?.value || '').trim();
+      if (accountCredential && (accountEmail || accountUsername)) {
+        await apiFetch('/api/accounts', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(appendCaptchaToken({
+            retailer: document.getElementById('account_retailer')?.value || 'walmart',
+            username: accountUsername || null,
+            email: accountEmail || null,
+            encrypted_credential_ref: accountCredential,
+            session_status: 'logged_out',
+          })),
+        });
+      }
+
+      const paymentRef = (document.getElementById('payment_token_reference')?.value || '').trim();
+      if (paymentRef) {
+        await apiFetch('/api/payments', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(appendCaptchaToken({
+            label: (document.getElementById('payment_label')?.value || 'Primary payment').trim(),
+            provider: (document.getElementById('payment_provider')?.value || '').trim(),
+            token_reference: paymentRef,
+            billing_profile_id: profileData.id,
+          })),
+        });
+      }
+      showToast('Profile vault saved.');
+      await loadProfilesPanel();
+    }
+
 
     function selectedMonitorIds() {
       return Array.from(document.querySelectorAll('.monitor-select:checked')).map(x => Number(x.value));
@@ -1845,6 +2115,7 @@
     loadWorkspace();
     loadMeta();
     loadWebhooks();
+    loadProfilesPanel();
     loadMonitors();
     updateTaskModeFields();
     loadTasks();
