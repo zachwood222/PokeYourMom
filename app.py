@@ -4189,7 +4189,6 @@ def api_list_tasks():
                 "id": row["id"],
                 "workspace_id": row["workspace_id"],
                 "retailer": config.get("retailer"),
-                "category": config.get("category"),
                 "product_url": config.get("product_url"),
                 "profile": config.get("profile"),
                 "account": config.get("account"),
@@ -4588,12 +4587,6 @@ def api_update_monitor(monitor_id: int):
     if not row:
         conn.close()
         return jsonify({"error": "Monitor not found"}), 404
-    conn.execute(
-        "update monitors set enabled = ? where id = ? and workspace_id = ?",
-        (int(bool(enabled)), monitor_id, workspace_id),
-    )
-    conn.commit()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
     return jsonify(dict(row))
 
@@ -4716,6 +4709,18 @@ def api_checkout_task_attempts(task_id: int):
     ).fetchall()
     conn.close()
     return jsonify([dict(row) for row in attempts])
+
+
+@app.get("/api/checkout/tasks")
+@require_auth
+def api_list_checkout_tasks():
+    conn = db()
+    rows = conn.execute(
+        "select * from checkout_tasks where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_task_ui(row) for row in rows])
 
 
 @app.get("/api/checkout/tasks")
