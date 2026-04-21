@@ -4611,6 +4611,44 @@ def test_checkout_run_retries_payment_and_terminal_failure_taxonomy(tmp_path, mo
         headers=_auth_headers(),
     )
     monitor = create_monitor_resp.get_json()
+    conn = app_module.db()
+    now = app_module.utc_now()
+    profile_id = int(
+        conn.execute(
+            """
+            insert into checkout_profiles(workspace_id, name, email, phone, shipping_address_json, billing_address_json, created_at, updated_at)
+            values (1, 'profile-a', 'a@example.com', '5551112222', ?, ?, ?, ?)
+            """,
+            (json.dumps({"line1": "1 Main"}), json.dumps({"line1": "1 Main"}), now, now),
+        ).lastrowid
+    )
+    account_id = int(
+        conn.execute(
+            """
+            insert into retailer_accounts(workspace_id, retailer, username, email, encrypted_credential_ref, session_status, created_at, updated_at)
+            values (1, 'target', 'bound-user', 'bound@example.com', 'enc-ref', 'active', ?, ?)
+            """,
+            (now, now),
+        ).lastrowid
+    )
+    payment_id = int(
+        conn.execute(
+            """
+            insert into payment_methods(workspace_id, label, provider, token_reference, billing_profile_id, created_at, updated_at)
+            values (1, 'visa-bound', 'stripe', 'tok_test', ?, ?, ?)
+            """,
+            (profile_id, now, now),
+        ).lastrowid
+    )
+    conn.execute(
+        """
+        insert into task_profile_bindings(workspace_id, monitor_id, checkout_profile_id, retailer_account_id, payment_method_id, created_at, updated_at)
+        values (1, ?, ?, ?, ?, ?, ?)
+        """,
+        (monitor["id"], profile_id, account_id, payment_id, now, now),
+    )
+    conn.commit()
+    conn.close()
 
     create_task_resp = client.post(
         "/api/checkout/tasks",
@@ -4649,6 +4687,158 @@ def test_checkout_run_retries_payment_and_terminal_failure_taxonomy(tmp_path, mo
     ).fetchone()["c"]
     conn.close()
     assert payment_failures == app_module.CHECKOUT_STEP_RETRY_POLICY["payment"]["max_attempts"]
+
+
+def test_checkout_attempts_include_status_signal_and_hint_for_antibot(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    monitor = client.post(
+        "/api/monitors",
+        json={"retailer": "target", "product_url": "https://example.com/item-antibot", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
+    ).get_json()
+    conn = app_module.db()
+    now = app_module.utc_now()
+    profile_id = int(
+        conn.execute(
+            """
+            insert into checkout_profiles(workspace_id, name, email, phone, shipping_address_json, billing_address_json, created_at, updated_at)
+            values (1, 'profile-a', 'a@example.com', '5551112222', ?, ?, ?, ?)
+            """,
+            (json.dumps({"line1": "1 Main"}), json.dumps({"line1": "1 Main"}), now, now),
+        ).lastrowid
+    )
+    account_id = int(
+        conn.execute(
+            """
+            insert into retailer_accounts(workspace_id, retailer, username, email, encrypted_credential_ref, session_status, created_at, updated_at)
+            values (1, 'target', 'bound-user', 'bound@example.com', 'enc-ref', 'active', ?, ?)
+            """,
+            (now, now),
+        ).lastrowid
+    )
+    payment_id = int(
+        conn.execute(
+            """
+            insert into payment_methods(workspace_id, label, provider, token_reference, billing_profile_id, created_at, updated_at)
+            values (1, 'visa-bound', 'stripe', 'tok_test', ?, ?, ?)
+            """,
+            (profile_id, now, now),
+        ).lastrowid
+    )
+    conn.execute(
+        """
+        insert into task_profile_bindings(workspace_id, monitor_id, checkout_profile_id, retailer_account_id, payment_method_id, created_at, updated_at)
+        values (1, ?, ?, ?, ?, ?, ?)
+        """,
+        (monitor["id"], profile_id, account_id, payment_id, now, now),
+    )
+    conn.commit()
+    conn.close()
+    task = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor["id"],
+            "task_name": "Checkout DataDome",
+            "task_config": {
+                "retailer": "target",
+                "profile": "default-profile",
+                "account": "acc-primary",
+                "payment": "visa-4242",
+                "simulate_fail_step": "payment",
+                "simulate_fail_times": 1,
+                "simulate_retryable": True,
+                "simulate_fail_error": "DataDome challenge detected",
+            },
+        },
+        headers=_auth_headers(),
+    ).get_json()
+
+    run_resp = client.post(f"/api/checkout/tasks/{task['id']}/run", headers=_auth_headers())
+    assert run_resp.status_code == 200
+
+    attempts_resp = client.get(f"/api/checkout/tasks/{task['id']}/attempts", headers=_auth_headers())
+    assert attempts_resp.status_code == 200
+    attempts = attempts_resp.get_json()
+    payment_failure = next(a for a in attempts if a["state"] == "payment" and a["step"] == "step_failure")
+    assert payment_failure["details"]["status_signal"] == "antibot_datadome_challenge"
+    assert payment_failure["details"]["status_hint"] == "likely proxy reputation issue"
+    assert payment_failure["details"]["failure_reason"]["failure_class"] == "antibot"
+
+
+def test_checkout_antibot_group_limit_cooldown_short_circuits_retries(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    monitor = client.post(
+        "/api/monitors",
+        json={"retailer": "target", "product_url": "https://example.com/item-anti-limit", "poll_interval_seconds": 20},
+        headers=_auth_headers(),
+    ).get_json()
+    conn = app_module.db()
+    now = app_module.utc_now()
+    profile_id = int(
+        conn.execute(
+            """
+            insert into checkout_profiles(workspace_id, name, email, phone, shipping_address_json, billing_address_json, created_at, updated_at)
+            values (1, 'profile-a', 'a@example.com', '5551112222', ?, ?, ?, ?)
+            """,
+            (json.dumps({"line1": "1 Main"}), json.dumps({"line1": "1 Main"}), now, now),
+        ).lastrowid
+    )
+    account_id = int(
+        conn.execute(
+            """
+            insert into retailer_accounts(workspace_id, retailer, username, email, encrypted_credential_ref, session_status, created_at, updated_at)
+            values (1, 'target', 'bound-user', 'bound@example.com', 'enc-ref', 'active', ?, ?)
+            """,
+            (now, now),
+        ).lastrowid
+    )
+    payment_id = int(
+        conn.execute(
+            """
+            insert into payment_methods(workspace_id, label, provider, token_reference, billing_profile_id, created_at, updated_at)
+            values (1, 'visa-bound', 'stripe', 'tok_test', ?, ?, ?)
+            """,
+            (profile_id, now, now),
+        ).lastrowid
+    )
+    conn.execute(
+        """
+        insert into task_profile_bindings(workspace_id, monitor_id, checkout_profile_id, retailer_account_id, payment_method_id, created_at, updated_at)
+        values (1, ?, ?, ?, ?, ?, ?)
+        """,
+        (monitor["id"], profile_id, account_id, payment_id, now, now),
+    )
+    conn.commit()
+    conn.close()
+    task = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor["id"],
+            "task_name": "Checkout Anti Limit",
+            "task_config": {
+                "retailer": "target",
+                "profile": "default-profile",
+                "account": "acc-primary",
+                "payment": "visa-4242",
+                "simulate_fail_step": "payment",
+                "simulate_fail_times": 5,
+                "simulate_retryable": True,
+                "simulate_fail_error": "Incapsula challenge page",
+                "group_limits": {"max_retries": 4, "antibot_event_threshold": 1, "antibot_cooldown_seconds": 30},
+            },
+        },
+        headers=_auth_headers(),
+    ).get_json()
+
+    run_resp = client.post(f"/api/checkout/tasks/{task['id']}/run", headers=_auth_headers())
+    payload = run_resp.get_json()
+    assert run_resp.status_code == 200
+    assert payload["task"]["current_state"] == "failed"
+    assert "antibot cooldown active" in (payload["task"]["last_error"] or "")
 
 
 def test_checkout_run_uses_task_profile_bindings_for_execution_context(tmp_path, monkeypatch):

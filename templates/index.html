@@ -1438,7 +1438,10 @@
       const logs = document.getElementById('task_logs');
       logs.textContent = '';
       for (const attempt of attempts.slice().reverse()) {
-        logs.textContent += `[${attempt.created_at}] state=${attempt.state} step=${attempt.step || '-'} err=${attempt.error || '-'}\n`;
+        const details = attempt.details || {};
+        const statusSignal = details.status_signal ? ` status=${details.status_signal}` : '';
+        const statusHint = details.status_hint ? ` hint=${details.status_hint}` : '';
+        logs.textContent += `[${attempt.created_at}] state=${attempt.state} step=${attempt.step || '-'}${statusSignal}${statusHint} err=${attempt.error || '-'}\n`;
       }
       logs.scrollTop = logs.scrollHeight;
     }

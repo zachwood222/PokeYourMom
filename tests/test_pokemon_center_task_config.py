@@ -38,6 +38,8 @@ def test_pokemon_center_defaults_are_applied_for_pokemon_center_only(tmp_path, m
     assert normalized['product_quantity'] == 1
     assert normalized['wait_for_queue'] is False
     assert normalized['loop_checkout'] is False
+    assert normalized['group_limits']['antibot_event_threshold'] == 3
+    assert normalized['group_limits']['antibot_cooldown_seconds'] == 60
     assert normalized['products'][0]['skip_if_oos'] is False
 
     walmart_monitor = {'retailer': 'walmart', 'product_url': 'https://www.walmart.com/ip/1'}
