@@ -152,6 +152,24 @@
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { padding: 7px 8px; border-bottom: 1px solid #222e44; text-align: left; }
     thead th { color: #b1bfd5; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .task-table-scroller { max-height: 560px; overflow: auto; border: 1px solid #222e44; border-radius: 10px; }
+    .task-table-scroller table { margin: 0; }
+    .task-table-scroller thead th { position: sticky; top: 0; background: #111827; z-index: 3; }
+    .task-table-scroller td { min-height: 48px; vertical-align: middle; }
+    .status-chip-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 10px; }
+    .status-chip {
+      width: auto;
+      padding: 5px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      text-transform: lowercase;
+      letter-spacing: 0.02em;
+    }
+    .status-chip.active { border-color: #4f689b; background: #1b2741; color: #eef2ff; }
+    .task-table-toolbar { display: grid; grid-template-columns: 1fr 200px; gap: 10px; align-items: center; }
+    .task-bulk-actions { margin: 10px 0; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .task-bulk-actions > * { width: auto; }
+    .task-checkbox-col { width: 36px; }
 
     .logs {
       height: 400px;
@@ -778,6 +796,12 @@
     let loopRunning = false;
     let selectedTaskId = null;
     let taskMap = new Map();
+    let selectedTaskIds = new Set();
+    let taskStatusFilter = new Set();
+    let taskSortMode = 'id_desc';
+    const TASK_VIRTUALIZATION_THRESHOLD = 120;
+    const TASK_VIRTUAL_ROW_HEIGHT = 52;
+    const TASK_VIRTUAL_BUFFER = 8;
     const toArray = (value, key) => Array.isArray(value) ? value : (value && Array.isArray(value[key]) ? value[key] : []);
     function getCaptchaToken() {
       return (document.getElementById('captcha_token')?.value || "").trim();
@@ -1334,6 +1358,7 @@
       for (const task of rows) {
         const tr = document.createElement('tr');
         tr.innerHTML = `
+          <td><input type="checkbox" ${selectedTaskIds.has(task.id) ? 'checked' : ''} onchange="toggleTaskSelected(${task.id}, this.checked)" /></td>
           <td>${task.id}</td>
           <td><input type="checkbox" class="task-select" value="${task.id}" /></td>
           <td>${task.monitor_id || '-'}</td>
@@ -1353,6 +1378,13 @@
         `;
         tbody.appendChild(tr);
       }
+      if (useVirtualization) {
+        const bottomSpacer = document.createElement('tr');
+        bottomSpacer.innerHTML = `<td colspan="9" style="height:${Math.max(0, (rows.length - end) * TASK_VIRTUAL_ROW_HEIGHT)}px; padding:0; border:0;"></td>`;
+        tbody.appendChild(bottomSpacer);
+      }
+      renderStatusChips();
+      updateTaskSelectionSummary();
     }
 
     async function startAllTasks() {
