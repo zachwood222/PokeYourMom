@@ -6,8 +6,6 @@ from dataclasses import dataclass
 from typing import Any
 
 RETAILER_ALIASES = {
-    "walmart.com": "walmart",
-    "walmart com": "walmart",
     "wal-mart": "walmart",
     "wal mart": "walmart",
     "target.com": "target",
@@ -22,6 +20,8 @@ RETAILER_ALIASES = {
 }
 
 TaskContext = dict[str, Any]
+DEFAULT_CATEGORY = "pokemon"
+SUPPORTED_CATEGORIES = {"pokemon", "sports_cards", "one_piece", "lorcana"}
 
 
 @dataclass
@@ -35,6 +35,7 @@ class MonitorResult:
     keyword_matched: bool | None = None
     price_within_limit: bool | None = None
     within_msrp_delta: bool | None = None
+    queue_detected: bool = False
 
 
 def extract_price_cents(text: str) -> int | None:
@@ -155,11 +156,33 @@ class PokemonCenterAdapter(DefaultRetailerAdapter):
         html = task_ctx["html"]
         title, text = _parse_common_title_and_text(html)
         result = default_parser(html, keyword=task_ctx.get("keyword"))
-        out_markers = ["notify me when available", "currently unavailable"]
+        category = (task_ctx.get("category") or DEFAULT_CATEGORY).strip().lower()
+        out_markers = [
+            "notify me when available",
+            "currently unavailable",
+        ]
         in_markers = ["add to bag"]
+        if category == "one_piece":
+            out_markers.append("this item is unavailable in your region")
+        if category == "lorcana":
+            in_markers.append("preorder")
+        queue_markers = [
+            "queue-it.net",
+            "queue-it",
+            "virtual waiting room",
+            "you are now in line",
+            "estimated wait time",
+        ]
+        has_queue = any(m in text for m in queue_markers)
+        result.queue_detected = has_queue
         has_out = any(m in text for m in out_markers)
         has_in = any(m in text for m in in_markers)
-        if has_out:
+        if has_queue:
+            result.in_stock = False
+            result.status_text = "queue_detected"
+            result.availability_reason = "pokemoncenter_queue_detected"
+            result.parser_confidence = 0.99
+        elif has_out:
             result.in_stock = False
             result.status_text = "out_or_unknown"
             result.availability_reason = "pokemoncenter_marker_out_of_stock"
@@ -169,6 +192,14 @@ class PokemonCenterAdapter(DefaultRetailerAdapter):
             result.status_text = "in_stock"
             result.availability_reason = "pokemoncenter_marker_in_stock"
             result.parser_confidence = 0.98
+        if category == "lorcana":
+            price_match = re.search(r'"price"\s*:\s*"?(\d{1,4}(?:\.\d{2})?)"?', text)
+            if price_match:
+                result.price_cents = int(round(float(price_match.group(1)) * 100))
+            elif result.price_cents is None:
+                result.price_cents = extract_price_cents(html)
+        else:
+            result.price_cents = extract_price_cents(html)
         result.title = title
         return result
 
@@ -206,6 +237,7 @@ class TargetAdapter(DefaultRetailerAdapter):
         html = task_ctx["html"]
         title, text = _parse_common_title_and_text(html)
         result = default_parser(html, keyword=task_ctx.get("keyword"))
+        category = (task_ctx.get("category") or DEFAULT_CATEGORY).strip().lower()
 
         in_markers = [
             '"availability":"instock"',
@@ -223,6 +255,14 @@ class TargetAdapter(DefaultRetailerAdapter):
             "unavailable",
             "currently unavailable online",
         ]
+        if category == "sports_cards":
+            in_markers.extend(["same day delivery", "shipping available"])
+        elif category == "one_piece":
+            in_markers.append("choose store")
+            out_markers.append("limited availability")
+        elif category == "lorcana":
+            in_markers.append("preorder")
+            out_markers.append("release date pending")
         has_in = any(marker in text for marker in in_markers)
         has_out = any(marker in text for marker in out_markers)
 
@@ -236,8 +276,14 @@ class TargetAdapter(DefaultRetailerAdapter):
             result.status_text = "in_stock"
             result.availability_reason = "target_marker_in_stock"
             result.parser_confidence = 0.98
-
-        result.price_cents = extract_price_cents(html)
+        if category == "sports_cards":
+            deal_price_match = re.search(r'"current_retail"\s*:\s*"?(\d{1,4}(?:\.\d{2})?)"?', text)
+            if deal_price_match:
+                result.price_cents = int(round(float(deal_price_match.group(1)) * 100))
+            else:
+                result.price_cents = extract_price_cents(html)
+        else:
+            result.price_cents = extract_price_cents(html)
         result.title = title
         return result
 
