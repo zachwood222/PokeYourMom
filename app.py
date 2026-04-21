@@ -1986,6 +1986,13 @@ def _resolve_monitor_input(
     return canonical_url, parsed_products
 
 
+def normalize_monitor_assist_pid(raw_pid: str) -> str:
+    digits = re.sub(r"\D+", "", str(raw_pid or ""))
+    if len(digits) != 10:
+        raise ValueError("PID must contain exactly 10 digits")
+    return f"{digits[:2]}-{digits[2:7]}-{digits[7:]}"
+
+
 def _normalize_plan_hint(value: str | None) -> str:
     if not value:
         return ""
@@ -4909,6 +4916,107 @@ def api_list_monitors():
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/monitors/monitor-assist/apply")
+@require_auth
+def api_apply_monitor_assist_pid():
+    body = request.json or {}
+    raw_monitor_ids = body.get("monitor_ids")
+    if not isinstance(raw_monitor_ids, list) or not raw_monitor_ids:
+        return jsonify({"error": "monitor_ids must be a non-empty list"}), 400
+    try:
+        monitor_ids = sorted({int(value) for value in raw_monitor_ids})
+    except (TypeError, ValueError):
+        return jsonify({"error": "monitor_ids must contain valid integers"}), 400
+
+    try:
+        pid = normalize_monitor_assist_pid(str(body.get("pid") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    product_url = f"https://www.pokemoncenter.com/product/{pid}"
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    placeholders = ",".join(["?"] * len(monitor_ids))
+    monitor_rows = conn.execute(
+        f"""
+        select id, retailer, product_url
+        from monitors
+        where workspace_id = ?
+          and id in ({placeholders})
+        """,
+        (workspace_id, *monitor_ids),
+    ).fetchall()
+    if not monitor_rows:
+        conn.close()
+        return jsonify({"error": "No matching monitors found"}), 404
+
+    eligible_monitor_ids = [row["id"] for row in monitor_rows if (row["retailer"] or "").strip().lower() == "pokemoncenter"]
+    if not eligible_monitor_ids:
+        conn.close()
+        return jsonify({"error": "Monitor assist currently supports pokemoncenter monitors only"}), 400
+
+    eligible_placeholders = ",".join(["?"] * len(eligible_monitor_ids))
+    conn.execute(
+        f"""
+        update monitors
+        set product_url = ?
+        where workspace_id = ?
+          and id in ({eligible_placeholders})
+        """,
+        (product_url, workspace_id, *eligible_monitor_ids),
+    )
+
+    task_rows = conn.execute(
+        f"""
+        select id, monitor_id, current_state
+        from checkout_tasks
+        where workspace_id = ?
+          and monitor_id in ({eligible_placeholders})
+        """,
+        (workspace_id, *eligible_monitor_ids),
+    ).fetchall()
+    for task in task_rows:
+        details = {
+            "event": "monitor_assist_pid_apply",
+            "pid": pid,
+            "product_url": product_url,
+            "source": "monitor_assist",
+        }
+        record_checkout_attempt(
+            conn,
+            task_id=int(task["id"]),
+            workspace_id=workspace_id,
+            monitor_id=int(task["monitor_id"]),
+            state=str(task["current_state"] or "queued"),
+            status="PID updated from monitor assist",
+            details=details,
+            error_text="PID updated from monitor assist",
+        )
+        record_task_log(
+            conn,
+            task_id=int(task["id"]),
+            workspace_id=workspace_id,
+            monitor_id=int(task["monitor_id"]),
+            level="info",
+            event_type="monitor_assist",
+            message="PID updated from monitor assist",
+            payload=details,
+        )
+
+    conn.commit()
+    conn.close()
+    return jsonify(
+        {
+            "ok": True,
+            "pid": pid,
+            "product_url": product_url,
+            "updated_monitors": len(eligible_monitor_ids),
+            "updated_tasks": len(task_rows),
+            "monitor_ids": eligible_monitor_ids,
+        }
+    )
 
 
 def get_monitor_for_workspace(
