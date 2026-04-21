@@ -722,32 +722,48 @@
     }
 
     async function createTask() {
-      const monitorField = document.getElementById('task_monitor_id');
-      const taskNameField = document.getElementById('task_name');
-      const monitorIdRaw = monitorField?.value || '';
-      const monitorId = Number(monitorIdRaw);
-      if (!Number.isInteger(monitorId) || monitorId <= 0) {
-        alert('Select a valid monitor before creating a task.');
-        return;
-      }
-      const taskName = (taskNameField?.value || '').trim();
+      const monitorId = (document.getElementById('task_monitor_id')?.value || '').trim();
+      const taskName = (document.getElementById('task_name')?.value || '').trim();
 
-      const res = await apiFetch('/api/checkout/tasks', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(appendCaptchaToken({
-          monitor_id: monitorId,
-          task_name: taskName || `Monitor ${monitorId} task`,
-          initial_state: 'queued',
-        }))
-      });
-      const data = await res.json();
-      if (data.error) {
-        alert(data.error);
+      if (!monitorId) {
+        alert('Select a monitor before creating a task.');
         return;
       }
-      await loadTasks();
-      selectTask(data.id);
+
+      const payload = {
+        monitor_id: monitorId,
+        initial_state: 'queued',
+      };
+
+      if (taskName) {
+        payload.task_name = taskName;
+      }
+
+      try {
+        const res = await apiFetch('/api/checkout/tasks', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(appendCaptchaToken(payload))
+        });
+
+        let data = null;
+        try {
+          data = await res.json();
+        } catch (error) {
+          alert(`Failed to parse task API response: ${error?.message || error}`);
+          return;
+        }
+
+        if (!res.ok || data?.error) {
+          alert(data?.error || `Failed to create task (HTTP ${res.status}).`);
+          return;
+        }
+
+        await loadTasks();
+        selectTask(data.id);
+      } catch (error) {
+        alert(`Failed to create task due to a network or fetch error: ${error?.message || error}`);
+      }
     }
 
     function taskErrorLabel(value) {
