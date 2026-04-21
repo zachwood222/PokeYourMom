@@ -4883,3 +4883,103 @@ def test_worker_loop_idles_when_no_jobs_available(tmp_path, monkeypatch):
     app_module.worker_loop()
 
     assert sleep_calls["count"] == 1
+
+
+def test_webhook_test_endpoint_resolves_secret_backed_webhook_url(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    captured = {}
+    resolved_url = "https://discord.com/api/webhooks/secret-test-endpoint"
+
+    class DummyResponse:
+        status_code = 204
+        text = ""
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    secret_id = app_module.create_secret(conn, 1, "webhook_url", resolved_url, 1)
+    redacted_url = app_module.redact_webhook_url(resolved_url)
+    cur = conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, webhook_secret_id, created_at)
+        values (1, 'Secret Main', ?, ?, ?)
+        """,
+        (redacted_url, secret_id, app_module.utc_now()),
+    )
+    webhook_id = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+
+    test_resp = client.post(f"/api/webhooks/{webhook_id}/test", headers=_auth_headers())
+    list_resp = client.get("/api/webhooks", headers=_auth_headers())
+
+    assert test_resp.status_code == 200
+    assert captured["url"] == resolved_url
+    assert list_resp.status_code == 200
+    assert list_resp.get_json()[0]["webhook_url"] == redacted_url
+
+
+def test_create_event_and_deliver_resolves_secret_backed_webhook_url(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    captured = {}
+    resolved_url = "https://discord.com/api/webhooks/secret-delivery"
+
+    class DummyResponse:
+        status_code = 204
+        text = ""
+        ok = True
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/secret-monitor', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor = conn.execute("select * from monitors order by id desc limit 1").fetchone()
+    secret_id = app_module.create_secret(conn, 1, "webhook_url", resolved_url, 1)
+    conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, webhook_secret_id, created_at)
+        values (1, 'Secret Delivery', ?, ?, ?)
+        """,
+        (app_module.redact_webhook_url(resolved_url), secret_id, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    result = app_module.MonitorResult(
+        in_stock=True,
+        price_cents=1999,
+        title="Pokemon Secret Product",
+        status_text="in_stock",
+        keyword_matched=True,
+    )
+    app_module.create_event_and_deliver(monitor, result, eligible=True)
+
+    assert captured["task_key"].startswith("webhook-")
+    assert captured["url"] == resolved_url
