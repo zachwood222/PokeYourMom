@@ -321,7 +321,31 @@
     }
 
     .warn { color: #f7b955; font-size: 13px; }
+    .helper-text { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.35; }
     .inline-error { color: #ff8e8e; font-size: 12px; margin-top: 8px; }
+    .inline-warn { color: #f7b955; font-size: 12px; margin-top: 8px; }
+    .summary-panel {
+      margin-top: 10px;
+      border: 1px solid #2a3856;
+      border-radius: 10px;
+      background: rgba(14, 19, 30, 0.75);
+      padding: 10px;
+    }
+    .summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .summary-item { font-size: 12px; color: #cbd6ea; }
+    .summary-item strong { display: block; font-size: 11px; text-transform: uppercase; color: var(--muted); letter-spacing: .04em; margin-bottom: 4px; }
+    .stepper { display: flex; align-items: center; gap: 6px; }
+    .stepper button { width: 38px; padding: 8px; }
+    .modal-footer {
+      position: sticky;
+      bottom: -14px;
+      margin: 14px -14px -14px;
+      padding: 12px 14px;
+      border-top: 1px solid #2a3856;
+      border-bottom-left-radius: 12px;
+      border-bottom-right-radius: 12px;
+      background: linear-gradient(180deg, rgba(18,24,35,.96), rgba(12,16,24,.98));
+    }
     .config-warn {
       display: none;
       margin: 16px;
@@ -509,11 +533,17 @@
           </div>
           <button class="btn-primary" style="margin-top:10px;" onclick="createTask()">Create Task</button>
           <div id="create_task_error" class="inline-error"></div>
-          <button style="margin-top:10px;" onclick="createTask()">Create Task</button>
+          <div class="modal-footer">
+            <button id="create_task_btn" onclick="createTask()" disabled>Create (1)</button>
+          </div>
         </div>
 
         <div class="card detail-section">
           <h2 class="section-title">Live Task Table</h2>
+          <div class="actions" style="margin-bottom:10px;">
+            <button onclick="bulkStopRunningGroup()">Bulk Stop Running Group</button>
+            <button onclick="deleteAllMonitors()">Delete All Monitors</button>
+          </div>
           <table>
             <thead><tr><th>ID</th><th>Monitor</th><th>Retailer</th><th>State</th><th>Last Transition</th><th>Last Error</th><th>Actions</th></tr></thead>
             <tbody id="tasks"></tbody>
@@ -559,6 +589,7 @@
             </div>
             <label class="small">Product URL</label>
             <input id="product_url" placeholder="https://www.walmart.com/ip/..." />
+            <p class="helper-text">Monitor input examples: URL, PID <code>12-34567-890</code>, or <code>placeholder</code>.</p>
             <div class="row" style="margin-top: 10px;">
               <div>
                 <label class="small">Keyword Filter</label>
@@ -898,15 +929,12 @@
       if (monitorErrorEl) monitorErrorEl.textContent = monitorValidationError || '';
       if (monitorValidationError) return;
 
-      const maxPrice = document.getElementById('max_price_cents').value;
-      const msrp = document.getElementById('msrp_cents').value;
       const retailerEl = document.getElementById('retailer');
       const productUrlEl = document.getElementById('product_url');
       const pollIntervalEl = document.getElementById('poll_interval');
       const keywordEl = document.getElementById('keyword');
       const maxPriceEl = document.getElementById('max_price_cents');
       const msrpEl = document.getElementById('msrp_cents');
-
       const maxPrice = maxPriceEl?.value || '';
       const msrp = msrpEl?.value || '';
       const pollIntervalRaw = (pollIntervalEl?.value || '').trim();
@@ -952,78 +980,126 @@
     }
 
     async function createTask() {
-      const monitorId = (document.getElementById('task_monitor_id')?.value || '').trim();
+      const monitorIdRaw = (document.getElementById('task_monitor_id')?.value || '').trim();
       const taskName = (document.getElementById('task_name')?.value || '').trim();
-
-      if (!monitorId) {
-        alert('Select a monitor before creating a task.');
-      const taskInput = document.getElementById('task_url')?.value || '';
-      const taskValidationError = validateMonitorInputClient(taskInput, {isEditFlow: false, existingProductCount: 0});
+      const taskCount = clampTaskCount(document.getElementById('task_count')?.value || '1');
+      const taskInput = document.getElementById('task_products')?.value || '';
+      const taskValidationError = taskInput.trim()
+        ? validateMonitorInputClient(taskInput, {isEditFlow: false, existingProductCount: 0})
+        : null;
       const taskErrorEl = document.getElementById('create_task_error');
       if (taskErrorEl) taskErrorEl.textContent = taskValidationError || '';
       if (taskValidationError) return;
-
-      const taskPayload = {
-        retailer: document.getElementById('task_retailer').value,
-        product_url: document.getElementById('task_url').value,
-        profile: document.getElementById('task_profile').value,
-        account: document.getElementById('task_account').value,
-        payment: document.getElementById('task_payment').value,
-      };
-
-      const monitorPayload = {
-        retailer: taskPayload.retailer,
-        product_url: taskPayload.product_url,
-        poll_interval_seconds: Number(document.getElementById('poll_interval').value),
-      };
-      const monitorRes = await apiFetch('/api/monitors', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(monitorPayload))
-      });
-      const monitor = await monitorRes.json();
-      if (monitor.error) {
-        alert(monitor.error);
-      const monitorField = document.getElementById('task_monitor_id');
-      const taskNameField = document.getElementById('task_name');
-      const monitorIdRaw = monitorField?.value || '';
       const monitorId = Number(monitorIdRaw);
       if (!Number.isInteger(monitorId) || monitorId <= 0) {
         alert('Select a valid monitor before creating a task.');
         return;
       }
 
-      const payload = {
+      const mode = (document.getElementById('task_mode')?.value || 'default').trim();
+      const profileGroup = (document.getElementById('task_profile_group')?.value || '').trim();
+      const proxyGroup = (document.getElementById('task_proxy_group')?.value || '').trim();
+      const queueDelayRaw = (document.getElementById('task_queue_entry_delay_ms')?.value || '').trim();
+      const promoCode = (document.getElementById('task_promo_code')?.value || '').trim();
+      const payloadBase = {
         monitor_id: monitorId,
         initial_state: 'queued',
+        task_config: {
+          mode,
+          profile_group: profileGroup || null,
+          proxy_group: proxyGroup || null,
+          queue_entry_delay_ms: queueDelayRaw === '' ? null : Number(queueDelayRaw),
+          promo_code: promoCode || null,
+        }
       };
 
       if (taskName) {
-        payload.task_name = taskName;
+        payloadBase.task_name = taskName;
+      }
+      if (taskInput.trim()) {
+        payloadBase.task_config.products = parseProductsForTaskConfig(taskInput);
       }
 
       try {
-        const res = await apiFetch('/api/checkout/tasks', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(appendCaptchaToken(payload))
-        });
-
-        let data = null;
-        try {
-          data = await res.json();
-        } catch (error) {
-          alert(`Failed to parse task API response: ${error?.message || error}`);
-          return;
-        }
-
-        if (!res.ok || data?.error) {
-          alert(data?.error || `Failed to create task (HTTP ${res.status}).`);
-          return;
+        for (let i = 0; i < taskCount; i++) {
+          const taskPayload = structuredClone(payloadBase);
+          if (taskName && taskCount > 1) {
+            taskPayload.task_name = `${taskName} (${i + 1}/${taskCount})`;
+          }
+          const res = await apiFetch('/api/checkout/tasks', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(appendCaptchaToken(taskPayload))
+          });
+          const data = await res.json();
+          if (!res.ok || data?.error) {
+            alert(data?.error || `Failed to create task (HTTP ${res.status}).`);
+            break;
+          }
         }
 
         await loadTasks();
-        selectTask(data.id);
+        updateTaskCreateSummary();
       } catch (error) {
         alert(`Failed to create task due to a network or fetch error: ${error?.message || error}`);
+      }
+    }
+
+    function parseProductsForTaskConfig(rawInput) {
+      const value = (rawInput || '').trim();
+      if (!value) return [];
+      if (value.toLowerCase() === 'placeholder') return [{pid: 'placeholder', quantity: 1}];
+      if (value.startsWith('http://') || value.startsWith('https://')) return [{url: value, quantity: 1}];
+      return value.split(',').map((segment) => {
+        const [pidRaw, qtyRaw] = segment.trim().split(':');
+        return {pid: (pidRaw || '').trim(), quantity: qtyRaw ? Number(qtyRaw.trim()) : 1};
+      });
+    }
+
+    function clampTaskCount(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return 1;
+      return Math.max(1, Math.min(100, Math.floor(n)));
+    }
+
+    function adjustTaskCount(delta) {
+      const input = document.getElementById('task_count');
+      if (!input) return;
+      input.value = String(clampTaskCount(Number(input.value || 1) + delta));
+      updateTaskCreateSummary();
+    }
+
+    function isValidPromoCode(promoCode) {
+      if (!promoCode) return true;
+      return /^[A-Z0-9_-]{4,20}$/i.test(promoCode);
+    }
+
+    function updateTaskCreateSummary() {
+      const taskCount = clampTaskCount(document.getElementById('task_count')?.value || '1');
+      const mode = (document.getElementById('task_mode')?.value || 'default').trim();
+      const productInput = (document.getElementById('task_products')?.value || '').trim();
+      const profileGroup = (document.getElementById('task_profile_group')?.value || '').trim();
+      const proxyGroup = (document.getElementById('task_proxy_group')?.value || '').trim();
+      const monitorId = (document.getElementById('task_monitor_id')?.value || '').trim();
+      const promoCode = (document.getElementById('task_promo_code')?.value || '').trim();
+      const createBtn = document.getElementById('create_task_btn');
+      const promoWarning = document.getElementById('task_promo_warning');
+      const taskErrorEl = document.getElementById('create_task_error');
+      const productError = productInput ? validateMonitorInputClient(productInput, {isEditFlow: false, existingProductCount: 0}) : null;
+      const promoOk = isValidPromoCode(promoCode);
+
+      document.getElementById('summary_task_count').textContent = String(taskCount);
+      document.getElementById('summary_mode').textContent = mode || 'default';
+      document.getElementById('summary_products').textContent = productInput || 'monitor default';
+      document.getElementById('summary_profile_group').textContent = profileGroup || '-';
+      document.getElementById('summary_proxy_group').textContent = proxyGroup || '-';
+      if (promoWarning) promoWarning.textContent = promoOk ? '' : 'Promo code appears invalid and may be rejected at checkout.';
+      if (taskErrorEl) taskErrorEl.textContent = productError || '';
+
+      const valid = Boolean(monitorId) && !productError && promoOk && taskCount >= 1;
+      if (createBtn) {
+        createBtn.textContent = `Create (${taskCount})`;
+        createBtn.disabled = !valid;
       }
     }
 
@@ -1369,6 +1445,43 @@
       await loadDashboardSummary();
     }
 
+    async function deleteAllMonitors() {
+      const monitorRows = await apiFetch('/api/monitors').then(r => r.json()).catch(() => []);
+      if (!Array.isArray(monitorRows) || !monitorRows.length) {
+        alert('No monitors to delete.');
+        return;
+      }
+      const confirmed = confirm(`Delete all ${monitorRows.length} monitors? This cannot be undone.`);
+      if (!confirmed) return;
+      for (const monitor of monitorRows) {
+        await apiFetch(`/api/monitors/${monitor.id}`, {method: 'DELETE'});
+      }
+      await loadMonitors();
+      await loadDashboardSummary();
+    }
+
+    async function bulkStopRunningGroup() {
+      const groupMonitorId = Number((document.getElementById('task_monitor_id')?.value || '').trim());
+      if (!Number.isInteger(groupMonitorId) || groupMonitorId <= 0) {
+        alert('Select a monitor/group first.');
+        return;
+      }
+      const tasks = await apiFetch('/api/checkout/tasks').then(r => r.json()).catch(() => []);
+      const running = (Array.isArray(tasks) ? tasks : []).filter(t =>
+        Number(t.monitor_id) === groupMonitorId && ['monitoring', 'carting', 'shipping', 'payment', 'submitting'].includes(String(t.current_state || '').toLowerCase())
+      );
+      if (!running.length) {
+        alert('No running tasks found for that group.');
+        return;
+      }
+      const confirmed = confirm(`Stop ${running.length} running task(s) for monitor/group ${groupMonitorId}?`);
+      if (!confirmed) return;
+      for (const task of running) {
+        await apiFetch(`/api/checkout/tasks/${task.id}/stop`, {method: 'POST'});
+      }
+      await loadTasks();
+    }
+
     async function toggleLoop() {
       const endpoint = loopRunning ? '/api/stop' : '/api/start';
       await apiFetch(endpoint, {method: 'POST'});
@@ -1389,6 +1502,29 @@
     }
 
     renderApiAuthWarning();
+    ['task_monitor_id', 'task_name', 'task_count', 'task_mode', 'task_products', 'task_profile_group', 'task_proxy_group', 'task_queue_entry_delay_ms', 'task_promo_code']
+      .forEach((id) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('input', updateTaskCreateSummary);
+        el.addEventListener('change', updateTaskCreateSummary);
+        el.addEventListener('keydown', async (event) => {
+          if (event.key === 'ArrowUp' && id === 'task_count') {
+            event.preventDefault();
+            adjustTaskCount(1);
+          } else if (event.key === 'ArrowDown' && id === 'task_count') {
+            event.preventDefault();
+            adjustTaskCount(-1);
+          } else if (event.key === 'Enter' && !event.shiftKey) {
+            event.preventDefault();
+            const createBtn = document.getElementById('create_task_btn');
+            if (createBtn && !createBtn.disabled) {
+              await createTask();
+            }
+          }
+        });
+      });
+    updateTaskCreateSummary();
     loadWorkspace();
     loadMeta();
     loadWebhooks();
