@@ -13,6 +13,7 @@
       --surface: #10151f;
       --surface-soft: #151b27;
       --surface-border: #1d2634;
+      --radius-md: 10px;
       --text: #e9edf5;
       --muted: #8d9bb0;
       --accent: #5d7cff;
@@ -87,9 +88,9 @@
     .card {
       background: linear-gradient(180deg, rgba(19, 25, 36, 0.95), rgba(13, 17, 25, 0.95));
       border: 1px solid var(--surface-border);
-      border-radius: 12px;
-      padding: 14px;
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
+      border-radius: var(--radius-md);
+      padding: 12px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 4px 12px rgba(4, 8, 16, 0.24);
     }
 
     .header-card {
@@ -98,49 +99,58 @@
     }
 
     .section-title {
-      margin: 0 0 10px;
+      margin: 0 0 8px;
       font-size: 13px;
       text-transform: uppercase;
       letter-spacing: 0.1em;
-      color: #d4def1;
+      color: #dbe5f7;
+      background: linear-gradient(180deg, rgba(42, 54, 82, 0.35), rgba(30, 40, 62, 0.24));
+      border: 1px solid rgba(83, 105, 147, 0.55);
+      border-radius: var(--radius-md);
+      display: inline-flex;
+      align-items: center;
+      min-height: 26px;
+      padding: 0 10px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
     }
 
     .hero-title { margin: 0; font-size: 24px; }
-    .subtitle, .small { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+    .subtitle, .small { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
 
     .tab { display: none; }
     .tab.active { display: block; }
 
     .content { min-width: 0; }
     .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-    .kpi-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-    .kpi-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 8px; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .kpi-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 6px; }
     .kpi-value { font-size: 22px; font-weight: 700; }
     .status-value { color: var(--ok); font-size: 24px; font-weight: 700; letter-spacing: 0.05em; }
 
-    h1, h2, h3 { margin: 0 0 10px; }
+    h1, h2, h3 { margin: 0 0 8px; }
     h1 { font-size: 21px; }
     h2 { font-size: 16px; color: #e5ecf8; }
     h3 { font-size: 14px; color: #dce5f7; }
 
-    label { display: block; margin: 8px 0 4px; font-size: 12px; color: #9fb0c7; }
+    label { display: block; margin: 6px 0 4px; font-size: 12px; color: #9fb0c7; }
     input, select, button {
       width: 100%;
-      padding: 9px 10px;
-      border-radius: 8px;
+      padding: 8px 10px;
+      border-radius: var(--radius-md);
       border: 1px solid #233049;
       background: var(--surface-soft);
       color: var(--text);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
     }
     button { cursor: pointer; font-weight: 600; }
     button:hover { border-color: #4f689b; }
 
-    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .actions { display: flex; gap: 6px; flex-wrap: wrap; }
     .actions button { width: auto; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { padding: 8px; border-bottom: 1px solid #222e44; text-align: left; }
+    th, td { padding: 7px 8px; border-bottom: 1px solid #222e44; text-align: left; }
     thead th { color: #b1bfd5; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
 
     .logs {
@@ -149,10 +159,11 @@
       white-space: pre-wrap;
       background: #0a0f17;
       border: 1px solid #222e44;
-      border-radius: 8px;
-      padding: 10px;
+      border-radius: var(--radius-md);
+      padding: 9px;
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 12px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
     }
     .task-log-panel { height: 280px; }
     .pill {
@@ -315,13 +326,30 @@
       display: none;
       margin: 16px;
       padding: 12px 14px;
-      border-radius: 10px;
+      border-radius: var(--radius-md);
       border: 1px solid #7a3f2b;
       background: rgba(152, 67, 42, 0.2);
       color: #ffd9cb;
       font-size: 13px;
       line-height: 1.45;
     }
+    .state-pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: var(--radius-md);
+      border: 1px solid transparent;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .state-running, .state-monitoring, .state-submitting { background: rgba(93,124,255,0.15); border-color: rgba(93,124,255,0.35); color: #bcd0ff; }
+    .state-queued, .state-idle, .state-paused, .state-stopped { background: rgba(121,136,164,0.12); border-color: rgba(121,136,164,0.28); color: #c9d3e6; }
+    .state-success { background: rgba(111,242,188,0.14); border-color: rgba(111,242,188,0.3); color: #9ff6d2; }
+    .state-failed { background: rgba(248,111,111,0.14); border-color: rgba(248,111,111,0.35); color: #ffc0c0; }
+    .task-summary-grid { margin-top: 12px; }
+    .detail-section { margin-top: 12px; }
     .config-warn.show { display: block; }
 
     @media (max-width: 1080px) {
@@ -443,6 +471,12 @@
 
       <section id="tab-monitors" class="tab">
         <h1>Task Controls</h1>
+        <div class="kpi-grid task-summary-grid">
+          <div class="card"><div class="kpi-label">Total Tasks</div><div id="task_kpi_total" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Active</div><div id="task_kpi_active" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Queued</div><div id="task_kpi_queued" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Failed</div><div id="task_kpi_failed" class="kpi-value">0</div></div>
+        </div>
         <div class="card">
           <h2 class="section-title">Task Overview</h2>
           <div class="metric-row">
@@ -478,7 +512,7 @@
           <button style="margin-top:10px;" onclick="createTask()">Create Task</button>
         </div>
 
-        <div class="card" style="margin-top:14px;">
+        <div class="card detail-section">
           <h2 class="section-title">Live Task Table</h2>
           <table>
             <thead><tr><th>ID</th><th>Monitor</th><th>Retailer</th><th>State</th><th>Last Transition</th><th>Last Error</th><th>Actions</th></tr></thead>
@@ -486,12 +520,13 @@
           </table>
         </div>
 
-        <div class="card" style="margin-top:14px;">
+        <div class="card detail-section">
           <h2 class="section-title">Per-Task Log Panel</h2>
           <div class="small" id="task_log_title">Select a task to inspect attempts.</div>
           <div id="task_logs" class="logs task-log-panel"></div>
         </div>
 
+        <div class="card detail-section">
         <div class="card task-card">
           <div class="task-card-header">
             <div>
@@ -578,7 +613,7 @@
           </div>
         </div>
 
-        <div class="card" style="margin-top:14px;">
+        <div class="card detail-section">
           <h2 class="section-title">Monitor List</h2>
           <table>
             <thead><tr><th>ID</th><th>Select</th><th>Retailer</th><th>URL</th><th>Last Checked</th><th>Last Alert State</th><th>Actions</th></tr></thead>
@@ -1022,6 +1057,10 @@
       return value ? value : '-';
     }
 
+    function statePill(state) {
+      const normalized = String(state || 'unknown').toLowerCase();
+      const safeText = normalized.replace(/[^a-z0-9_-]/g, '_');
+      return `<span class="state-pill state-${safeText}">${normalized}</span>`;
     function taskStateTone(state) {
       const normalized = (state || '').toLowerCase();
       if (['success', 'verification_code_received'].includes(normalized)) return 'success';
@@ -1060,6 +1099,18 @@
       const tbody = document.getElementById('tasks');
       tbody.innerHTML = '';
       const rows = Array.from(taskMap.values()).sort((a, b) => b.id - a.id);
+      const total = rows.length;
+      const active = rows.filter((task) => !['stopped', 'success', 'failed'].includes(String(task.state || '').toLowerCase())).length;
+      const queued = rows.filter((task) => String(task.state || '').toLowerCase() === 'queued').length;
+      const failed = rows.filter((task) => String(task.state || '').toLowerCase() === 'failed').length;
+      const kpiTotal = document.getElementById('task_kpi_total');
+      const kpiActive = document.getElementById('task_kpi_active');
+      const kpiQueued = document.getElementById('task_kpi_queued');
+      const kpiFailed = document.getElementById('task_kpi_failed');
+      if (kpiTotal) kpiTotal.textContent = String(total);
+      if (kpiActive) kpiActive.textContent = String(active);
+      if (kpiQueued) kpiQueued.textContent = String(queued);
+      if (kpiFailed) kpiFailed.textContent = String(failed);
       renderTaskMetrics(rows);
       for (const task of rows) {
         const tr = document.createElement('tr');
@@ -1067,6 +1118,7 @@
           <td>${task.id}</td>
           <td>${task.monitor_id || '-'}</td>
           <td>${task.retailer}</td>
+          <td>${statePill(task.state)}</td>
           <td>${renderStatusBadge(task.state)}</td>
           <td>${task.last_transition_at || '-'}</td>
           <td>${taskErrorLabel(task.last_error)}</td>
