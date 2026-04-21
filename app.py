@@ -3056,13 +3056,6 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
     return done
 
 
-def enqueue_checkout_for_monitor(
-    monitor: sqlite3.Row, result: MonitorResult, *, reason: str = "in_stock_detected"
-) -> int | None:
-    if not result.in_stock:
-        return None
-    conn = db()
-    existing = conn.execute(
 def create_secret(
     conn: sqlite3.Connection,
     workspace_id: int,
