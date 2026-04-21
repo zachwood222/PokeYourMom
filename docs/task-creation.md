@@ -55,10 +55,45 @@ curl -X POST http://localhost:5000/api/checkout/tasks \
       "product_url": "https://www.target.com/p/example",
       "profile": "profile-main",
       "account": "acc-primary",
-      "payment": "visa-ending-4242"
+      "payment": "visa-ending-4242",
+      "site": "us",
+      "mode": "default",
+      "monitor_input": "",
+      "product_quantity": 1,
+      "monitor_delay_ms": 3500,
+      "queue_entry_delay_ms": null,
+      "discount_code": null,
+      "wait_for_queue": false,
+      "loop_checkout": false,
+      "products": [
+        {"sku": "example-sku", "skip_if_oos": false}
+      ]
     }
   }'
 ```
+
+### Pokémon Center specific task fields
+
+When the monitor retailer is `pokemoncenter`, checkout task config supports the following fields:
+
+- `site`: region enum (`us`, `ca`, `uk`)
+- `mode`: `default`, `create_account`, `newsletter_subscribe`
+- `monitor_input`: PID / URL / free-form placeholder
+- `product_quantity`: integer >= 1
+- `monitor_delay_ms`: integer >= 0
+- `queue_entry_delay_ms`: nullable integer >= 0
+- `discount_code`: nullable string
+- `wait_for_queue`: boolean
+- `loop_checkout`: boolean
+- `products[*].skip_if_oos`: per-product boolean
+
+Defaults applied only for Pokémon Center tasks:
+
+- `mode=default`
+- `monitor_delay_ms=3500`
+- `product_quantity=1`
+- `wait_for_queue=false`
+- `loop_checkout=false`
 
 3. Start and/or run the task state machine:
 
