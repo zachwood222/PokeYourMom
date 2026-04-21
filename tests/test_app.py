@@ -41,6 +41,106 @@ def _stripe_signature(payload: str, secret: str, timestamp: int | None = None) -
     return f"t={ts},v1={digest}"
 
 
+def test_format_log_entry_has_structured_shape(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    entry = app_module.format_log_entry(
+        level="WARNING",
+        message="monitor check failed",
+        workspace_id=12,
+        monitor_id=34,
+        correlation_id="cid-123",
+    )
+
+    assert set(entry.keys()) == {
+        "timestamp",
+        "level",
+        "message",
+        "workspace_id",
+        "monitor_id",
+        "correlation_id",
+    }
+    assert entry["level"] == "warning"
+    assert entry["message"] == "monitor check failed"
+    assert entry["workspace_id"] == 12
+    assert entry["monitor_id"] == 34
+    assert entry["correlation_id"] == "cid-123"
+
+
+def test_log_outputs_json_and_emits_socket_event(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    printed = []
+    emitted = []
+
+    monkeypatch.setattr("builtins.print", lambda value: printed.append(value))
+    monkeypatch.setattr(app_module.socketio, "emit", lambda event, payload: emitted.append((event, payload)))
+
+    app_module.log(
+        "webhook target https://discord.com/api/webhooks/abc123",
+        level="WARNING",
+        workspace_id=2,
+        monitor_id=9,
+        correlation_id="corr-9",
+    )
+
+    assert len(printed) == 1
+    printed_entry = json.loads(printed[0])
+    assert printed_entry["level"] == "warning"
+    assert printed_entry["workspace_id"] == 2
+    assert printed_entry["monitor_id"] == 9
+    assert printed_entry["correlation_id"] == "corr-9"
+    assert "***redacted***" in printed_entry["message"]
+
+    assert emitted == [("log", printed_entry)]
+
+
+def test_correlation_id_header_generated_for_api_request(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/monitors", headers=_auth_headers())
+
+    assert resp.status_code == 200
+    assert app_module.CORRELATION_ID_HEADER in resp.headers
+    assert resp.headers[app_module.CORRELATION_ID_HEADER]
+
+
+def test_correlation_id_propagates_from_request_to_log_and_response(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAPTCHA_SECRET_KEY", "captcha-secret")
+    monkeypatch.setenv("CAPTCHA_VERIFY_URL", "https://captcha.local/verify")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    printed = []
+
+    monkeypatch.setattr("builtins.print", lambda value: printed.append(value))
+
+    class DummyCaptchaResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"success": False}
+
+    monkeypatch.setattr(app_module.requests, "post", lambda *args, **kwargs: DummyCaptchaResponse())
+
+    request_cid = "cid-from-client"
+    resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/product",
+            "poll_interval_seconds": 20,
+            "captcha_token": "bad-token",
+        },
+        headers={**_auth_headers(), app_module.CORRELATION_ID_HEADER: request_cid},
+    )
+
+    assert resp.status_code == 403
+    assert resp.headers[app_module.CORRELATION_ID_HEADER] == request_cid
+    parsed = [json.loads(line) for line in printed if isinstance(line, str) and line.startswith("{")]
+    assert any(entry.get("correlation_id") == request_cid for entry in parsed)
+
+
 def test_protected_endpoint_requires_auth(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -49,6 +149,28 @@ def test_protected_endpoint_requires_auth(tmp_path, monkeypatch):
 
     assert resp.status_code == 401
     assert "Unauthorized" in resp.get_json()["error"]
+
+
+def test_workspace_endpoint_requires_auth(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/workspace")
+
+    assert resp.status_code == 401
+    assert resp.get_json() == {"error": "Unauthorized"}
+
+
+def test_workspace_endpoint_allows_authenticated_user_and_returns_context(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/workspace", headers={"Authorization": "Bearer test-token"})
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["workspace"]["id"] == 1
+    assert payload["user"]["email"] == "owner@local.test"
 
 
 def test_create_monitor_validates_retailer(tmp_path, monkeypatch):
@@ -171,10 +293,10 @@ def test_captcha_invalid_or_missing_token_rejects_protected_post(tmp_path, monke
         headers=_auth_headers(),
     )
 
-    assert missing_token.status_code == 400
+    assert missing_token.status_code == 403
     assert missing_token.get_json()["reason"] == "missing_token"
-    assert invalid_token.status_code == 400
-    assert invalid_token.get_json()["reason"] == "invalid_token"
+    assert invalid_token.status_code == 403
+    assert invalid_token.get_json()["reason"] == "provider_rejected"
 
 
 def test_captcha_provider_errors_fail_safely(tmp_path, monkeypatch):
@@ -227,6 +349,276 @@ def test_authenticated_user_only_sees_own_workspace_data(tmp_path, monkeypatch):
 
     assert resp.status_code == 200
     assert resp.get_json() == []
+
+
+def test_monitor_resource_endpoints_return_404_for_cross_tenant_access(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    monitor_id = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'target', 'https://example.com/other-monitor', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+    conn.commit()
+    conn.close()
+
+    read_resp = client.get(f"/api/monitors/{monitor_id}", headers=_auth_headers())
+    update_resp = client.patch(
+        f"/api/monitors/{monitor_id}",
+        json={"enabled": False},
+        headers=_auth_headers(),
+    )
+    check_resp = client.post(f"/api/monitors/{monitor_id}/check", headers=_auth_headers())
+    delete_resp = client.delete(f"/api/monitors/{monitor_id}", headers=_auth_headers())
+
+    assert read_resp.status_code == 404
+    assert update_resp.status_code == 404
+    assert check_resp.status_code == 404
+    assert delete_resp.status_code == 404
+
+    conn = app_module.db()
+    still_exists = conn.execute("select 1 from monitors where id = ?", (monitor_id,)).fetchone()
+    conn.close()
+    assert still_exists is not None
+
+
+def test_events_endpoint_scopes_results_to_authenticated_workspace(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+
+    own_monitor = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/own', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    ).lastrowid
+    other_monitor = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'target', 'https://example.com/other', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+        values
+        (?, 'in_stock', 'Own Event', 'https://example.com/own', 'walmart', 1999, ?, 'own-event'),
+        (?, 'in_stock', 'Other Event', 'https://example.com/other', 'target', 2999, ?, 'other-event')
+        """,
+        (own_monitor, app_module.utc_now(), other_monitor, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/events", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert len(payload) == 1
+    assert payload[0]["title"] == "Own Event"
+
+
+def test_events_endpoint_keeps_desc_limit_and_excludes_cross_tenant_rows(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    own_monitor_id = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/own-seed', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    ).lastrowid
+    other_monitor_id = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'target', 'https://example.com/other-seed', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+
+    for idx in range(1, 121):
+        conn.execute(
+            """
+            insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+            values (?, 'in_stock', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                own_monitor_id,
+                f"Own Event {idx}",
+                "https://example.com/own-seed",
+                "walmart",
+                1000 + idx,
+                app_module.utc_now(),
+                f"own-seq-{idx}",
+            ),
+        )
+        if idx <= 20:
+            conn.execute(
+                """
+                insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+                values (?, 'in_stock', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    other_monitor_id,
+                    f"Other Event {idx}",
+                    "https://example.com/other-seed",
+                    "target",
+                    2000 + idx,
+                    app_module.utc_now(),
+                    f"other-seq-{idx}",
+                ),
+            )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/events", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert len(payload) == 100
+    assert all(row["title"].startswith("Own Event ") for row in payload)
+    ids = [row["id"] for row in payload]
+    assert ids == sorted(ids, reverse=True)
+
+
+def test_webhooks_endpoint_scopes_results_to_authenticated_workspace(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, created_at)
+        values
+        (1, 'Own Hook', 'https://discord.com/api/webhooks/own', ?),
+        (?, 'Other Hook', 'https://discord.com/api/webhooks/other', ?)
+        """,
+        (app_module.utc_now(), other_workspace, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/webhooks", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert len(payload) == 1
+    assert payload[0]["name"] == "Own Hook"
+
+
+def test_webhook_routes_allow_authorized_workspace_access(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_resp = client.post(
+        "/api/webhooks",
+        json={"name": "Main", "webhook_url": "https://discord.com/api/webhooks/abc123"},
+        headers=_auth_headers(),
+    )
+    created = create_resp.get_json()
+    webhook_id = created["id"]
+
+    list_resp = client.get("/api/webhooks", headers=_auth_headers())
+
+    class DummyResponse:
+        status_code = 204
+        text = ""
+
+    class FakeReqResult:
+        def __init__(self, response):
+            self.response = response
+            self.error = None
+            self.telemetry = None
+
+    monkeypatch.setattr(app_module, "perform_request", lambda **kwargs: FakeReqResult(DummyResponse()))
+    monkeypatch.setattr(app_module.requests, "post", lambda *args, **kwargs: DummyResponse())
+
+    test_resp = client.post(f"/api/webhooks/{webhook_id}/test", headers=_auth_headers())
+    patch_resp = client.patch(
+        f"/api/webhooks/{webhook_id}",
+        json={"notify_failures": True},
+        headers=_auth_headers(),
+    )
+    delete_resp = client.delete(f"/api/webhooks/{webhook_id}", headers=_auth_headers())
+
+    assert create_resp.status_code == 201
+    assert list_resp.status_code == 200
+    assert any(row["id"] == webhook_id for row in list_resp.get_json())
+    assert test_resp.status_code == 200
+    assert patch_resp.status_code == 200
+    assert patch_resp.get_json()["notify_failures"] == 1
+    assert delete_resp.status_code == 200
+
+
+def test_webhook_routes_block_cross_tenant_access(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    webhook_id = conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, created_at)
+        values (?, 'OtherHook', 'https://discord.com/api/webhooks/other', ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+    conn.commit()
+    conn.close()
+
+    test_resp = client.post(f"/api/webhooks/{webhook_id}/test", headers=_auth_headers())
+    patch_resp = client.patch(
+        f"/api/webhooks/{webhook_id}",
+        json={"notify_failures": True},
+        headers=_auth_headers(),
+    )
+    delete_resp = client.delete(f"/api/webhooks/{webhook_id}", headers=_auth_headers())
+    list_resp = client.get("/api/webhooks", headers=_auth_headers())
+
+    assert test_resp.status_code == 404
+    assert patch_resp.status_code == 404
+    assert delete_resp.status_code == 404
+    assert list_resp.status_code == 200
+    assert list_resp.get_json() == []
+
+    conn = app_module.db()
+    still_exists = conn.execute("select 1 from webhooks where id = ?", (webhook_id,)).fetchone()
+    conn.close()
+    assert still_exists is not None
 
 
 def test_keyword_and_max_price_filter_block_event(tmp_path, monkeypatch):
@@ -380,6 +772,35 @@ def test_init_db_migrates_existing_monitors_table_with_msrp_column(tmp_path, mon
     assert "session_metadata" in workspace_columns
 
 
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
 def test_api_routes_require_auth(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -514,63 +935,84 @@ def test_captcha_provider_errors_fail_safely(tmp_path, monkeypatch):
     assert resp.status_code == 403
     assert resp.get_json()["error"] == "CAPTCHA verification failed"
     assert resp.get_json()["reason"] == "provider_request_failed"
-def test_create_list_task_and_attempts_endpoint(tmp_path, monkeypatch):
+def test_create_checkout_task_and_read_state_endpoint(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
 
-    create_resp = client.post(
-        "/api/tasks",
+    create_monitor_resp = client.post(
+        "/api/monitors",
         json={
             "retailer": "walmart",
-            "url": "https://www.walmart.com/ip/sku",
-            "profile": "profile-main",
-            "account": "acc-primary",
-            "payment": "visa-4242",
+            "product_url": "https://www.walmart.com/ip/sku",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    assert create_monitor_resp.status_code == 201
+    monitor_id = create_monitor_resp.get_json()["id"]
+
+    create_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor_id,
+            "task_name": "Smoke task",
+            "task_config": {"profile": "profile-main", "account": "acc-primary", "payment": "visa-4242"},
         },
         headers=_auth_headers(),
     )
     assert create_resp.status_code == 201
     created = create_resp.get_json()
-    assert created["state"] == "idle"
     task_id = created["id"]
+    assert created["monitor_id"] == monitor_id
+    assert created["current_state"] == "queued"
 
-    list_resp = client.get("/api/tasks", headers=_auth_headers())
-    assert list_resp.status_code == 200
-    tasks = list_resp.get_json()
-    assert len(tasks) == 1
-    assert tasks[0]["id"] == task_id
-
-    attempts_resp = client.get(f"/api/tasks/{task_id}/attempts", headers=_auth_headers())
-    assert attempts_resp.status_code == 200
-    assert attempts_resp.get_json() == []
+    state_resp = client.get(f"/api/checkout/tasks/{task_id}/state", headers=_auth_headers())
+    assert state_resp.status_code == 200
+    state_payload = state_resp.get_json()
+    assert state_payload["task_id"] == task_id
+    assert state_payload["current_state"] == "queued"
+    assert state_payload["last_attempt"] is not None
 
 
-def test_start_and_stop_task(tmp_path, monkeypatch):
+def test_checkout_task_lifecycle_start_pause_stop(tmp_path, monkeypatch):
     monkeypatch.setenv("TASK_STEP_DELAY_SECONDS", "0.01")
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
 
-    create_resp = client.post(
-        "/api/tasks",
+    create_monitor_resp = client.post(
+        "/api/monitors",
         json={
             "retailer": "target",
-            "url": "https://www.target.com/p/abc",
-            "profile": "default",
-            "account": "acct-1",
-            "payment": "amex",
+            "product_url": "https://www.target.com/p/abc",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    assert create_monitor_resp.status_code == 201
+    monitor_id = create_monitor_resp.get_json()["id"]
+
+    create_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor_id,
+            "task_name": "Lifecycle task",
+            "task_config": {"profile": "default", "account": "acct-1", "payment": "amex"},
         },
         headers=_auth_headers(),
     )
     task_id = create_resp.get_json()["id"]
 
-    start_resp = client.post(f"/api/tasks/{task_id}/start", headers=_auth_headers())
+    start_resp = client.post(f"/api/checkout/tasks/{task_id}/start", headers=_auth_headers())
     assert start_resp.status_code == 200
-    started_task = start_resp.get_json()["task"]
-    assert started_task["state"] in {"queued", "running"}
+    assert start_resp.get_json()["task"]["current_state"] == "monitoring"
 
-    stop_resp = client.post(f"/api/tasks/{task_id}/stop", headers=_auth_headers())
+    pause_resp = client.post(f"/api/checkout/tasks/{task_id}/pause", headers=_auth_headers())
+    assert pause_resp.status_code == 200
+    assert pause_resp.get_json()["task"]["current_state"] == "paused"
+
+    stop_resp = client.post(f"/api/checkout/tasks/{task_id}/stop", headers=_auth_headers())
     assert stop_resp.status_code == 200
-    assert stop_resp.get_json()["task"]["state"] == "stopped"
+    assert stop_resp.get_json()["task"]["current_state"] == "stopped"
 
 
 def test_stripe_webhook_valid_signature_accepted(tmp_path, monkeypatch):
@@ -804,6 +1246,67 @@ def test_check_update_returns_fallback_payload_on_upstream_failure(tmp_path, mon
     assert "source_error" in payload
 
 
+def test_ops_metrics_returns_expected_schema_and_non_negative_counts(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    checked_monitor_id = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, enabled, last_checked_at, failure_streak, created_at
+        ) values (1, 'walmart', 'https://example.com/checked', 20, 1, ?, 1, ?)
+        """,
+        (app_module.utc_now(), app_module.utc_now()),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, created_at)
+        values (1, 'Main', 'https://discord.com/api/webhooks/main', ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    webhook_id = conn.execute("select id from webhooks where name = 'Main'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+        values (?, 'in_stock', 'seed', 'https://example.com/checked', 'walmart', 1200, ?, 'metrics-event-1')
+        """,
+        (checked_monitor_id, app_module.utc_now()),
+    )
+    event_id = conn.execute("select id from events where dedupe_key = 'metrics-event-1'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into deliveries(event_id, webhook_id, status, response_code, response_body, delivered_at)
+        values
+        (?, ?, 'sent', 204, '', ?),
+        (?, ?, 'failed', 500, 'oops', ?)
+        """,
+        (event_id, webhook_id, app_module.utc_now(), event_id, webhook_id, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ops/metrics", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert set(payload.keys()) == {
+        "checks_total",
+        "checks_failed_total",
+        "alerts_created_total",
+        "webhook_sent_total",
+        "webhook_failed_total",
+    }
+    assert all(isinstance(payload[key], int) for key in payload)
+    assert all(payload[key] >= 0 for key in payload)
+    assert payload["checks_total"] == 1
+    assert payload["checks_failed_total"] == 1
+    assert payload["alerts_created_total"] == 1
+    assert payload["webhook_sent_total"] == 1
+    assert payload["webhook_failed_total"] == 1
+
+
 def test_monitor_failure_trends_returns_seeded_counts(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -841,6 +1344,73 @@ def test_monitor_failure_trends_returns_seeded_counts(tmp_path, monkeypatch):
     assert resp.status_code == 200
     assert payload["trends"] == [
         {"monitor_id": monitor_id, "failures_last_24h": 1, "failures_last_7d": 2}
+    ]
+
+
+def test_monitor_failure_trends_includes_zero_counts_and_excludes_other_workspaces(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    now = datetime.now(timezone.utc)
+
+    conn = app_module.db()
+    own_monitor_with_failures = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/with-failures', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    ).lastrowid
+    own_monitor_without_failures = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'target', 'https://example.com/no-failures', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into monitor_failures(monitor_id, workspace_id, error_text, failed_at)
+        values (?, 1, 'err-1', ?), (?, 1, 'err-2', ?)
+        """,
+        (
+            own_monitor_with_failures,
+            (now - timedelta(hours=3)).isoformat(),
+            own_monitor_with_failures,
+            (now - timedelta(days=2)).isoformat(),
+        ),
+    )
+
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    other_monitor_id = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'bestbuy', 'https://example.com/other', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into monitor_failures(monitor_id, workspace_id, error_text, failed_at)
+        values (?, ?, 'other-err', ?)
+        """,
+        (other_monitor_id, other_workspace, (now - timedelta(hours=1)).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ops/monitor-failure-trends", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert set(payload.keys()) == {"trends"}
+    trends = sorted(payload["trends"], key=lambda row: row["monitor_id"])
+    assert trends == [
+        {"monitor_id": own_monitor_with_failures, "failures_last_24h": 1, "failures_last_7d": 2},
+        {"monitor_id": own_monitor_without_failures, "failures_last_24h": 0, "failures_last_7d": 0},
     ]
 
 
@@ -931,6 +1501,76 @@ def test_adapter_dispatch_uses_walmart_and_fallback(tmp_path, monkeypatch):
     assert fallback_adapter.name == "default"
 
 
+def test_adapter_dispatch_supports_pokemon_alias_and_canonical_name(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    canonical = app_module.get_adapter_for_retailer("pokemoncenter")
+    hyphenated = app_module.get_adapter_for_retailer("pokemon-center")
+    underscored = app_module.get_adapter_for_retailer("pokemon_center")
+
+    assert canonical.name == "pokemoncenter"
+    assert hyphenated.name == "pokemoncenter"
+    assert underscored.name == "pokemoncenter"
+
+
+def test_adapter_dispatch_supports_walmart_aliases(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    canonical = app_module.get_adapter_for_retailer("walmart")
+    hyphenated = app_module.get_adapter_for_retailer("wal-mart")
+    spaced = app_module.get_adapter_for_retailer("wal mart")
+    dotted = app_module.get_adapter_for_retailer("walmart.com")
+    spaced_domain = app_module.get_adapter_for_retailer("walmart com")
+
+    assert canonical.name == "walmart"
+    assert hyphenated.name == "walmart"
+    assert spaced.name == "walmart"
+    assert dotted.name == "walmart"
+    assert spaced_domain.name == "walmart"
+
+
+def test_adapter_dispatch_supports_target_aliases(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    canonical = app_module.get_adapter_for_retailer("target")
+    dotted = app_module.get_adapter_for_retailer("target.com")
+    spaced = app_module.get_adapter_for_retailer("target com")
+
+    assert canonical.name == "target"
+    assert dotted.name == "target"
+    assert spaced.name == "target"
+
+
+def test_adapter_dispatch_supports_bestbuy_aliases(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    canonical = app_module.get_adapter_for_retailer("bestbuy")
+    hyphenated = app_module.get_adapter_for_retailer("best-buy")
+    spaced = app_module.get_adapter_for_retailer("best buy")
+    dotted = app_module.get_adapter_for_retailer("bestbuy.com")
+
+    assert canonical.name == "bestbuy"
+    assert hyphenated.name == "bestbuy"
+    assert spaced.name == "bestbuy"
+    assert dotted.name == "bestbuy"
+
+
+def test_parse_monitor_html_dispatches_and_keeps_default_fallback(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    walmart_html = load_fixture_html("walmart", "in_stock")
+    unknown_html = load_fixture_html("target", "unknown_markup")
+
+    walmart_result = app_module.parse_monitor_html(html=walmart_html, retailer="walmart")
+    fallback_result = app_module.parse_monitor_html(html=unknown_html, retailer="unknown-retailer")
+    default_result = app_module.default_parser(unknown_html)
+
+    assert walmart_result.availability_reason == "walmart_marker_in_stock"
+    assert walmart_result.in_stock is True
+    assert fallback_result.in_stock == default_result.in_stock
+    assert fallback_result.status_text == default_result.status_text
+    assert fallback_result.availability_reason == default_result.availability_reason
+
+
 def test_walmart_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     in_stock_html = load_fixture_html("walmart", "in_stock")
@@ -947,6 +1587,19 @@ def test_walmart_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch
     assert out_stock.price_cents == 2488
     assert out_stock.availability_reason == "walmart_marker_out_of_stock"
     assert out_stock.parser_confidence == 0.98
+
+
+def test_walmart_parser_uses_default_fallback_for_unknown_markup_fixture(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    unknown_html = load_fixture_html("walmart", "unknown_markup")
+
+    walmart_result = app_module.evaluate_page(unknown_html, retailer="walmart")
+    default_result = app_module.default_parser(unknown_html)
+
+    assert walmart_result.in_stock == default_result.in_stock
+    assert walmart_result.status_text == default_result.status_text
+    assert walmart_result.availability_reason == default_result.availability_reason
+    assert walmart_result.parser_confidence == default_result.parser_confidence
 
 
 def test_target_parser_extracts_in_stock_and_out_of_stock(tmp_path, monkeypatch):
@@ -1005,6 +1658,32 @@ def test_target_and_bestbuy_parsers_keep_default_fallback_for_unknown_markup(tmp
     assert bestbuy_result.price_cents == bestbuy_default.price_cents
     assert bestbuy_result.availability_reason == bestbuy_default.availability_reason
     assert bestbuy_result.parser_confidence == bestbuy_default.parser_confidence
+
+
+def test_target_parser_uses_default_fallback_for_unknown_markup_fixture(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    unknown_html = load_fixture_html("target", "unknown_markup")
+
+    target_result = app_module.evaluate_page(unknown_html, retailer="target")
+    default_result = app_module.default_parser(unknown_html)
+
+    assert target_result.in_stock == default_result.in_stock
+    assert target_result.status_text == default_result.status_text
+    assert target_result.availability_reason == default_result.availability_reason
+    assert target_result.parser_confidence == default_result.parser_confidence
+
+
+def test_bestbuy_parser_uses_default_fallback_for_unknown_markup_fixture(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    unknown_html = load_fixture_html("bestbuy", "unknown_markup")
+
+    bestbuy_result = app_module.evaluate_page(unknown_html, retailer="bestbuy")
+    default_result = app_module.default_parser(unknown_html)
+
+    assert bestbuy_result.in_stock == default_result.in_stock
+    assert bestbuy_result.status_text == default_result.status_text
+    assert bestbuy_result.availability_reason == default_result.availability_reason
+    assert bestbuy_result.parser_confidence == default_result.parser_confidence
 
 
 def _seed_monitor(app_module):

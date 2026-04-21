@@ -6,6 +6,15 @@ from dataclasses import dataclass
 from typing import Any
 
 RETAILER_ALIASES = {
+    "walmart.com": "walmart",
+    "walmart com": "walmart",
+    "wal-mart": "walmart",
+    "wal mart": "walmart",
+    "target.com": "target",
+    "target com": "target",
+    "best-buy": "bestbuy",
+    "best buy": "bestbuy",
+    "bestbuy.com": "bestbuy",
     "pokemon-center": "pokemoncenter",
     "pokemon_center": "pokemoncenter",
     "pokemon center": "pokemoncenter",
@@ -295,3 +304,13 @@ def run_retailer_flow(adapter: RetailerAdapter, task_ctx: TaskContext) -> Monito
     adapter.submit_payment(task_ctx)
     adapter.place_order(task_ctx)
     return result
+
+
+def parse_monitor_html(
+    *,
+    html: str,
+    retailer: str | None = None,
+    keyword: str | None = None,
+) -> MonitorResult:
+    adapter = resolve_retailer_adapter(retailer)
+    return run_retailer_flow(adapter, {"html": html, "keyword": keyword})
