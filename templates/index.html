@@ -166,6 +166,18 @@
     }
 
     .warn { color: #f7b955; font-size: 13px; }
+    .config-warn {
+      display: none;
+      margin: 16px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid #7a3f2b;
+      background: rgba(152, 67, 42, 0.2);
+      color: #ffd9cb;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    .config-warn.show { display: block; }
 
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
@@ -194,6 +206,10 @@
     </div>
     <div class="topbar-right" id="clock">--:--:--</div>
   </header>
+  <div id="api_auth_warning" class="config-warn" role="alert" aria-live="polite">
+    API auth token is not configured. API requests to <code>/api/*</code> will return <code>401 Unauthorized</code>
+    until <code>API_AUTH_TOKEN</code> is set to a non-empty bearer token.
+  </div>
 
   <div class="layout">
     <aside class="sidebar">
@@ -284,32 +300,13 @@
           <h2>Create Automation Task</h2>
           <div class="row">
             <div>
-              <label>Retailer</label>
-              <select id="task_retailer">
-                <option>walmart</option>
-                <option>target</option>
-                <option>bestbuy</option>
-                <option>pokemoncenter</option>
-              </select>
+              <label>Monitor</label>
+              <select id="task_monitor_id"></select>
             </div>
             <div>
-              <label>Product URL</label>
-              <input id="task_url" placeholder="https://www.walmart.com/ip/..." />
+              <label>Task Name (Optional)</label>
+              <input id="task_name" placeholder="Walmart checkout task" />
             </div>
-          </div>
-          <div class="row" style="margin-top:10px;">
-            <div>
-              <label>Profile</label>
-              <input id="task_profile" placeholder="profile-main" />
-            </div>
-            <div>
-              <label>Account</label>
-              <input id="task_account" placeholder="acc-primary" />
-            </div>
-          </div>
-          <div style="margin-top:10px;">
-            <label>Payment</label>
-            <input id="task_payment" placeholder="visa-ending-4242" />
           </div>
           <button style="margin-top:10px;" onclick="createTask()">Create Task</button>
         </div>
@@ -317,7 +314,7 @@
         <div class="card" style="margin-top:14px;">
           <h2 class="section-title">Live Task Table</h2>
           <table>
-            <thead><tr><th>ID</th><th>Retailer</th><th>State</th><th>Retries</th><th>Last Step</th><th>Last Error</th><th>Actions</th></tr></thead>
+            <thead><tr><th>ID</th><th>Monitor</th><th>Retailer</th><th>State</th><th>Last Transition</th><th>Last Error</th><th>Actions</th></tr></thead>
             <tbody id="tasks"></tbody>
           </table>
         </div>
@@ -407,6 +404,11 @@
           <input id="webhook_name" value="Main Discord" />
           <label>Webhook URL</label>
           <input id="webhook_url" placeholder="https://discord.com/api/webhooks/..." />
+          <div style="margin-top:10px;">
+            <label style="display:flex; align-items:center; gap:8px;"><input id="notify_success" type="checkbox" style="width:auto;" checked /> Notify on success events</label>
+            <label style="display:flex; align-items:center; gap:8px;"><input id="notify_failures" type="checkbox" style="width:auto;" /> Notify on failures</label>
+            <label style="display:flex; align-items:center; gap:8px;"><input id="notify_restock_only" type="checkbox" style="width:auto;" checked /> Restock-only alerts</label>
+          </div>
           <div class="actions" style="margin-top:10px;">
             <button onclick="addWebhook()">Add Webhook</button>
             <button onclick="testFirstWebhook()">Test First Webhook</button>
@@ -474,6 +476,8 @@
   <script>
     const socket = io();
     const API_AUTH_TOKEN = {{ api_auth_token|tojson }};
+    const API_AUTH_TOKEN_NORMALIZED = typeof API_AUTH_TOKEN === 'string' ? API_AUTH_TOKEN.trim() : '';
+    const HAS_API_AUTH_TOKEN = API_AUTH_TOKEN_NORMALIZED.length > 0;
     let loopRunning = false;
     let selectedTaskId = null;
     let taskMap = new Map();
@@ -501,8 +505,8 @@
       const opts = {...options};
       const method = (opts.method || 'GET').toUpperCase();
       const headers = new Headers(opts.headers || {});
-      if (API_AUTH_TOKEN && !headers.has('Authorization')) {
-        headers.set('Authorization', `Bearer ${API_AUTH_TOKEN}`);
+      if (HAS_API_AUTH_TOKEN && !headers.has('Authorization')) {
+        headers.set('Authorization', `Bearer ${API_AUTH_TOKEN_NORMALIZED}`);
       }
       const token = getCaptchaToken();
       if (token) {
@@ -527,6 +531,17 @@
       document.querySelectorAll('.top-nav button').forEach(el => el.classList.remove('active'));
       document.getElementById(`tab-${tab}`).classList.add('active');
       document.querySelector(`.top-nav button[data-tab="${tab}"]`).classList.add('active');
+    }
+
+    function renderApiAuthWarning() {
+      const warning = document.getElementById('api_auth_warning');
+      if (!warning) return;
+      if (HAS_API_AUTH_TOKEN) {
+        warning.classList.remove('show');
+        return;
+      }
+      warning.classList.add('show');
+      console.warn('API_AUTH_TOKEN is empty; /api/* requests are expected to return 401 until configured.');
     }
 
     socket.on('log', (d) => {
@@ -621,17 +636,23 @@
 
     async function addWebhook() {
       const payload = {
-        name: document.getElementById('webhook_name').value,
-        webhook_url: document.getElementById('webhook_url').value,
-        notify_success: document.getElementById('notify_success').checked,
-        notify_failures: document.getElementById('notify_failures').checked,
-        notify_restock_only: document.getElementById('notify_restock_only').checked,
+        name: document.getElementById('webhook_name')?.value || '',
+        webhook_url: document.getElementById('webhook_url')?.value || '',
+        notify_success: document.getElementById('notify_success')?.checked ?? true,
+        notify_failures: document.getElementById('notify_failures')?.checked ?? false,
+        notify_restock_only: document.getElementById('notify_restock_only')?.checked ?? true,
       };
       const res = await apiFetch('/api/webhooks', {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))
       });
       const data = await res.json();
       alert(data.error || `Webhook added (id=${data.id})`);
+      const webhookName = document.getElementById('webhook_name');
+      const webhookUrl = document.getElementById('webhook_url');
+      if (!data.error) {
+        if (webhookName) webhookName.value = 'Main Discord';
+        if (webhookUrl) webhookUrl.value = '';
+      }
       await loadWebhooks();
     }
 
@@ -719,10 +740,10 @@
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td>${task.id}</td>
+          <td>${task.monitor_id || '-'}</td>
           <td>${task.retailer}</td>
           <td>${task.state}</td>
-          <td>${task.retries || 0}</td>
-          <td>${task.last_step || '-'}</td>
+          <td>${task.last_transition_at || '-'}</td>
           <td>${taskErrorLabel(task.last_error)}</td>
           <td class="actions">
             <button onclick="startTask(${task.id})">Start</button>
@@ -785,6 +806,12 @@
 
     async function loadMonitors() {
       const rows = await apiFetch('/api/monitors').then(r => r.json());
+      const taskMonitorSelect = document.getElementById('task_monitor_id');
+      if (taskMonitorSelect) {
+        taskMonitorSelect.innerHTML = rows
+          .map((m) => `<option value="${m.id}">#${m.id} ${m.retailer} - ${m.product_url}</option>`)
+          .join('');
+      }
       const tbody = document.getElementById('monitors');
       tbody.innerHTML = '';
       for (const r of rows) {
@@ -868,14 +895,6 @@
       await loadWebhooks();
     }
 
-    async function testFirstWebhook() {
-      const hooks = await fetch('/api/webhooks').then(r => r.json()).catch(() => []);
-      if (!Array.isArray(hooks) || !hooks.length) {
-        alert('No webhooks available to test.');
-        return;
-      }
-      await testWebhook(hooks[0].id);
-    }
 
     function selectedMonitorIds() {
       return Array.from(document.querySelectorAll('.monitor-select:checked')).map(x => Number(x.value));
@@ -963,6 +982,7 @@
       setInterval(paint, 1000);
     }
 
+    renderApiAuthWarning();
     loadWorkspace();
     loadMeta();
     loadWebhooks();
