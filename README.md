@@ -139,9 +139,11 @@ The regression harness in `tests/test_parser_fixtures.py` asserts two expectatio
 
 - `expected_in_stock` (`True`/`False`)
 - `expected_status` (`in_stock` or `out_or_unknown`)
+- failure output includes the exact fixture path (for example `walmart/ambiguous.html`) to make regressions easy to triage.
 
 To add a new fixture case:
 
 1. Add the HTML snapshot in `tests/fixtures/<retailer>/`.
-2. Register a `pytest.param(...)` case in `tests/parser_fixture_harness.py` (case IDs are formatted as `<retailer>:<fixture_name>`).
-3. Run `pytest tests/test_parser_fixtures.py` to validate the new snapshot.
+2. Register the expected output in `PARSER_FIXTURE_EXPECTATIONS` in `tests/parser_fixture_harness.py`.
+3. Ensure each retailer still includes the required baseline snapshots: `in_stock`, `out_of_stock`, and `ambiguous`.
+4. Run `pytest tests/test_parser_fixtures.py` to validate the new snapshot.
