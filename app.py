@@ -757,6 +757,88 @@ def normalize_task_config_for_monitor(
     return normalized
 
 
+RUNNING_TASK_STATES = {"queued", "monitoring", "carting", "shipping", "payment", "submitting", "paused"}
+
+
+def _is_quick_edit_input(raw_input: str) -> bool:
+    text = (raw_input or "").strip()
+    if not text:
+        return False
+    segments = [segment.strip() for segment in text.split(",")]
+    return len(segments) > 1 or any(":" in segment for segment in segments)
+
+
+def _coerce_product_rows(value: Any) -> list[dict[str, Any]]:
+    rows = value if isinstance(value, list) else []
+    normalized_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pid = str(row.get("pid") or "").strip()
+        if not pid:
+            continue
+        quantity = _coerce_optional_int(row.get("quantity"))
+        normalized_rows.append(
+            {
+                "pid": pid,
+                "quantity": quantity if quantity and quantity > 0 else 1,
+                "skip_if_oos": bool(row.get("skip_if_oos", False)),
+            }
+        )
+    return normalized_rows
+
+
+def apply_product_group_operation(task_config: dict[str, Any], operation: dict[str, Any]) -> dict[str, Any]:
+    config = dict(task_config or {})
+    existing_products = _coerce_product_rows(config.get("products"))
+    op = str(operation.get("mode") or "").strip().lower()
+    if op not in {"edit", "add", "remove"}:
+        raise ValueError("mode must be one of: edit, add, remove")
+
+    updated_products = list(existing_products)
+    if op in {"edit", "add"}:
+        raw_input = str(operation.get("input") or "").strip()
+        if not raw_input:
+            raise ValueError("input is required for edit/add operations")
+        quick_edit = _is_quick_edit_input(raw_input)
+        parsed = parse_monitor_input(
+            raw_input,
+            is_edit_flow=True,
+            existing_product_count=1 if op == "add" else len(existing_products),
+        )
+        if op == "edit":
+            if quick_edit and len(existing_products) != 1:
+                raise ValueError("Quick Edit is only allowed when editing a task with exactly one product.")
+            if not updated_products:
+                updated_products = [parsed[0]]
+            elif quick_edit:
+                updated_products = [parsed[0], *parsed[1:]]
+            else:
+                updated_products[0] = parsed[0]
+        else:
+            updated_products.extend(parsed)
+
+    if op == "remove":
+        indices = operation.get("remove_indices")
+        if not isinstance(indices, list) or not indices:
+            raise ValueError("remove_indices must include at least one row index")
+        valid_indices = {idx for idx in indices if isinstance(idx, int) and idx >= 0}
+        updated_products = [row for idx, row in enumerate(updated_products) if idx not in valid_indices]
+
+    skip_updates = operation.get("skip_updates")
+    if isinstance(skip_updates, list):
+        for patch in skip_updates:
+            if not isinstance(patch, dict):
+                continue
+            idx = patch.get("index")
+            if not isinstance(idx, int) or idx < 0 or idx >= len(updated_products):
+                continue
+            updated_products[idx]["skip_if_oos"] = bool(patch.get("skip_if_oos"))
+
+    config["products"] = updated_products
+    return normalize_task_config_for_monitor(config)
+
+
 def run_pokemon_center_task_group_config_migration(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -5793,6 +5875,111 @@ def api_list_checkout_tasks():
     ).fetchall()
     conn.close()
     return jsonify([serialize_checkout_task_summary(row) for row in rows])
+
+
+@app.post("/api/checkout/task-groups/products/preview")
+@require_auth
+def api_preview_checkout_task_group_products():
+    body = request.json if isinstance(request.json, dict) else {}
+    monitor_ids = body.get("monitor_ids")
+    if not isinstance(monitor_ids, list) or not monitor_ids:
+        return jsonify({"error": "monitor_ids must be a non-empty list"}), 400
+    normalized_ids = [int(mid) for mid in monitor_ids if isinstance(mid, int) or str(mid).isdigit()]
+    if not normalized_ids:
+        return jsonify({"error": "monitor_ids must include numeric ids"}), 400
+
+    workspace_id = current_workspace_id()
+    conn = db()
+    placeholders = ",".join(["?"] * len(normalized_ids))
+    state_placeholders = ",".join(["?"] * len(RUNNING_TASK_STATES))
+    rows = conn.execute(
+        f"""
+        select ct.id, ct.task_config
+        from checkout_tasks ct
+        where ct.workspace_id = ?
+          and ct.monitor_id in ({placeholders})
+          and ct.current_state in ({state_placeholders})
+        order by ct.id asc
+        """,
+        (workspace_id, *normalized_ids, *RUNNING_TASK_STATES),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return jsonify({"tasks_found": 0, "products": []})
+
+    first = serialize_checkout_task(rows[0]) or {}
+    config = first.get("task_config") if isinstance(first.get("task_config"), dict) else {}
+    products = _coerce_product_rows(config.get("products"))
+    return jsonify({"tasks_found": len(rows), "products": products})
+
+
+@app.post("/api/checkout/task-groups/products")
+@require_auth
+def api_update_checkout_task_group_products():
+    body = request.json if isinstance(request.json, dict) else {}
+    monitor_ids = body.get("monitor_ids")
+    operation = body.get("operation") if isinstance(body.get("operation"), dict) else {}
+    if not isinstance(monitor_ids, list) or not monitor_ids:
+        return jsonify({"error": "monitor_ids must be a non-empty list"}), 400
+
+    normalized_ids = [int(mid) for mid in monitor_ids if isinstance(mid, int) or str(mid).isdigit()]
+    if not normalized_ids:
+        return jsonify({"error": "monitor_ids must include numeric ids"}), 400
+
+    workspace_id = current_workspace_id()
+    conn = db()
+    placeholders = ",".join(["?"] * len(normalized_ids))
+    state_placeholders = ",".join(["?"] * len(RUNNING_TASK_STATES))
+    rows = conn.execute(
+        f"""
+        select ct.*, m.retailer, m.product_url
+        from checkout_tasks ct
+        join monitors m on m.id = ct.monitor_id
+        where ct.workspace_id = ?
+          and ct.monitor_id in ({placeholders})
+          and ct.current_state in ({state_placeholders})
+        order by ct.id asc
+        """,
+        (workspace_id, *normalized_ids, *RUNNING_TASK_STATES),
+    ).fetchall()
+    if not rows:
+        conn.close()
+        return jsonify({"updated": 0, "rejected": 0, "tasks_found": 0})
+
+    updated = 0
+    rejected = 0
+    errors: list[dict[str, Any]] = []
+    for row in rows:
+        task_payload = serialize_checkout_task(row) or {}
+        task_config = task_payload.get("task_config") if isinstance(task_payload.get("task_config"), dict) else {}
+        try:
+            next_config = apply_product_group_operation(task_config, operation)
+        except ValueError as exc:
+            rejected += 1
+            errors.append({"task_id": row["id"], "error": str(exc)})
+            continue
+        conn.execute(
+            "update checkout_tasks set task_config = ?, updated_at = ? where id = ? and workspace_id = ?",
+            (json.dumps(next_config), utc_now(), row["id"], workspace_id),
+        )
+        refreshed = conn.execute(
+            "select * from checkout_tasks where id = ? and workspace_id = ?",
+            (row["id"], workspace_id),
+        ).fetchone()
+        if refreshed:
+            socketio.emit("task_update", serialize_task_ui(refreshed))
+        updated += 1
+
+    conn.commit()
+    conn.close()
+    return jsonify(
+        {
+            "updated": updated,
+            "rejected": rejected,
+            "tasks_found": len(rows),
+            "errors": errors[:25],
+        }
+    )
 
 
 def get_monitor_for_workspace(
