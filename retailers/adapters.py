@@ -35,6 +35,7 @@ class MonitorResult:
     keyword_matched: bool | None = None
     price_within_limit: bool | None = None
     within_msrp_delta: bool | None = None
+    queue_detected: bool = False
 
 
 def extract_price_cents(text: str) -> int | None:
@@ -165,9 +166,23 @@ class PokemonCenterAdapter(DefaultRetailerAdapter):
             out_markers.append("this item is unavailable in your region")
         if category == "lorcana":
             in_markers.append("preorder")
+        queue_markers = [
+            "queue-it.net",
+            "queue-it",
+            "virtual waiting room",
+            "you are now in line",
+            "estimated wait time",
+        ]
+        has_queue = any(m in text for m in queue_markers)
+        result.queue_detected = has_queue
         has_out = any(m in text for m in out_markers)
         has_in = any(m in text for m in in_markers)
-        if has_out:
+        if has_queue:
+            result.in_stock = False
+            result.status_text = "queue_detected"
+            result.availability_reason = "pokemoncenter_queue_detected"
+            result.parser_confidence = 0.99
+        elif has_out:
             result.in_stock = False
             result.status_text = "out_or_unknown"
             result.availability_reason = "pokemoncenter_marker_out_of_stock"
