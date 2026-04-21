@@ -3056,13 +3056,6 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
     return done
 
 
-def enqueue_checkout_for_monitor(
-    monitor: sqlite3.Row, result: MonitorResult, *, reason: str = "in_stock_detected"
-) -> int | None:
-    if not result.in_stock:
-        return None
-    conn = db()
-    existing = conn.execute(
 def create_secret(
     conn: sqlite3.Connection,
     workspace_id: int,
@@ -4967,7 +4960,7 @@ def api_stop_task(task_id: int):
 
 @app.get("/api/monitors/<int:monitor_id>")
 @require_auth
-def api_get_monitor(monitor_id: int):
+def api_get_monitor_dup1(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
     row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
@@ -5241,7 +5234,7 @@ def api_update_monitor(monitor_id: int):
 
 @app.delete("/api/monitors/<int:monitor_id>")
 @require_auth
-def api_workspace():
+def api_workspace_dup1():
     row = get_workspace(current_workspace_id())
     return jsonify({"workspace": dict(row), "user": current_user_context()})
 def api_delete_monitor(monitor_id: int):
@@ -5352,7 +5345,7 @@ def get_monitor_for_workspace(
 
 @app.get("/api/monitors/<int:monitor_id>")
 @require_auth
-def api_get_monitor(monitor_id: int):
+def api_get_monitor_dup2(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
     row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
@@ -5364,7 +5357,7 @@ def api_get_monitor(monitor_id: int):
 
 @app.get("/api/monitors/<int:monitor_id>")
 @require_auth
-def api_get_monitor(monitor_id: int):
+def api_get_monitor_dup3(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
     row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
@@ -5397,7 +5390,7 @@ def api_checkout_task_attempts(task_id: int):
 
 @app.get("/api/checkout/tasks")
 @require_auth
-def api_list_checkout_tasks():
+def api_list_checkout_tasks_dup1():
     conn = db()
     rows = conn.execute(
         "select * from checkout_tasks where workspace_id = ? order by id desc",
@@ -5409,7 +5402,7 @@ def api_list_checkout_tasks():
 
 @app.get("/api/checkout/tasks")
 @require_auth
-def api_list_checkout_tasks():
+def api_list_checkout_tasks_dup2():
     conn = db()
     rows = conn.execute(
         "select * from checkout_tasks where workspace_id = ? order by id desc",
@@ -5421,7 +5414,7 @@ def api_list_checkout_tasks():
 
 @app.get("/api/checkout/tasks")
 @require_auth
-def api_list_checkout_tasks():
+def api_list_checkout_tasks_dup3():
     conn = db()
     rows = conn.execute(
         "select * from checkout_tasks where workspace_id = ? order by id desc",
@@ -5433,7 +5426,7 @@ def api_list_checkout_tasks():
 
 @app.get("/api/checkout/tasks")
 @require_auth
-def api_list_checkout_tasks():
+def api_list_checkout_tasks_dup4():
     conn = db()
     rows = conn.execute(
         "select * from checkout_tasks where workspace_id = ? order by id desc",
@@ -5475,7 +5468,7 @@ def api_run_checkout_task(task_id: int):
 
 @app.post("/api/checkout/tasks/<int:task_id>/run")
 @require_auth
-def api_run_checkout_task(task_id: int):
+def api_run_checkout_task_dup1(task_id: int):
     row = execute_checkout_task_state_machine(task_id, current_workspace_id())
     if not row:
         return jsonify({"error": "Checkout task not found"}), 404
@@ -5484,7 +5477,7 @@ def api_run_checkout_task(task_id: int):
 
 @app.post("/api/checkout/tasks/<int:task_id>/run")
 @require_auth
-def api_run_checkout_task(task_id: int):
+def api_run_checkout_task_dup2(task_id: int):
     row = execute_checkout_task_state_machine(task_id, current_workspace_id())
     if not row:
         return jsonify({"error": "Checkout task not found"}), 404
@@ -5537,7 +5530,7 @@ def api_stop_checkout_task(task_id: int):
 
 @app.get("/api/checkout/tasks/<int:task_id>/attempts")
 @require_auth
-def api_checkout_task_attempts(task_id: int):
+def api_checkout_task_attempts_dup1(task_id: int):
     conn = db()
     row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
     if not row:
@@ -5570,7 +5563,7 @@ def api_checkout_task_attempts(task_id: int):
 
 @app.get("/api/checkout/tasks/<int:task_id>/attempts")
 @require_auth
-def api_checkout_task_attempts(task_id: int):
+def api_checkout_task_attempts_dup2(task_id: int):
     conn = db()
     row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
     if not row:
@@ -5603,7 +5596,7 @@ def api_checkout_task_attempts(task_id: int):
 
 @app.get("/api/checkout/tasks/<int:task_id>/attempts")
 @require_auth
-def api_checkout_task_attempts(task_id: int):
+def api_checkout_task_attempts_dup3(task_id: int):
     conn = db()
     row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     if not row:
@@ -5726,7 +5719,7 @@ def api_create_checkout_captcha_challenge(task_id: int):
 
 @app.get("/api/checkout/tasks")
 @require_auth
-def api_list_checkout_tasks():
+def api_list_checkout_tasks_dup5():
     conn = db()
     rows = conn.execute(
         "select * from checkout_tasks where workspace_id = ? order by id desc",
@@ -5762,7 +5755,7 @@ def api_list_checkout_captcha_challenges(task_id: int):
 
 @app.post("/api/checkout/tasks/<int:task_id>/run")
 @require_auth
-def api_run_checkout_task(task_id: int):
+def api_run_checkout_task_dup3(task_id: int):
     row = execute_checkout_task_state_machine(task_id, current_workspace_id())
     if not row:
         return jsonify({"error": "Checkout task not found"}), 404
@@ -5832,7 +5825,7 @@ def api_issue_captcha_handoff_token(challenge_id: int):
 
 @app.get("/api/checkout/tasks/<int:task_id>/attempts")
 @require_auth
-def api_checkout_task_attempts(task_id: int):
+def api_checkout_task_attempts_dup4(task_id: int):
     conn = db()
     row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
     if not row:
