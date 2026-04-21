@@ -817,6 +817,13 @@ def current_workspace_id() -> int:
     return workspace_id
 
 
+def current_user_context() -> dict[str, Any]:
+    user = getattr(g, "current_user", None)
+    if not user:
+        raise RuntimeError("Missing user context")
+    return dict(user)
+
+
 def get_workspace_for_user(user_id: int) -> sqlite3.Row | None:
     conn = db()
     row = conn.execute(
@@ -867,10 +874,19 @@ def get_workspace(workspace_id: int) -> sqlite3.Row:
     return row
 
 
+def get_default_workspace() -> sqlite3.Row:
+    conn = db()
+    row = conn.execute("select * from workspaces order by id asc limit 1").fetchone()
+    conn.close()
+    if not row:
+        raise ValueError("Workspace not found")
+    return row
+
+
 def get_workspace_for_request() -> sqlite3.Row:
     workspace = getattr(g, "current_workspace", None)
     if workspace is None:
-        workspace = get_workspace(1)
+        workspace = get_default_workspace()
     return workspace
 
 
@@ -1017,7 +1033,7 @@ def require_api_auth() -> tuple[dict[str, str], int] | None:
     else:
         token = _token_from_request()
         if token and token == API_AUTH_TOKEN:
-            _set_auth_context(DEFAULT_USER, get_workspace(1))
+            _set_auth_context(DEFAULT_USER, get_default_workspace())
         else:
             return jsonify({"error": "Unauthorized"}), 401
 
@@ -1891,6 +1907,39 @@ def cents_to_dollars(cents: int | None) -> str:
     return f"${cents / 100:.2f}"
 
 
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
 def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
@@ -1901,6 +1950,14 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     except (TypeError, json.JSONDecodeError):
         payload["task_config"] = {}
     return payload
+
+
+def redact_webhook_url(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 12:
+        return "***"
+    return f"{value[:8]}...{value[-4:]}"
 
 
 def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -2672,7 +2729,7 @@ def api_billing_stripe_webhook():
 @require_auth
 def api_workspace():
     row = get_workspace(current_workspace_id())
-    return jsonify({"workspace": dict(row), "user": dict(g.current_user)})
+    return jsonify({"workspace": dict(row), "user": current_user_context()})
 
 
 @app.post("/api/workspace/plan")
@@ -2730,6 +2787,27 @@ def api_list_monitors():
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+def get_monitor_for_workspace(
+    conn: sqlite3.Connection, monitor_id: int, workspace_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (monitor_id, workspace_id),
+    ).fetchone()
+
+
+@app.get("/api/monitors/<int:monitor_id>")
+@require_auth
+def api_get_monitor(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    conn.close()
+    if not row:
+        return jsonify({"error": "Monitor not found"}), 404
+    return jsonify(dict(row))
 
 
 @app.post("/api/tasks")
@@ -3161,15 +3239,16 @@ def api_update_monitor(monitor_id: int):
         return jsonify({"error": "enabled is required"}), 400
 
     conn = db()
-    conn.execute("update monitors set enabled = ? where id = ? and workspace_id = ?", (int(bool(enabled)), monitor_id, workspace_id))
-    conn.commit()
-    row = conn.execute(
-        "select * from monitors where id = ? and workspace_id = ?",
-        (monitor_id, workspace_id),
-    ).fetchone()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     if not row:
         conn.close()
         return jsonify({"error": "Monitor not found"}), 404
+    conn.execute(
+        "update monitors set enabled = ? where id = ? and workspace_id = ?",
+        (int(bool(enabled)), monitor_id, workspace_id),
+    )
+    conn.commit()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
     return jsonify(dict(row))
 
@@ -3179,10 +3258,11 @@ def api_update_monitor(monitor_id: int):
 def api_delete_monitor(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
-    conn.execute(
-        "delete from monitors where id = ? and workspace_id = ?",
-        (monitor_id, current_workspace_id()),
-    )
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+    conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -3193,10 +3273,7 @@ def api_delete_monitor(monitor_id: int):
 def api_check_monitor(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
-    row = conn.execute(
-        "select * from monitors where id = ? and workspace_id = ?",
-        (monitor_id, current_workspace_id()),
-    ).fetchone()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
     if not row:
         return jsonify({"error": "Monitor not found"}), 404
@@ -3360,15 +3437,16 @@ def api_add_webhook():
     if not url.startswith("https://discord.com/api/webhooks/"):
         return jsonify({"error": "Invalid Discord webhook URL"}), 400
 
+    workspace_id = get_workspace_id_for_request()
     conn = db()
-    secret_id = create_secret(conn, current_workspace_id(), "webhook_url", url, int(g.current_user["id"]))
+    secret_id = create_secret(conn, workspace_id, "webhook_url", url, int(g.current_user["id"]))
     cur = conn.execute(
         """
         insert into webhooks(workspace_id, name, webhook_url, webhook_secret_id, notify_success, notify_failures, notify_restock_only, created_at)
         values (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            current_workspace_id(),
+            workspace_id,
             name,
             redact_webhook_url(url),
             secret_id,
@@ -3384,16 +3462,26 @@ def api_add_webhook():
     return jsonify(serialize_webhook(row)), 201
 
 
+def get_webhook_for_workspace(
+    conn: sqlite3.Connection, webhook_id: int, workspace_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from webhooks where id = ? and workspace_id = ?",
+        (webhook_id, workspace_id),
+    ).fetchone()
+
+
 @app.get("/api/webhooks")
 @require_auth
 def api_list_webhooks():
     role_error = ensure_workspace_role("owner", "admin")
     if role_error:
         return role_error
+    workspace_id = get_workspace_id_for_request()
     conn = db()
     rows = conn.execute(
         "select * from webhooks where workspace_id = ? order by id desc",
-        (current_workspace_id(),),
+        (workspace_id,),
     ).fetchall()
     conn.close()
     return jsonify([serialize_webhook(r) for r in rows])
@@ -3405,11 +3493,9 @@ def api_test_webhook(webhook_id: int):
     role_error = ensure_workspace_role("owner", "admin")
     if role_error:
         return role_error
+    workspace_id = get_workspace_id_for_request()
     conn = db()
-    hook = conn.execute(
-        "select * from webhooks where id = ? and workspace_id = ?",
-        (webhook_id, current_workspace_id()),
-    ).fetchone()
+    hook = get_webhook_for_workspace(conn, webhook_id, workspace_id)
     conn.close()
     if not hook:
         return jsonify({"error": "Webhook not found"}), 404
@@ -3425,7 +3511,7 @@ def api_test_webhook(webhook_id: int):
             task_key=f"webhook-test-{webhook_id}",
             method="POST",
             url=hook["webhook_url"],
-            workspace_id=current_workspace_id(),
+            workspace_id=workspace_id,
             proxy_url=None,
             timeout=8,
             retry_total=1,
@@ -3477,20 +3563,20 @@ def api_update_webhook(webhook_id: int):
         fields.append(("notify_restock_only", int(bool(body["notify_restock_only"]))))
     if not fields:
         return jsonify({"error": "No mutable fields provided"}), 400
+    workspace_id = get_workspace_id_for_request()
     conn = db()
+    row = get_webhook_for_workspace(conn, webhook_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Webhook not found"}), 404
     for key, value in fields:
         conn.execute(
             f"update webhooks set {key} = ? where id = ? and workspace_id = ?",
-            (value, webhook_id, current_workspace_id()),
+            (value, webhook_id, workspace_id),
         )
     conn.commit()
-    row = conn.execute(
-        "select * from webhooks where id = ? and workspace_id = ?",
-        (webhook_id, current_workspace_id()),
-    ).fetchone()
+    row = get_webhook_for_workspace(conn, webhook_id, workspace_id)
     conn.close()
-    if not row:
-        return jsonify({"error": "Webhook not found"}), 404
     return jsonify(dict(row))
 
 
@@ -3500,15 +3586,15 @@ def api_delete_webhook(webhook_id: int):
     role_error = ensure_workspace_role("owner", "admin")
     if role_error:
         return role_error
+    workspace_id = get_workspace_id_for_request()
     conn = db()
-    cur = conn.execute(
-        "delete from webhooks where id = ? and workspace_id = ?",
-        (webhook_id, current_workspace_id()),
-    )
+    row = get_webhook_for_workspace(conn, webhook_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Webhook not found"}), 404
+    conn.execute("delete from webhooks where id = ? and workspace_id = ?", (webhook_id, workspace_id))
     conn.commit()
     conn.close()
-    if cur.rowcount == 0:
-        return jsonify({"error": "Webhook not found"}), 404
     return jsonify({"ok": True})
 
 
