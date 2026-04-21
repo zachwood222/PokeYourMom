@@ -1983,189 +1983,6 @@ def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]
     return sync_manual_billing_subscription_event(payload)
 
 
-def extract_price_cents(text: str) -> int | None:
-    matches = re.findall(r"\$\s*(\d{1,4}(?:\.\d{2})?)", text)
-    if not matches:
-        return None
-    values = []
-    for m in matches:
-        try:
-            v = float(m)
-            if 1.0 <= v <= 2000.0:
-                values.append(int(round(v * 100)))
-        except ValueError:
-            continue
-    return min(values) if values else None
-
-
-def _parse_common_title_and_text(html: str) -> tuple[str, str]:
-    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
-    title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "Product"
-    text = re.sub(r"<[^>]+>", " ", html).lower()
-    return title[:180], text
-
-
-def default_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-
-    out_markers = [
-        "out of stock",
-        "sold out",
-        "unavailable",
-        "not available",
-        "coming soon",
-        "temporarily out of stock",
-    ]
-    in_markers = [
-        "in stock",
-        "add to cart",
-        "buy now",
-        "pickup",
-        "ship it",
-    ]
-
-    has_out = any(m in text for m in out_markers)
-    has_in = any(m in text for m in in_markers)
-
-    in_stock = has_in and not has_out
-    availability_reason = "fallback_unknown"
-    parser_confidence = 0.2
-    if has_out and not has_in:
-        availability_reason = "marker_out_of_stock"
-        parser_confidence = 0.9
-    elif has_in and not has_out:
-        availability_reason = "marker_in_stock"
-        parser_confidence = 0.9
-    elif has_in and has_out:
-        availability_reason = "marker_conflict"
-        parser_confidence = 0.35
-    keyword_matched: bool | None = None
-    if keyword:
-        keyword_matched = keyword.lower() in text
-    price_cents = extract_price_cents(re.sub(r"<[^>]+>", " ", html))
-    status_text = "in_stock" if in_stock else "out_or_unknown"
-    return MonitorResult(
-        in_stock=in_stock,
-        price_cents=price_cents,
-        title=title[:180],
-        status_text=status_text,
-        availability_reason=availability_reason,
-        parser_confidence=parser_confidence,
-        keyword_matched=keyword_matched,
-    )
-
-
-def pokemoncenter_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-    result = default_parser(html, keyword=keyword)
-    out_markers = ["notify me when available", "currently unavailable"]
-    in_markers = ["add to bag"]
-    has_out = any(m in text for m in out_markers)
-    has_in = any(m in text for m in in_markers)
-    if has_out:
-        result.in_stock = False
-        result.status_text = "out_or_unknown"
-        result.availability_reason = "pokemoncenter_marker_out_of_stock"
-        result.parser_confidence = 0.98
-    elif has_in:
-        result.in_stock = True
-        result.status_text = "in_stock"
-        result.availability_reason = "pokemoncenter_marker_in_stock"
-        result.parser_confidence = 0.98
-    result.title = title
-    return result
-
-
-def walmart_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-    result = default_parser(html, keyword=keyword)
-    if '"availability":"instock"' in text or "fulfillmentoptions" in text:
-        result.in_stock = True
-        result.status_text = "in_stock"
-        result.availability_reason = "walmart_marker_in_stock"
-        result.parser_confidence = 0.98
-    if '"availability":"outofstock"' in text or "out of stock" in text:
-        result.in_stock = False
-        result.status_text = "out_or_unknown"
-        result.availability_reason = "walmart_marker_out_of_stock"
-        result.parser_confidence = 0.98
-    result.price_cents = extract_price_cents(html)
-    result.title = title
-    return result
-
-
-def target_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-    result = default_parser(html, keyword=keyword)
-
-    in_markers = [
-        '"availability":"instock"',
-        '"availability":"in_stock"',
-        "add to cart",
-        "ship it",
-        "pick up",
-    ]
-    out_markers = [
-        '"availability":"outofstock"',
-        '"availability":"out_of_stock"',
-        "out of stock",
-        "sold out",
-        "unavailable",
-    ]
-    has_in = any(marker in text for marker in in_markers)
-    has_out = any(marker in text for marker in out_markers)
-
-    if has_out:
-        result.in_stock = False
-        result.status_text = "out_or_unknown"
-        result.availability_reason = "target_marker_out_of_stock"
-        result.parser_confidence = 0.98
-    elif has_in:
-        result.in_stock = True
-        result.status_text = "in_stock"
-        result.availability_reason = "target_marker_in_stock"
-        result.parser_confidence = 0.98
-
-    result.price_cents = extract_price_cents(html)
-    result.title = title
-    return result
-
-
-def bestbuy_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-    result = default_parser(html, keyword=keyword)
-
-    in_markers = [
-        '"buttonstate":"add to cart"',
-        '"shipping":"available"',
-        "ready for pickup today",
-    ]
-    out_markers = [
-        '"buttonstate":"sold out"',
-        '"buttonstate":"coming soon"',
-        '"shipping":"unavailable"',
-        "sold out",
-        "coming soon",
-    ]
-    has_in = any(marker in text for marker in in_markers)
-    has_out = any(marker in text for marker in out_markers)
-
-    if has_out:
-        result.in_stock = False
-        result.status_text = "out_or_unknown"
-        result.availability_reason = "bestbuy_marker_out_of_stock"
-        result.parser_confidence = 0.98
-    elif has_in:
-        result.in_stock = True
-        result.status_text = "in_stock"
-        result.availability_reason = "bestbuy_marker_in_stock"
-        result.parser_confidence = 0.98
-
-    result.price_cents = extract_price_cents(html)
-    result.title = title
-    return result
-
-
 def get_adapter_for_retailer(retailer: str | None):
     return resolve_retailer_adapter(retailer)
 
@@ -2822,6 +2639,66 @@ class CheckoutRetryableError(RuntimeError):
     pass
 
 
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
+def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    config_raw = payload.get("task_config")
+    try:
+        payload["task_config"] = json.loads(config_raw) if config_raw else {}
+    except (TypeError, json.JSONDecodeError):
+        payload["task_config"] = {}
+    return payload
+
+
+def redact_webhook_url(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 12:
+        return "***"
+    return f"{value[:8]}...{value[-4:]}"
+
+
+def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    payload["webhook_url"] = redact_webhook_url(payload.get("webhook_url") or "")
+    payload = redact_sensitive_payload(payload)
+    return payload
 def _classify_checkout_step_failure(step: str, exc: Exception, attempt_number: int) -> tuple[bool, str]:
     policy = CHECKOUT_STEP_RETRY_POLICY[step]
     if isinstance(exc, (ValueError, PermissionError)):
@@ -5296,6 +5173,9 @@ def api_update_monitor(monitor_id: int):
 
 @app.delete("/api/monitors/<int:monitor_id>")
 @require_auth
+def api_workspace():
+    row = get_workspace(current_workspace_id())
+    return jsonify({"workspace": dict(row), "user": current_user_context()})
 def api_delete_monitor(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
@@ -5393,6 +5273,25 @@ def api_list_checkout_tasks():
     return jsonify([serialize_checkout_task_summary(row) for row in rows])
 
 
+def get_monitor_for_workspace(
+    conn: sqlite3.Connection, monitor_id: int, workspace_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (monitor_id, workspace_id),
+    ).fetchone()
+
+
+@app.get("/api/monitors/<int:monitor_id>")
+@require_auth
+def api_get_monitor(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    conn.close()
+    if not row:
+        return jsonify({"error": "Monitor not found"}), 404
+    return jsonify(dict(row))
 @app.get("/api/checkout/tasks/<int:task_id>/attempts")
 @require_auth
 def api_checkout_task_attempts(task_id: int):
@@ -5626,6 +5525,33 @@ def api_checkout_task_attempts(task_id: int):
 @require_auth
 def api_checkout_task_attempts(task_id: int):
     conn = db()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+    conn.execute(
+        "update monitors set enabled = ? where id = ? and workspace_id = ?",
+        (int(bool(enabled)), monitor_id, workspace_id),
+    )
+    conn.commit()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    conn.close()
+    return jsonify(dict(row))
+
+
+@app.delete("/api/monitors/<int:monitor_id>")
+@require_auth
+def api_delete_monitor(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+    conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
     row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
     if not row:
         conn.close()
@@ -5659,6 +5585,7 @@ def api_checkout_task_attempts(task_id: int):
 @require_auth
 def api_checkout_task_state(task_id: int):
     conn = db()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
     if not row:
         conn.close()

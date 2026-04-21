@@ -53,6 +53,10 @@ The last two commands are explicit migration-safety checks for:
   - `X-API-Token: <token>`
 - `POST /api/webhooks` to add Discord webhook.
 - `POST /api/monitors` to add product monitor.
+- `POST /api/checkout/tasks` to create a checkout task for an existing monitor.
+- `POST /api/checkout/tasks/:id/start|pause|stop` to manage checkout task lifecycle.
+- `GET /api/checkout/tasks/:id/state` to read canonical task state and last attempt metadata.
+- `POST /api/start` to begin background checks.
 - `POST /api/checkout/tasks` to create a checkout task from an existing monitor.
 - `POST /api/checkout/tasks/:id/start` to transition task into `monitoring`.
 - `POST /api/checkout/tasks/:id/run` to execute the checkout state machine (`monitoring` → `carting` → `shipping` → `payment` → `submitting`).
