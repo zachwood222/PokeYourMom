@@ -53,9 +53,19 @@ The last two commands are explicit migration-safety checks for:
   - `X-API-Token: <token>`
 - `POST /api/webhooks` to add Discord webhook.
 - `POST /api/monitors` to add product monitor.
+- `POST /api/checkout/tasks` to create a checkout task for an existing monitor.
+- `POST /api/checkout/tasks/:id/start|pause|stop` to manage checkout task lifecycle.
+- `GET /api/checkout/tasks/:id/state` to read canonical task state and last attempt metadata.
 - `POST /api/start` to begin background checks.
 - `POST /api/monitors/:id/check` to run an immediate check.
 - `GET /api/workspace/usage-limits` to retrieve plan limits + current usage snapshot.
+
+Monitor check response compatibility notes:
+
+- `POST /api/monitors/:id/check` now includes `availability_reason` and `parser_confidence`.
+- Existing response fields are unchanged.
+- `parser_confidence` is normalized to the range `[0.0, 1.0]`; if unavailable/invalid, it is `null`.
+- Clients that do not use these new fields can safely ignore them.
 
 Example:
 
