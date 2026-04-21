@@ -31,6 +31,7 @@ from retailers import (
     MonitorResult,
     canonical_retailer,
     default_parser,
+    parse_monitor_html,
     resolve_retailer_adapter,
     run_retailer_flow,
 )
@@ -1993,6 +1994,7 @@ def evaluate_page(
     retailer: str | None = None,
     category: str | None = None,
 ) -> MonitorResult:
+    return parse_monitor_html(html=html, keyword=keyword, retailer=retailer)
     adapter = get_adapter_for_retailer(retailer)
     return run_retailer_flow(adapter, {"html": html, "keyword": keyword, "category": category})
 
@@ -2637,6 +2639,39 @@ def transition_checkout_task(
 
 class CheckoutRetryableError(RuntimeError):
     pass
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
 
 
 def create_secret(
@@ -5280,6 +5315,18 @@ def get_monitor_for_workspace(
         "select * from monitors where id = ? and workspace_id = ?",
         (monitor_id, workspace_id),
     ).fetchone()
+
+
+@app.get("/api/monitors/<int:monitor_id>")
+@require_auth
+def api_get_monitor(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    conn.close()
+    if not row:
+        return jsonify({"error": "Monitor not found"}), 404
+    return jsonify(dict(row))
 
 
 @app.get("/api/monitors/<int:monitor_id>")
