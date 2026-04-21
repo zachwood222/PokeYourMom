@@ -508,6 +508,63 @@ def test_keyword_and_max_price_filter_block_event(tmp_path, monkeypatch):
     assert posted_payloads == []
 
 
+def test_create_event_and_deliver_uses_shared_request_helper_only(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    captured = {}
+
+    class DummyResponse:
+        status_code = 204
+        text = ""
+        ok = True
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    def fail_direct_post(*_args, **_kwargs):
+        raise AssertionError("direct requests.post should not be used for webhook delivery")
+
+    monkeypatch.setattr(app_module.requests, "post", fail_direct_post)
+
+    conn = app_module.db()
+    conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/p', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor = conn.execute("select * from monitors order by id desc limit 1").fetchone()
+    conn.execute(
+        "insert into webhooks(workspace_id, name, webhook_url, created_at) values (1, 'Main', 'https://discord.com/api/webhooks/test', ?)",
+        (app_module.utc_now(),),
+    )
+    conn.commit()
+    conn.close()
+
+    result = app_module.MonitorResult(
+        in_stock=True,
+        price_cents=2500,
+        title="Pokemon Product",
+        status_text="in_stock",
+        keyword_matched=True,
+    )
+    app_module.create_event_and_deliver(monitor, result, eligible=True)
+
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://discord.com/api/webhooks/test"
+    assert captured["retry_total"] == 1
+    assert captured["backoff_factor"] == 0.2
+
+
 def test_evaluate_page_sets_keyword_and_price_fields(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
 
@@ -651,6 +708,103 @@ def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
     assert tables == {"users", "workspace_members"}
     assert users_count == 1
     assert members_count == 1
+
+
+def test_fetch_monitor_uses_monitor_proxy_override_and_session_task_key(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    class DummyResponse:
+        status_code = 200
+        text = "<html><title>Item</title><body>in stock add to cart $19.99</body></html>"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    captured = {}
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    conn.execute("update workspaces set proxy_url = ? where id = 1", ("http://workspace-proxy:8080",))
+    cur = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, proxy_url, session_task_key, created_at
+        ) values (1, 'target', 'https://example.com/item', 20, 'http://monitor-proxy:9090', 'session-custom-1', ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor = conn.execute("select * from monitors where id = ?", (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+
+    result = app_module.fetch_monitor(monitor)
+
+    assert result.in_stock is True
+    assert captured["task_key"] == "session-custom-1"
+    assert captured["proxy_url"] == "http://monitor-proxy:9090"
+    assert captured["retry_total"] == 2
+    assert captured["backoff_factor"] == 0.35
+
+
+def test_fetch_monitor_uses_workspace_proxy_and_default_session_task_key(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    class DummyResponse:
+        status_code = 200
+        text = "<html><title>Item</title><body>out of stock $29.99</body></html>"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    captured = {}
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    conn.execute("update workspaces set proxy_url = ? where id = 1", ("http://workspace-proxy:8080",))
+    cur = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, proxy_url, session_task_key, created_at
+        ) values (1, 'walmart', 'https://example.com/item2', 20, null, null, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    monitor_id = int(cur.lastrowid)
+    monitor = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
+    conn.commit()
+    conn.close()
+
+    result = app_module.fetch_monitor(monitor)
+
+    assert result.in_stock is False
+    assert captured["task_key"] == f"monitor-{monitor_id}"
+    assert captured["proxy_url"] == "http://workspace-proxy:8080"
+    assert captured["retry_total"] == 2
+    assert captured["backoff_factor"] == 0.35
 
 
 def test_api_routes_require_auth(tmp_path, monkeypatch):
@@ -1075,6 +1229,49 @@ def test_check_update_returns_fallback_payload_on_upstream_failure(tmp_path, mon
     assert payload["latest_version"] == "3.1.0"
     assert payload["update_available"] is False
     assert "source_error" in payload
+
+
+def test_webhook_test_endpoint_uses_shared_request_helper(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    captured = {}
+
+    class DummyResponse:
+        status_code = 204
+        text = ""
+
+    class FakeReqResult:
+        def __init__(self):
+            self.response = DummyResponse()
+            self.error = None
+            self.telemetry = None
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return FakeReqResult()
+
+    monkeypatch.setattr(app_module, "perform_request", fake_request)
+
+    conn = app_module.db()
+    cur = conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, created_at)
+        values (1, 'Main', 'https://discord.com/api/webhooks/test-endpoint', ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    webhook_id = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+
+    resp = client.post(f"/api/webhooks/{webhook_id}/test", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["ok"] is True
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://discord.com/api/webhooks/test-endpoint"
+    assert captured["task_key"] == f"webhook-test-{webhook_id}"
 
 
 def test_monitor_failure_trends_returns_seeded_counts(tmp_path, monkeypatch):
