@@ -303,6 +303,7 @@
             <div>
               <label>Monitor</label>
               <select id="task_monitor_id"></select>
+              <p class="small">Create a monitor first in “Add Product Monitor”.</p>
             </div>
             <div>
               <label>Task Name (Optional)</label>
@@ -913,12 +914,25 @@
     async function loadMonitors() {
       const rows = await apiFetch('/api/monitors').then(r => r.json());
       const taskMonitorSelect = document.getElementById('task_monitor_id');
-      if (taskMonitorSelect) {
-        taskMonitorSelect.innerHTML = rows
-          .map((m) => `<option value="${m.id}">#${m.id} ${m.retailer} - ${m.product_url}</option>`)
-          .join('');
-      }
       const tbody = document.getElementById('monitors');
+      if (!Array.isArray(rows)) {
+        if (taskMonitorSelect) {
+          taskMonitorSelect.innerHTML = '<option disabled selected>Unable to load monitors (check API auth)</option>';
+        }
+        if (tbody) {
+          tbody.innerHTML = '';
+        }
+        return;
+      }
+      if (taskMonitorSelect) {
+        if (rows.length === 0) {
+          taskMonitorSelect.innerHTML = '<option disabled selected>No monitors yet — add one below first</option>';
+        } else {
+          taskMonitorSelect.innerHTML = rows
+            .map((m) => `<option value="${m.id}">#${m.id} ${m.retailer} - ${m.product_url}</option>`)
+            .join('');
+        }
+      }
       tbody.innerHTML = '';
       for (const r of rows) {
         const tr = document.createElement('tr');
