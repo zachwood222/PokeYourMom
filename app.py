@@ -1597,10 +1597,29 @@ def init_db() -> None:
             foreign key(job_id) references jobs(id)
         );
 
+        create table if not exists monitor_automation_policies (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            alerts_enabled integer not null default 1,
+            autobuy_enabled integer not null default 0,
+            alert_throttle_seconds integer,
+            autobuy_cooldown_seconds integer,
+            dedupe_window_seconds integer,
+            dedupe_scope text,
+            created_at text not null,
+            updated_at text not null,
+            unique(workspace_id, monitor_id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id)
+        );
+
         create index if not exists idx_alert_subscriptions_workspace_enabled
             on alert_subscriptions(workspace_id, enabled);
         create index if not exists idx_alert_events_workspace_created
             on alert_events(workspace_id, created_at);
+        create index if not exists idx_monitor_automation_policies_workspace_monitor
+            on monitor_automation_policies(workspace_id, monitor_id);
         """
     )
     existing = conn.execute("select id from workspaces limit 1").fetchone()
@@ -2457,22 +2476,110 @@ def dedupe_key(monitor: sqlite3.Row, result: MonitorResult) -> str:
     return f"{monitor['id']}:{result.in_stock}:{bucket}:{minute}"
 
 
+def action_dedupe_key(
+    *,
+    workspace_id: int,
+    monitor_id: int,
+    action_type: str,
+    event_id: int | None = None,
+    source_key: str | None = None,
+) -> str:
+    event_token = str(event_id) if event_id is not None else "no-event"
+    source_token = (source_key or "").strip() or "none"
+    raw = f"{workspace_id}:{monitor_id}:{action_type}:{event_token}:{source_token}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _normalize_policy_bool(value: Any, *, field_name: str) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(bool(value))
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return 1
+        if normalized in {"0", "false", "no", "off"}:
+            return 0
+    raise ValueError(f"{field_name} must be a boolean")
+
+
+def _normalize_policy_optional_int(value: Any, *, field_name: str) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must be an integer or null") from None
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be >= 0")
+    return parsed
+
+
+def serialize_monitor_automation_policy(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "workspace_id": row["workspace_id"],
+        "monitor_id": row["monitor_id"],
+        "alerts_enabled": bool(row["alerts_enabled"]),
+        "autobuy_enabled": bool(row["autobuy_enabled"]),
+        "alert_throttle_seconds": row["alert_throttle_seconds"],
+        "autobuy_cooldown_seconds": row["autobuy_cooldown_seconds"],
+        "dedupe_window_seconds": row["dedupe_window_seconds"],
+        "dedupe_scope": row["dedupe_scope"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_or_create_monitor_automation_policy(
+    conn: sqlite3.Connection, *, workspace_id: int, monitor_id: int
+) -> sqlite3.Row:
+    policy = conn.execute(
+        """
+        select * from monitor_automation_policies
+        where workspace_id = ? and monitor_id = ?
+        """,
+        (workspace_id, monitor_id),
+    ).fetchone()
+    if policy:
+        return policy
+    now_iso = utc_now()
+    conn.execute(
+        """
+        insert into monitor_automation_policies(
+            workspace_id, monitor_id, alerts_enabled, autobuy_enabled, created_at, updated_at
+        ) values (?, ?, 1, 0, ?, ?)
+        """,
+        (workspace_id, monitor_id, now_iso, now_iso),
+    )
+    return conn.execute(
+        """
+        select * from monitor_automation_policies
+        where workspace_id = ? and monitor_id = ?
+        """,
+        (workspace_id, monitor_id),
+    ).fetchone()
+
+
 def create_event_and_deliver(
     monitor: sqlite3.Row,
     result: MonitorResult,
     eligible: bool | None = None,
-) -> None:
+    *,
+    dispatch_alerts: bool = True,
+) -> int | None:
     if eligible is None:
         eligible = alert_eligibility(monitor, result)
     if not eligible:
-        return
+        return None
 
     key = dedupe_key(monitor, result)
     conn = db()
     existing = conn.execute("select id from events where dedupe_key = ?", (key,)).fetchone()
     if existing:
         conn.close()
-        return
+        return int(existing["id"])
 
     ev = (
         monitor["id"],
@@ -2498,62 +2605,63 @@ def create_event_and_deliver(
         (monitor["workspace_id"],),
     ).fetchall()
 
-    payload = {
-        "username": "Stock Sentinel",
-        "content": "@here In-stock alert",
-        "embeds": [
-            {
-                "title": f"In Stock: {result.title}",
-                "url": monitor["product_url"],
-                "description": f"Retailer: {monitor['retailer']}",
-                "color": 5763719,
-                "fields": [
-                    {"name": "Price", "value": cents_to_dollars(result.price_cents), "inline": True},
-                    {"name": "Status", "value": "IN STOCK", "inline": True},
-                    {"name": "Detected", "value": utc_now(), "inline": False},
-                ],
-                "footer": {"text": f"Monitor ID: {monitor['id']}"},
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-        ],
-    }
+    if dispatch_alerts:
+        payload = {
+            "username": "Stock Sentinel",
+            "content": "@here In-stock alert",
+            "embeds": [
+                {
+                    "title": f"In Stock: {result.title}",
+                    "url": monitor["product_url"],
+                    "description": f"Retailer: {monitor['retailer']}",
+                    "color": 5763719,
+                    "fields": [
+                        {"name": "Price", "value": cents_to_dollars(result.price_cents), "inline": True},
+                        {"name": "Status", "value": "IN STOCK", "inline": True},
+                        {"name": "Detected", "value": utc_now(), "inline": False},
+                    ],
+                    "footer": {"text": f"Monitor ID: {monitor['id']}"},
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            ],
+        }
 
-    for hook in webhooks:
-        if not should_send_to_webhook(monitor, hook, eligible):
-            continue
-        status, code, body = "queued", None, ""
-        try:
-            target_url = resolve_webhook_url(conn, hook)
-            req = perform_request(
-                task_key=f"webhook-{hook['id']}",
-                method="POST",
-                url=target_url,
-                workspace_id=monitor["workspace_id"],
-                proxy_url=None,
-                timeout=8,
-                retry_total=1,
-                backoff_factor=0.2,
-                json=payload,
+        for hook in webhooks:
+            if not should_send_to_webhook(monitor, hook, eligible):
+                continue
+            status, code, body = "queued", None, ""
+            try:
+                target_url = resolve_webhook_url(conn, hook)
+                req = perform_request(
+                    task_key=f"webhook-{hook['id']}",
+                    method="POST",
+                    url=target_url,
+                    workspace_id=monitor["workspace_id"],
+                    proxy_url=None,
+                    timeout=8,
+                    retry_total=1,
+                    backoff_factor=0.2,
+                    json=payload,
+                )
+                if req.error:
+                    raise req.error
+                assert req.response is not None
+                resp = req.response
+                code = resp.status_code
+                body = (resp.text or "")[:1000]
+                status = "sent" if 200 <= resp.status_code < 300 else "failed"
+            except Exception as exc:  # noqa: BLE001
+                status = "failed"
+                body = str(exc)
+
+            conn.execute(
+                """
+                insert into deliveries(event_id, webhook_id, status, response_code, response_body, delivered_at)
+                values (?, ?, ?, ?, ?, ?)
+                """,
+                (event_id, hook["id"], status, code, body, utc_now()),
             )
-            if req.error:
-                raise req.error
-            assert req.response is not None
-            resp = req.response
-            code = resp.status_code
-            body = (resp.text or "")[:1000]
-            status = "sent" if 200 <= resp.status_code < 300 else "failed"
-        except Exception as exc:  # noqa: BLE001
-            status = "failed"
-            body = str(exc)
-
-        conn.execute(
-            """
-            insert into deliveries(event_id, webhook_id, status, response_code, response_body, delivered_at)
-            values (?, ?, ?, ?, ?, ?)
-            """,
-            (event_id, hook["id"], status, code, body, utc_now()),
-        )
-        update_webhook_health(conn, hook["id"], status=status, status_code=code, error_text=body)
+            update_webhook_health(conn, hook["id"], status=status, status_code=code, error_text=body)
 
     conn.commit()
     conn.close()
@@ -2563,6 +2671,7 @@ def create_event_and_deliver(
         workspace_id=monitor["workspace_id"],
         monitor_id=monitor["id"],
     )
+    return int(event_id)
 
 
 def normalize_checkout_state(raw_state: Any, *, allow_control_states: bool = True) -> str:
@@ -4355,11 +4464,36 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
 
 
 def enqueue_checkout_for_monitor(
-    monitor: sqlite3.Row, result: MonitorResult, *, reason: str = "in_stock_detected"
+    monitor: sqlite3.Row,
+    result: MonitorResult,
+    *,
+    reason: str = "in_stock_detected",
+    event_id: int | None = None,
+    dedupe_window_seconds: int | None = None,
 ) -> int | None:
     if not result.in_stock:
         return None
     conn = db()
+    action_key = None
+    if event_id is not None:
+        dedupe_window = max(int(dedupe_window_seconds or 60), 1)
+        price_bucket = (result.price_cents or -1) // 100
+        window_bucket = int(time.time() // dedupe_window)
+        source_key = f"monitor-hit:{monitor['id']}:{price_bucket}:{window_bucket}"
+        action_key = action_dedupe_key(
+            workspace_id=int(monitor["workspace_id"]),
+            monitor_id=int(monitor["id"]),
+            event_id=int(event_id),
+            action_type="autobuy_monitor_hit",
+            source_key=source_key,
+        )
+        existing_action = conn.execute(
+            "select id, task_id from alert_event_actions where dedupe_key = ?",
+            (action_key,),
+        ).fetchone()
+        if existing_action:
+            conn.close()
+            return int(existing_action["task_id"]) if existing_action["task_id"] else None
     binding_ok, binding_error = _require_checkout_binding(
         conn,
         workspace_id=monitor["workspace_id"],
@@ -4373,6 +4507,23 @@ def enqueue_checkout_for_monitor(
             workspace_id=monitor["workspace_id"],
             monitor_id=monitor["id"],
         )
+        if action_key and event_id is not None:
+            conn.execute(
+                """
+                insert or ignore into alert_event_actions(
+                    event_id, workspace_id, monitor_id, action_type, status, dedupe_key, details, created_at
+                ) values (?, ?, ?, 'autobuy_monitor_hit', 'skipped_binding', ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    monitor["workspace_id"],
+                    monitor["id"],
+                    action_key,
+                    json.dumps({"reason": reason, "error": binding_error}),
+                    utc_now(),
+                ),
+            )
+            conn.commit()
         conn.close()
         return None
     existing = conn.execute(
@@ -4396,6 +4547,23 @@ def enqueue_checkout_for_monitor(
             message=f"Existing active checkout task {existing['id']} detected",
             payload={"reason": reason},
         )
+        if action_key and event_id is not None:
+            conn.execute(
+                """
+                insert or ignore into alert_event_actions(
+                    event_id, workspace_id, monitor_id, action_type, status, dedupe_key, task_id, details, created_at
+                ) values (?, ?, ?, 'autobuy_monitor_hit', 'skipped_existing_task', ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    monitor["workspace_id"],
+                    monitor["id"],
+                    action_key,
+                    existing["id"],
+                    json.dumps({"reason": reason}),
+                    utc_now(),
+                ),
+            )
         conn.commit()
         conn.close()
         return existing["id"]
@@ -4437,6 +4605,23 @@ def enqueue_checkout_for_monitor(
         message=f"Checkout task {task['id']} enqueued from monitor {monitor['id']}",
         payload={"price_cents": result.price_cents, "title": result.title},
     )
+    if action_key and event_id is not None:
+        conn.execute(
+            """
+            insert or ignore into alert_event_actions(
+                event_id, workspace_id, monitor_id, action_type, status, dedupe_key, task_id, details, created_at
+            ) values (?, ?, ?, 'autobuy_monitor_hit', 'enqueued', ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                monitor["workspace_id"],
+                monitor["id"],
+                action_key,
+                task["id"],
+                json.dumps({"reason": reason, "title": result.title, "price_cents": result.price_cents}),
+                utc_now(),
+            ),
+        )
     conn.commit()
     conn.close()
     return int(task["id"])
@@ -4781,13 +4966,22 @@ def create_monitor_error_events(monitor: sqlite3.Row, error_text: str) -> None:
     )
 
 
-def emit_monitor_events(monitor: sqlite3.Row, result: MonitorResult, eligible: bool) -> None:
+def emit_monitor_events(
+    monitor: sqlite3.Row,
+    result: MonitorResult,
+    eligible: bool,
+    *,
+    alerts_enabled: bool,
+    autobuy_enabled: bool,
+) -> None:
     payload = {
         "monitor_id": monitor["id"],
         "workspace_id": monitor["workspace_id"],
         "retailer": monitor["retailer"],
         "status_text": result.status_text,
         "eligible_for_alert": bool(eligible),
+        "alerts_enabled": bool(alerts_enabled),
+        "autobuy_enabled": bool(autobuy_enabled),
         "in_stock": bool(result.in_stock),
         "price_cents": result.price_cents,
         "availability_reason": result.availability_reason,
@@ -4891,9 +5085,39 @@ def process_post_persist_actions(
     strict: bool,
 ) -> None:
     _handle_queue_detected_for_waiting_tasks(monitor, result)
-    if eligible:
+    conn = db()
+    policy = get_or_create_monitor_automation_policy(
+        conn,
+        workspace_id=int(monitor["workspace_id"]),
+        monitor_id=int(monitor["id"]),
+    )
+    conn.commit()
+    conn.close()
+
+    alerts_enabled = bool(policy["alerts_enabled"]) and bool(eligible)
+    autobuy_enabled = bool(policy["autobuy_enabled"]) and bool(eligible)
+    event_id: int | None = None
+    if alerts_enabled or autobuy_enabled:
         try:
-            enqueue_checkout_for_monitor(monitor, result)
+            event_id = create_event_and_deliver(monitor, result, eligible, dispatch_alerts=alerts_enabled)
+        except Exception as exc:  # noqa: BLE001
+            if strict:
+                raise
+            log(
+                f"Event/webhook notify failed for monitor {monitor['id']}: {exc}",
+                level="warning",
+                workspace_id=monitor["workspace_id"],
+                monitor_id=monitor["id"],
+            )
+
+    if autobuy_enabled:
+        try:
+            enqueue_checkout_for_monitor(
+                monitor,
+                result,
+                event_id=event_id,
+                dedupe_window_seconds=policy["dedupe_window_seconds"],
+            )
         except Exception as exc:  # noqa: BLE001
             if strict:
                 raise
@@ -4905,19 +5129,13 @@ def process_post_persist_actions(
             )
 
     try:
-        create_event_and_deliver(monitor, result, eligible)
-    except Exception as exc:  # noqa: BLE001
-        if strict:
-            raise
-        log(
-            f"Event/webhook notify failed for monitor {monitor['id']}: {exc}",
-            level="warning",
-            workspace_id=monitor["workspace_id"],
-            monitor_id=monitor["id"],
+        emit_monitor_events(
+            monitor,
+            result,
+            eligible,
+            alerts_enabled=alerts_enabled,
+            autobuy_enabled=autobuy_enabled,
         )
-
-    try:
-        emit_monitor_events(monitor, result, eligible)
     except Exception as exc:  # noqa: BLE001
         if strict:
             raise
@@ -5663,6 +5881,146 @@ def api_list_monitors():
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/monitor-automation-policies")
+@require_auth
+def api_create_monitor_automation_policy():
+    body = request.json or {}
+    monitor_id = body.get("monitor_id")
+    if monitor_id is None:
+        return jsonify({"error": "monitor_id is required"}), 400
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    monitor = get_monitor_for_workspace(conn, int(monitor_id), workspace_id)
+    if not monitor:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+    updates: dict[str, Any] = {}
+    try:
+        updates["alerts_enabled"] = _normalize_policy_bool(body.get("alerts_enabled", True), field_name="alerts_enabled")
+        updates["autobuy_enabled"] = _normalize_policy_bool(body.get("autobuy_enabled", False), field_name="autobuy_enabled")
+        updates["alert_throttle_seconds"] = _normalize_policy_optional_int(
+            body.get("alert_throttle_seconds"), field_name="alert_throttle_seconds"
+        )
+        updates["autobuy_cooldown_seconds"] = _normalize_policy_optional_int(
+            body.get("autobuy_cooldown_seconds"), field_name="autobuy_cooldown_seconds"
+        )
+        updates["dedupe_window_seconds"] = _normalize_policy_optional_int(
+            body.get("dedupe_window_seconds"), field_name="dedupe_window_seconds"
+        )
+    except ValueError as exc:
+        conn.close()
+        return jsonify({"error": str(exc)}), 400
+    dedupe_scope = body.get("dedupe_scope")
+    updates["dedupe_scope"] = str(dedupe_scope).strip() if dedupe_scope not in (None, "") else None
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into monitor_automation_policies(
+            workspace_id, monitor_id, alerts_enabled, autobuy_enabled, alert_throttle_seconds,
+            autobuy_cooldown_seconds, dedupe_window_seconds, dedupe_scope, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(workspace_id, monitor_id) do update set
+            alerts_enabled = excluded.alerts_enabled,
+            autobuy_enabled = excluded.autobuy_enabled,
+            alert_throttle_seconds = excluded.alert_throttle_seconds,
+            autobuy_cooldown_seconds = excluded.autobuy_cooldown_seconds,
+            dedupe_window_seconds = excluded.dedupe_window_seconds,
+            dedupe_scope = excluded.dedupe_scope,
+            updated_at = excluded.updated_at
+        """,
+        (
+            workspace_id,
+            int(monitor_id),
+            updates["alerts_enabled"],
+            updates["autobuy_enabled"],
+            updates["alert_throttle_seconds"],
+            updates["autobuy_cooldown_seconds"],
+            updates["dedupe_window_seconds"],
+            updates["dedupe_scope"],
+            now_iso,
+            now_iso,
+        ),
+    )
+    policy = conn.execute(
+        "select * from monitor_automation_policies where workspace_id = ? and monitor_id = ?",
+        (workspace_id, int(monitor_id)),
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    status_code = 201 if cur.lastrowid else 200
+    return jsonify({"policy": serialize_monitor_automation_policy(policy)}), status_code
+
+
+@app.get("/api/monitor-automation-policies")
+@require_auth
+def api_list_monitor_automation_policies():
+    monitor_id = request.args.get("monitor_id", type=int)
+    if monitor_id is None:
+        return jsonify({"error": "monitor_id query parameter is required"}), 400
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    monitor = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    if not monitor:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+    policy = get_or_create_monitor_automation_policy(conn, workspace_id=workspace_id, monitor_id=monitor_id)
+    conn.commit()
+    conn.close()
+    return jsonify({"policies": [serialize_monitor_automation_policy(policy)]})
+
+
+@app.patch("/api/monitor-automation-policies/<int:policy_id>")
+@require_auth
+def api_update_monitor_automation_policy(policy_id: int):
+    workspace_id = get_workspace_id_for_request()
+    body = request.json or {}
+    updates: dict[str, Any] = {}
+    try:
+        if "alerts_enabled" in body:
+            updates["alerts_enabled"] = _normalize_policy_bool(body.get("alerts_enabled"), field_name="alerts_enabled")
+        if "autobuy_enabled" in body:
+            updates["autobuy_enabled"] = _normalize_policy_bool(body.get("autobuy_enabled"), field_name="autobuy_enabled")
+        if "alert_throttle_seconds" in body:
+            updates["alert_throttle_seconds"] = _normalize_policy_optional_int(
+                body.get("alert_throttle_seconds"), field_name="alert_throttle_seconds"
+            )
+        if "autobuy_cooldown_seconds" in body:
+            updates["autobuy_cooldown_seconds"] = _normalize_policy_optional_int(
+                body.get("autobuy_cooldown_seconds"), field_name="autobuy_cooldown_seconds"
+            )
+        if "dedupe_window_seconds" in body:
+            updates["dedupe_window_seconds"] = _normalize_policy_optional_int(
+                body.get("dedupe_window_seconds"), field_name="dedupe_window_seconds"
+            )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if "dedupe_scope" in body:
+        updates["dedupe_scope"] = str(body.get("dedupe_scope") or "").strip() or None
+    if not updates:
+        return jsonify({"error": "No updatable fields provided"}), 400
+    updates["updated_at"] = utc_now()
+    conn = db()
+    policy = conn.execute(
+        "select * from monitor_automation_policies where id = ? and workspace_id = ?",
+        (policy_id, workspace_id),
+    ).fetchone()
+    if not policy:
+        conn.close()
+        return jsonify({"error": "Policy not found"}), 404
+    set_clause = ", ".join(f"{column} = ?" for column in updates)
+    conn.execute(
+        f"update monitor_automation_policies set {set_clause} where id = ? and workspace_id = ?",
+        (*updates.values(), policy_id, workspace_id),
+    )
+    updated = conn.execute(
+        "select * from monitor_automation_policies where id = ? and workspace_id = ?",
+        (policy_id, workspace_id),
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify({"policy": serialize_monitor_automation_policy(updated)})
 
 
 @app.post("/api/monitors/monitor-assist/apply")
