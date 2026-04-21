@@ -469,6 +469,13 @@
           <div class="card"><div class="kpi-label">Events (24h)</div><div id="kpi_events_24h" class="kpi-value">0</div></div>
           <div class="card"><div class="kpi-label">Delivery Success</div><div id="kpi_success_rate" class="kpi-value">0%</div></div>
         </div>
+        <div class="kpi-grid" style="margin-top:12px;">
+          <div class="card"><div class="kpi-label">Checks Total</div><div id="ops_checks_total" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Checks Failed</div><div id="ops_checks_failed_total" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Alerts Created</div><div id="ops_alerts_created_total" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Webhook Sent</div><div id="ops_webhook_sent_total" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Webhook Failed</div><div id="ops_webhook_failed_total" class="kpi-value">0</div></div>
+        </div>
 
         <div class="workspace">
           <div class="card">
@@ -933,7 +940,25 @@
       document.getElementById('runtime_latest_check_badge').textContent = data.latest_check_at || 'N/A';
       loopRunning = !!data.running;
       document.getElementById('loopBtn').textContent = loopRunning ? 'Stop Monitor Loop' : 'Start Monitor Loop';
+      await loadOpsMetrics();
       await loadOpsTrends();
+    }
+
+    async function loadOpsMetrics() {
+      const metrics = await apiFetch('/api/ops/metrics')
+        .then(r => r.json())
+        .catch(() => ({}));
+      const checksTotal = Number(metrics.checks_total || 0);
+      const checksFailed = Number(metrics.checks_failed_total || 0);
+      const alertsCreated = Number(metrics.alerts_created_total || 0);
+      const webhookSent = Number(metrics.webhook_sent_total || 0);
+      const webhookFailed = Number(metrics.webhook_failed_total || 0);
+
+      document.getElementById('ops_checks_total').textContent = checksTotal;
+      document.getElementById('ops_checks_failed_total').textContent = checksFailed;
+      document.getElementById('ops_alerts_created_total').textContent = alertsCreated;
+      document.getElementById('ops_webhook_sent_total').textContent = webhookSent;
+      document.getElementById('ops_webhook_failed_total').textContent = webhookFailed;
     }
 
     async function loadOpsTrends() {

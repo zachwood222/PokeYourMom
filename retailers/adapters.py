@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 RETAILER_ALIASES = {
+    "walmart.com": "walmart",
+    "walmart com": "walmart",
     "wal-mart": "walmart",
     "wal mart": "walmart",
     "target.com": "target",
