@@ -148,6 +148,35 @@
     .actions { display: flex; gap: 6px; flex-wrap: wrap; }
     .actions button { width: auto; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .quick-setup-steps {
+      margin: 0 0 10px;
+      padding-left: 20px;
+      color: #d8e2f4;
+      font-size: 13px;
+    }
+    .quick-setup-steps li { margin-bottom: 4px; }
+    .legacy-path {
+      opacity: 0.72;
+      border-style: dashed;
+    }
+    .legacy-path h2::after {
+      content: " (Legacy)";
+      color: var(--muted);
+      font-weight: 500;
+    }
+    details.quick-advanced {
+      margin-top: 10px;
+      border: 1px solid #27334d;
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #0f1728;
+    }
+    details.quick-advanced summary {
+      cursor: pointer;
+      color: #c8d5ec;
+      font-size: 12px;
+      user-select: none;
+    }
 
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { padding: 7px 8px; border-bottom: 1px solid #222e44; text-align: left; }
@@ -520,6 +549,59 @@
 
       <section id="tab-monitors" class="tab">
         <h1>Task Controls</h1>
+        <div class="card">
+          <h2>Quick Setup</h2>
+          <ol class="quick-setup-steps">
+            <li>Create Monitor</li>
+            <li>Enable Auto Action (Alert + Auto-buy)</li>
+          </ol>
+          <form onsubmit="createQuickSetupFlow(event)">
+            <div class="row">
+              <div>
+                <label>Retailer</label>
+                <select id="quick_retailer">
+                  <option>walmart</option>
+                  <option>target</option>
+                  <option>bestbuy</option>
+                </select>
+              </div>
+              <div>
+                <label>Poll Interval (seconds)</label>
+                <input id="quick_poll_interval" type="number" value="20" />
+              </div>
+            </div>
+            <label>Product URL</label>
+            <input id="quick_product_url" placeholder="https://www.walmart.com/ip/..." />
+            <div class="row" style="margin-top:10px;">
+              <div>
+                <label>Webhook Target</label>
+                <select id="quick_webhook_target"></select>
+              </div>
+              <div>
+                <label>Monitor Selection (Optional Existing)</label>
+                <select id="quick_monitor_selection"></select>
+              </div>
+            </div>
+            <details class="quick-advanced">
+              <summary>Advanced</summary>
+              <div class="row" style="margin-top:8px;">
+                <div>
+                  <label>Keyword Filter</label>
+                  <input id="quick_keyword" placeholder="pokemon" />
+                </div>
+                <div>
+                  <label>Max Price Cents</label>
+                  <input id="quick_max_price_cents" type="number" placeholder="4000" />
+                </div>
+              </div>
+              <div style="margin-top:8px;">
+                <label>Original MSRP Cents (Pokemon only)</label>
+                <input id="quick_msrp_cents" type="number" placeholder="499" />
+              </div>
+            </details>
+            <button class="btn-primary" style="margin-top:12px;" type="submit">Run Quick Setup</button>
+          </form>
+        </div>
         <div class="kpi-grid task-summary-grid">
           <div class="card"><div class="kpi-label">Total Tasks</div><div id="task_kpi_total" class="kpi-value">0</div></div>
           <div class="card"><div class="kpi-label">Active</div><div id="task_kpi_active" class="kpi-value">0</div></div>
@@ -541,7 +623,7 @@
           </div>
         </div>
 
-        <div class="card">
+        <div class="card legacy-path">
           <h2>Create Automation Task</h2>
           <div class="dense-grid">
             <div class="dense-form-row">
@@ -601,7 +683,7 @@
           </div>
         </div>
 
-        <div class="card" style="margin-top:14px;">
+        <div class="card legacy-path" style="margin-top:14px;">
           <h2>Add Product Monitor</h2>
           <div class="row">
             <div>
@@ -809,6 +891,7 @@
     const TASK_VIRTUALIZATION_THRESHOLD = 120;
     const TASK_VIRTUAL_ROW_HEIGHT = 52;
     const TASK_VIRTUAL_BUFFER = 8;
+    const QUICK_SETUP_POLICY_ENDPOINT = '/api/automation-policies';
     let taskMonitorsById = new Map();
     const toArray = (value, key) => Array.isArray(value) ? value : (value && Array.isArray(value[key]) ? value[key] : []);
     function toggleTaskSelected(taskId, isSelected) {
@@ -1104,6 +1187,75 @@
       } catch (error) {
         alert(`Failed to add monitor due to a network or fetch error: ${error?.message || error}`);
       }
+    }
+
+    async function createQuickSetupFlow(event) {
+      if (event) event.preventDefault();
+      const monitorInput = (document.getElementById('quick_product_url')?.value || '').trim();
+      const monitorValidationError = validateMonitorInputClient(monitorInput, {isEditFlow: false, existingProductCount: 0});
+      if (monitorValidationError) {
+        showToast(monitorValidationError, true);
+        return;
+      }
+
+      const selectedMonitorId = Number((document.getElementById('quick_monitor_selection')?.value || '').trim());
+      const pollIntervalRaw = (document.getElementById('quick_poll_interval')?.value || '').trim();
+      const pollIntervalParsed = pollIntervalRaw === '' ? 20 : Number(pollIntervalRaw);
+      if (!Number.isFinite(pollIntervalParsed) || pollIntervalParsed <= 0) {
+        showToast('Poll interval must be a valid positive number of seconds.', true);
+        return;
+      }
+
+      let monitorId = Number.isInteger(selectedMonitorId) && selectedMonitorId > 0 ? selectedMonitorId : null;
+      if (!monitorId) {
+        const maxPrice = document.getElementById('quick_max_price_cents')?.value || '';
+        const msrp = document.getElementById('quick_msrp_cents')?.value || '';
+        const monitorPayload = {
+          retailer: document.getElementById('quick_retailer')?.value || '',
+          product_url: monitorInput,
+          poll_interval_seconds: pollIntervalParsed,
+          keyword: (document.getElementById('quick_keyword')?.value || '').trim() || null,
+          max_price_cents: maxPrice ? Number(maxPrice) : null,
+          msrp_cents: msrp ? Number(msrp) : null,
+        };
+        const monitorRes = await apiFetch('/api/monitors', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(appendCaptchaToken(monitorPayload))
+        });
+        const monitorData = await monitorRes.json();
+        if (!monitorRes.ok || monitorData?.error || !monitorData?.id) {
+          showToast(monitorData?.error || `Failed to create monitor (HTTP ${monitorRes.status}).`, true);
+          return;
+        }
+        monitorId = Number(monitorData.id);
+      }
+
+      const webhookId = Number((document.getElementById('quick_webhook_target')?.value || '').trim());
+      if (!Number.isInteger(webhookId) || webhookId <= 0) {
+        showToast('Select a webhook target before enabling auto action.', true);
+        return;
+      }
+      const policyRes = await apiFetch(QUICK_SETUP_POLICY_ENDPOINT, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken({
+          monitor_id: monitorId,
+          webhook_id: webhookId,
+          auto_buy_enabled: true,
+          alert_enabled: true,
+        }))
+      });
+      const policyData = await policyRes.json();
+      if (!policyRes.ok || policyData?.error || !policyData?.id) {
+        showToast(policyData?.error || `Failed to create automation policy (HTTP ${policyRes.status}).`, true);
+        return;
+      }
+
+      showToast(`Quick setup complete: monitor #${monitorId}, policy #${policyData.id}.`);
+      await loadMonitors();
+      await loadTasks();
+      await loadDashboardSummary();
     }
 
     async function createTask() {
@@ -1519,11 +1671,15 @@
     async function loadMonitors() {
       const rows = await apiFetch('/api/monitors').then(r => r.json());
       const taskMonitorSelect = document.getElementById('task_monitor_id');
+      const quickMonitorSelect = document.getElementById('quick_monitor_selection');
       const tbody = document.getElementById('monitors');
       taskMonitorsById = new Map(Array.isArray(rows) ? rows.map((m) => [Number(m.id), m]) : []);
       if (!Array.isArray(rows)) {
         if (taskMonitorSelect) {
           taskMonitorSelect.innerHTML = '<option disabled selected>Unable to load monitors (check API auth)</option>';
+        }
+        if (quickMonitorSelect) {
+          quickMonitorSelect.innerHTML = '<option disabled selected>Unable to load monitors</option>';
         }
         if (tbody) {
           tbody.innerHTML = '';
@@ -1531,14 +1687,27 @@
         return;
       }
       if (taskMonitorSelect) {
+        const previous = taskMonitorSelect.value;
         if (rows.length === 0) {
           taskMonitorSelect.innerHTML = '<option disabled selected>No monitors yet — add one below first</option>';
         } else {
           taskMonitorSelect.innerHTML = rows
             .map((m) => `<option value="${m.id}">#${m.id} ${m.retailer} - ${m.product_url}</option>`)
             .join('');
+          if (previous && rows.some((m) => String(m.id) === previous)) taskMonitorSelect.value = previous;
         }
         taskMonitorSelect.onchange = () => updateTaskModeFields();
+      }
+      if (quickMonitorSelect) {
+        const previousQuick = quickMonitorSelect.value;
+        if (rows.length === 0) {
+          quickMonitorSelect.innerHTML = '<option value="">Create a new monitor in Step 1</option>';
+        } else {
+          quickMonitorSelect.innerHTML = '<option value="">Create a new monitor in Step 1</option>' + rows
+            .map((m) => `<option value="${m.id}">Use #${m.id} ${m.retailer}</option>`)
+            .join('');
+          if (previousQuick && rows.some((m) => String(m.id) === previousQuick)) quickMonitorSelect.value = previousQuick;
+        }
       }
       tbody.innerHTML = '';
       for (const r of rows) {
@@ -1585,8 +1754,22 @@
 
     async function loadWebhooks() {
       const hooks = await apiFetch('/api/webhooks').then(r => r.json());
+      const quickWebhookSelect = document.getElementById('quick_webhook_target');
       const tbody = document.getElementById('webhooks');
       tbody.innerHTML = '';
+      if (quickWebhookSelect) {
+        const previous = quickWebhookSelect.value;
+        if (!Array.isArray(hooks) || hooks.length === 0) {
+          quickWebhookSelect.innerHTML = '<option value="">Add a webhook first</option>';
+        } else {
+          quickWebhookSelect.innerHTML = hooks
+            .map((h) => `<option value="${h.id}">#${h.id} ${h.name}</option>`)
+            .join('');
+          if (previous && hooks.some((h) => String(h.id) === previous)) {
+            quickWebhookSelect.value = previous;
+          }
+        }
+      }
       for (const h of hooks) {
         const tr = document.createElement('tr');
         tr.innerHTML = `
