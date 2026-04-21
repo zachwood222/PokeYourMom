@@ -131,27 +131,55 @@ worker_thread: threading.Thread | None = None
 worker_lock = threading.Lock()
 
 CHECKOUT_TASK_STATES = {
-    "queued",
-    "monitoring",
-    "carting",
-    "shipping",
-    "payment",
-    "verification_pending",
-    "verification_code_received",
-    "submitting",
+    "idle",
+    "starting",
+    "waiting_for_queue",
+    "solving_hcaptcha",
+    "in_queue",
+    "passed_queue",
+    "waiting_for_monitor_input",
+    "monitoring_product",
+    "adding_to_cart",
+    "checking_out",
     "success",
-    "failed",
+    "decline",
+    "requeued",
+    "antibot_datadome",
+    "antibot_incapsula",
+    "error",
     "paused",
     "stopped",
 }
 
-CHECKOUT_STEP_SEQUENCE = ["monitoring", "carting", "shipping", "payment", "submitting"]
+CHECKOUT_TERMINAL_STATES = {"success", "decline", "error", "stopped"}
+CHECKOUT_ACTIVE_STATES = CHECKOUT_TASK_STATES - CHECKOUT_TERMINAL_STATES - {"paused", "idle"}
+
+CHECKOUT_STEP_SEQUENCE = ["monitoring_product", "adding_to_cart", "checking_out"]
 CHECKOUT_STEP_RETRY_POLICY = {
-    "monitoring": {"max_attempts": 3},
-    "carting": {"max_attempts": 3},
-    "shipping": {"max_attempts": 2},
-    "payment": {"max_attempts": 2},
-    "submitting": {"max_attempts": 2},
+    "monitoring_product": {"max_attempts": 3},
+    "adding_to_cart": {"max_attempts": 3},
+    "checking_out": {"max_attempts": 3},
+}
+
+TASK_STATUS_LABELS = {
+    "idle": "Idle",
+    "starting": "Starting",
+    "waiting_for_queue": "Queue Wait",
+    "solving_hcaptcha": "Captcha",
+    "in_queue": "In Queue",
+    "passed_queue": "Queue Passed",
+    "waiting_for_monitor_input": "Input Wait",
+    "monitoring_product": "Monitoring",
+    "adding_to_cart": "Adding to Cart",
+    "checking_out": "Checking Out",
+    "success": "Success",
+    "decline": "Declined",
+    "requeued": "Requeued",
+    "antibot_datadome": "DataDome",
+    "antibot_incapsula": "Incapsula",
+    "error": "Error",
+    "paused": "Paused",
+    "stopped": "Stopped",
 }
 
 MAILBOX_SECRET_TYPES = {"mailbox_password", "mailbox_oauth_refresh_token", "mailbox_oauth_access_token"}
@@ -637,17 +665,23 @@ def table_exists(conn: sqlite3.Connection, table: str) -> bool:
 def normalize_legacy_task_state(raw_state: Any) -> str:
     state = str(raw_state or "").strip().lower()
     compat_map = {
-        "idle": "queued",
-        "running": "monitoring",
+        "queued": "idle",
+        "idle": "idle",
+        "running": "monitoring_product",
+        "monitoring": "monitoring_product",
+        "carting": "adding_to_cart",
+        "shipping": "checking_out",
+        "payment": "checking_out",
+        "submitting": "checking_out",
         "complete": "success",
         "completed": "success",
-        "error": "failed",
+        "failed": "decline",
         "cancelled": "stopped",
         "canceled": "stopped",
     }
-    state = compat_map.get(state, state or "queued")
+    state = compat_map.get(state, state or "idle")
     if state not in CHECKOUT_TASK_STATES:
-        return "queued"
+        return "idle"
     return state
 
 
@@ -1214,9 +1248,10 @@ def init_db() -> None:
             task_config text,
             active_proxy_id integer,
             active_proxy_lease_key text,
-            current_state text not null default 'queued',
+            current_state text not null default 'idle',
             enabled integer not null default 0,
             is_paused integer not null default 0,
+            status_timestamps_json text,
             last_error text,
             created_at text not null,
             updated_at text not null,
@@ -1547,6 +1582,7 @@ def init_db() -> None:
     ensure_column(conn, "checkout_attempts", "step", "text")
     ensure_column(conn, "checkout_attempts", "error", "text")
     ensure_column(conn, "checkout_attempts", "updated_at", "text")
+    ensure_column(conn, "checkout_tasks", "status_timestamps_json", "text")
     run_legacy_tasks_migration(conn)
     run_pokemon_center_task_group_config_migration(conn)
     conn.commit()
@@ -2068,6 +2104,13 @@ def _resolve_monitor_input(
     return canonical_url, parsed_products
 
 
+def normalize_monitor_assist_pid(raw_pid: str) -> str:
+    digits = re.sub(r"\D+", "", str(raw_pid or ""))
+    if len(digits) != 10:
+        raise ValueError("PID must contain exactly 10 digits")
+    return f"{digits[:2]}-{digits[2:7]}-{digits[7:]}"
+
+
 def _normalize_plan_hint(value: str | None) -> str:
     if not value:
         return ""
@@ -2434,11 +2477,20 @@ def create_event_and_deliver(
 
 def normalize_checkout_state(raw_state: Any, *, allow_control_states: bool = True) -> str:
     state = str(raw_state or "").strip().lower()
+    compatibility = {
+        "queued": "idle",
+        "monitoring": "monitoring_product",
+        "carting": "adding_to_cart",
+        "shipping": "checking_out",
+        "payment": "checking_out",
+        "submitting": "checking_out",
+        "failed": "decline",
+    }
+    state = compatibility.get(state, state)
     valid_states = CHECKOUT_TASK_STATES if allow_control_states else CHECKOUT_TASK_STATES - {"paused", "stopped"}
     if state not in valid_states:
-        raise ValueError(
-            "Invalid checkout state. Expected one of: queued, monitoring, carting, shipping, payment, verification_pending, verification_code_received, submitting, success, failed"
-        )
+        expected = ", ".join(sorted(valid_states))
+        raise ValueError(f"Invalid checkout state. Expected one of: {expected}")
     return state
 
 
@@ -2725,7 +2777,7 @@ def create_checkout_task(
     monitor_id: int,
     task_name: str | None = None,
     task_config: dict[str, Any] | None = None,
-    initial_state: str = "queued",
+    initial_state: str = "idle",
 ) -> sqlite3.Row:
     task_config = dict(task_config or {})
     monitor_row = conn.execute(
@@ -2747,13 +2799,24 @@ def create_checkout_task(
             current_state,
             enabled,
             is_paused,
+            status_timestamps_json,
             created_at,
             updated_at,
             last_transition_at
         )
-        values (?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+        values (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
         """,
-        (workspace_id, monitor_id, task_name, json.dumps(task_config or {}), normalized_state, now_iso, now_iso, now_iso),
+        (
+            workspace_id,
+            monitor_id,
+            task_name,
+            json.dumps(task_config or {}),
+            normalized_state,
+            json.dumps({normalized_state: now_iso}),
+            now_iso,
+            now_iso,
+            now_iso,
+        ),
     )
     task_id = cur.lastrowid
     record_checkout_attempt(
@@ -2787,6 +2850,34 @@ def get_checkout_task_for_workspace(
     ).fetchone()
 
 
+def _build_transition_timestamp_map(row: sqlite3.Row, next_state: str, now_iso: str) -> dict[str, str]:
+    raw_map = row["status_timestamps_json"] if "status_timestamps_json" in row.keys() else None
+    existing = parse_json_object(raw_map)
+    timeline = {str(key): str(value) for key, value in existing.items() if str(key) and str(value)}
+    timeline[next_state] = now_iso
+    return timeline
+
+
+def serialize_checkout_task_summary(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    payload = serialize_checkout_task(row)
+    if payload is None:
+        return None
+    state = str(payload.get("current_state") or "idle")
+    timestamps = parse_json_object(payload.get("status_timestamps_json"))
+    return {
+        "id": payload["id"],
+        "workspace_id": payload["workspace_id"],
+        "monitor_id": payload["monitor_id"],
+        "task_name": payload.get("task_name"),
+        "retailer": (payload.get("task_config") or {}).get("retailer"),
+        "current_state": state,
+        "status_label": TASK_STATUS_LABELS.get(state, state.replace("_", " ").title()),
+        "status_timestamps": timestamps,
+        "last_transition_at": payload.get("last_transition_at"),
+        "last_error": payload.get("last_error"),
+    }
+
+
 def transition_checkout_task(
     conn: sqlite3.Connection,
     *,
@@ -2805,7 +2896,7 @@ def transition_checkout_task(
     active_lease_key = row["active_proxy_lease_key"]
     active_proxy_id = row["active_proxy_id"]
     allocator = ProxyAllocator(conn)
-    if normalized_state == "monitoring" and not active_lease_key:
+    if normalized_state == "monitoring_product" and not active_lease_key:
         policy = task_config.get("proxy_policy") if isinstance(task_config.get("proxy_policy"), dict) else {}
         sticky = int(policy.get("sticky_session_seconds") or 300)
         lease = allocator.acquire_lease(
@@ -2818,7 +2909,7 @@ def transition_checkout_task(
         if lease:
             active_lease_key = lease.lease_key
             active_proxy_id = lease.proxy_id
-    if normalized_state in {"paused", "stopped", "success", "failed"} and active_lease_key:
+    if normalized_state in CHECKOUT_TERMINAL_STATES.union({"paused"}) and active_lease_key:
         lease_row = conn.execute(
             "select id from proxy_leases where owner_type = 'checkout_task' and owner_id = ? and lease_key = ? and released_at is null",
             (task_id, active_lease_key),
@@ -2827,9 +2918,11 @@ def transition_checkout_task(
             allocator.release_lease(lease_id=lease_row["id"])
         active_lease_key = None
         active_proxy_id = None
-    enabled = int(normalized_state not in {"stopped", "success", "failed"})
+    enabled = int(normalized_state in CHECKOUT_ACTIVE_STATES)
     is_paused = int(normalized_state == "paused")
     now_iso = utc_now()
+    timestamp_map = _build_transition_timestamp_map(row, normalized_state, now_iso)
+    transition_error = (error_text or "")[:500] if error_text else None
     conn.execute(
         """
         update checkout_tasks
@@ -2838,6 +2931,7 @@ def transition_checkout_task(
             is_paused = ?,
             active_proxy_id = ?,
             active_proxy_lease_key = ?,
+            status_timestamps_json = ?,
             last_error = ?,
             updated_at = ?,
             last_transition_at = ?
@@ -2849,7 +2943,8 @@ def transition_checkout_task(
             is_paused,
             active_proxy_id,
             active_lease_key,
-            (error_text or "")[:500] if error_text else None,
+            json.dumps(timestamp_map),
+            transition_error,
             now_iso,
             now_iso,
             task_id,
@@ -2864,14 +2959,14 @@ def transition_checkout_task(
         state=normalized_state,
         status="transition",
         details={"reason": reason},
-        error_text=transition_error,
+        error_text=error_text,
     )
     record_task_log(
         conn,
         task_id=task_id,
         workspace_id=workspace_id,
         monitor_id=row["monitor_id"],
-        level="info" if not transition_error else "error",
+        level="info" if not error_text else "error",
         event_type="state_transition",
         message=f"Task transitioned to {normalized_state}",
         payload={"reason": reason},
@@ -3066,7 +3161,7 @@ def _checkout_step_payment(
         raise ValueError("payment_method_missing")
     fail_step = str(config.get("simulate_fail_step") or "")
     fail_times = int(config.get("simulate_fail_times") or 0)
-    if fail_step == "payment" and attempt_number <= fail_times:
+    if fail_step in {"payment", "checking_out"} and attempt_number <= fail_times:
         if bool(config.get("simulate_retryable", True)):
             raise CheckoutRetryableError("simulated_payment_failure")
         raise ValueError("simulated_payment_terminal_failure")
@@ -3083,11 +3178,9 @@ def _checkout_step_submitting(
 
 
 CHECKOUT_STEP_HANDLERS = {
-    "monitoring": _checkout_step_monitoring,
-    "carting": _checkout_step_carting,
-    "shipping": _checkout_step_shipping,
-    "payment": _checkout_step_payment,
-    "submitting": _checkout_step_submitting,
+    "monitoring_product": _checkout_step_monitoring,
+    "adding_to_cart": _checkout_step_carting,
+    "checking_out": _checkout_step_payment,
 }
 
 
@@ -3154,7 +3247,7 @@ def _resolve_task_binding_context(
 
 
 def _validate_checkout_context_for_step(step: str, context: dict[str, Any], binding_errors: list[str]) -> str | None:
-    if step not in {"payment", "submitting"}:
+    if step != "checking_out":
         return None
     if binding_errors:
         return binding_errors[0]
@@ -3191,6 +3284,13 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
         (task["monitor_id"], workspace_id),
     ).fetchone()
 
+    transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        requested_state="starting",
+        reason="checkout_run_start",
+    )
     for step in CHECKOUT_STEP_SEQUENCE:
         context_error = _validate_checkout_context_for_step(step, config, binding_errors)
         if context_error:
@@ -3198,7 +3298,7 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
                 conn,
                 task_id=task_id,
                 workspace_id=workspace_id,
-                requested_state="failed",
+                requested_state="error",
                 reason=f"{step}:validation",
                 error_text=context_error,
             )
@@ -3273,13 +3373,31 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
                     message=f"{step} failed ({taxonomy})",
                     payload={"attempt_number": attempt_number, "retryable": retryable},
                 )
+                message = str(exc).lower()
+                if "queue_session_expired" in message or "queue expired" in message:
+                    transition_checkout_task(
+                        conn,
+                        task_id=task_id,
+                        workspace_id=workspace_id,
+                        requested_state="requeued",
+                        reason=f"{step}:queue_session_expired",
+                        error_text=f"{taxonomy}:{exc}",
+                    )
+                    transition_checkout_task(
+                        conn,
+                        task_id=task_id,
+                        workspace_id=workspace_id,
+                        requested_state="waiting_for_queue",
+                        reason=f"{step}:waiting_for_new_queue",
+                    )
+                    continue
                 if retryable:
                     continue
                 transition_checkout_task(
                     conn,
                     task_id=task_id,
                     workspace_id=workspace_id,
-                    requested_state="failed",
+                    requested_state="decline",
                     reason=f"{step}:{taxonomy}",
                     error_text=f"{taxonomy}:{exc}",
                 )
@@ -3484,7 +3602,7 @@ def _checkout_step_payment(
         raise ValueError("payment_method_missing")
     fail_step = str(config.get("simulate_fail_step") or "")
     fail_times = int(config.get("simulate_fail_times") or 0)
-    if fail_step == "payment" and attempt_number <= fail_times:
+    if fail_step in {"payment", "checking_out"} and attempt_number <= fail_times:
         if bool(config.get("simulate_retryable", True)):
             raise CheckoutRetryableError("simulated_payment_failure")
         raise ValueError("simulated_payment_terminal_failure")
@@ -3501,11 +3619,9 @@ def _checkout_step_submitting(
 
 
 CHECKOUT_STEP_HANDLERS = {
-    "monitoring": _checkout_step_monitoring,
-    "carting": _checkout_step_carting,
-    "shipping": _checkout_step_shipping,
-    "payment": _checkout_step_payment,
-    "submitting": _checkout_step_submitting,
+    "monitoring_product": _checkout_step_monitoring,
+    "adding_to_cart": _checkout_step_carting,
+    "checking_out": _checkout_step_payment,
 }
 
 
@@ -3572,7 +3688,7 @@ def _resolve_task_binding_context(
 
 
 def _validate_checkout_context_for_step(step: str, context: dict[str, Any], binding_errors: list[str]) -> str | None:
-    if step not in {"payment", "submitting"}:
+    if step != "checking_out":
         return None
     if binding_errors:
         return binding_errors[0]
@@ -3609,6 +3725,13 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
         (task["monitor_id"], workspace_id),
     ).fetchone()
 
+    transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        requested_state="starting",
+        reason="checkout_run_start",
+    )
     for step in CHECKOUT_STEP_SEQUENCE:
         context_error = _validate_checkout_context_for_step(step, config, binding_errors)
         if context_error:
@@ -3616,7 +3739,7 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
                 conn,
                 task_id=task_id,
                 workspace_id=workspace_id,
-                requested_state="failed",
+                requested_state="decline",
                 reason=f"{step}:validation",
                 error_text=context_error,
             )
@@ -3691,13 +3814,31 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
                     message=f"{step} failed ({taxonomy})",
                     payload={"attempt_number": attempt_number, "retryable": retryable},
                 )
+                message = str(exc).lower()
+                if "queue_session_expired" in message or "queue expired" in message:
+                    transition_checkout_task(
+                        conn,
+                        task_id=task_id,
+                        workspace_id=workspace_id,
+                        requested_state="requeued",
+                        reason=f"{step}:queue_session_expired",
+                        error_text=f"{taxonomy}:{exc}",
+                    )
+                    transition_checkout_task(
+                        conn,
+                        task_id=task_id,
+                        workspace_id=workspace_id,
+                        requested_state="waiting_for_queue",
+                        reason=f"{step}:waiting_for_new_queue",
+                    )
+                    continue
                 if retryable:
                     continue
                 transition_checkout_task(
                     conn,
                     task_id=task_id,
                     workspace_id=workspace_id,
-                    requested_state="failed",
+                    requested_state="decline",
                     reason=f"{step}:{taxonomy}",
                     error_text=f"{taxonomy}:{exc}",
                 )
@@ -3743,7 +3884,7 @@ def enqueue_checkout_for_monitor(
         """
         select * from checkout_tasks
         where workspace_id = ? and monitor_id = ?
-          and current_state not in ('success', 'failed', 'stopped')
+          and current_state not in ('success', 'decline', 'error', 'stopped')
         order by id desc
         limit 1
         """,
@@ -3764,24 +3905,26 @@ def enqueue_checkout_for_monitor(
         conn.close()
         return existing["id"]
 
+    task_config = {
+        "retailer": monitor["retailer"],
+        "category": monitor["category"],
+        "product_url": monitor["product_url"],
+    }
+    initial_state = "waiting_for_queue" if bool(task_config.get("wait_for_queue")) else "queued"
     task = create_checkout_task(
         conn,
         workspace_id=monitor["workspace_id"],
         monitor_id=monitor["id"],
         task_name=f"Monitor {monitor['id']} checkout",
-        task_config={
-            "retailer": monitor["retailer"],
-            "category": monitor["category"],
-            "product_url": monitor["product_url"],
-        },
-        initial_state="queued",
+        task_config=task_config,
+        initial_state=initial_state,
     )
     record_checkout_attempt(
         conn,
         task_id=task["id"],
         workspace_id=monitor["workspace_id"],
         monitor_id=monitor["id"],
-        state="queued",
+        state=initial_state,
         status="enqueued",
         details={
             "reason": reason,
@@ -3891,26 +4034,18 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return payload
 
 
+def serialize_checkout_task_summary(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    return serialize_task_ui(row)
+
+
 def serialize_task_ui(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    payload = serialize_checkout_task(row)
+    payload = serialize_checkout_task_summary(row)
     if payload is None:
         return None
-    config = payload.get("task_config") or {}
-    current_state = str(payload.get("current_state") or "queued")
-    state = "running" if current_state == "monitoring" else ("idle" if current_state == "queued" else current_state)
-    return {
-        "id": payload["id"],
-        "current_state": current_state,
-        "state": state,
-        "retries": 0,
-        "last_step": current_state,
-        "last_error": payload.get("last_error"),
-        "retailer": config.get("retailer"),
-        "product_url": config.get("product_url"),
-        "profile": config.get("profile"),
-        "account": config.get("account"),
-        "payment": config.get("payment"),
-    }
+    payload["state"] = payload["current_state"]
+    payload["retries"] = 0
+    payload["last_step"] = payload["current_state"]
+    return payload
 
 
 def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -3918,7 +4053,7 @@ def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return None
     config = payload.get("task_config") or {}
     current_state = str(payload.get("current_state") or "queued")
-    state = "running" if current_state == "monitoring" else ("idle" if current_state == "queued" else current_state)
+    state = "running" if current_state == "monitoring" else ("idle" if current_state in {"queued", "waiting_for_queue"} else current_state)
     return {
         "id": payload["id"],
         "state": state,
@@ -4160,6 +4295,7 @@ def emit_monitor_events(monitor: sqlite3.Row, result: MonitorResult, eligible: b
         "price_cents": result.price_cents,
         "availability_reason": result.availability_reason,
         "parser_confidence": result.parser_confidence,
+        "queue_detected": bool(getattr(result, "queue_detected", False)),
         "checked_at": utc_now(),
     }
     try:
@@ -4212,6 +4348,44 @@ def persist_monitor_state(monitor: sqlite3.Row, result: MonitorResult, eligible:
     conn.commit()
     conn.close()
 
+def _handle_queue_detected_for_waiting_tasks(monitor: sqlite3.Row, result: MonitorResult) -> None:
+    if monitor["retailer"] != "pokemoncenter" or not bool(getattr(result, "queue_detected", False)):
+        return
+    conn = db()
+    waiting_tasks = conn.execute(
+        """
+        select *
+        from checkout_tasks
+        where workspace_id = ?
+          and monitor_id = ?
+          and current_state = 'waiting_for_queue'
+          and is_paused = 0
+        order by id asc
+        """,
+        (monitor["workspace_id"], monitor["id"]),
+    ).fetchall()
+    transitioned = 0
+    for task in waiting_tasks:
+        task_config = parse_json_object(task["task_config"])
+        if not bool(task_config.get("wait_for_queue")):
+            continue
+        delay_ms = _coerce_optional_int(task_config.get("queue_entry_delay_ms"))
+        if delay_ms and delay_ms > 0:
+            time.sleep(delay_ms / 1000)
+        updated = transition_checkout_task(
+            conn,
+            task_id=task["id"],
+            workspace_id=task["workspace_id"],
+            requested_state="monitoring",
+            reason="queue_detected_event",
+        )
+        if updated:
+            transitioned += 1
+    if transitioned:
+        conn.commit()
+    conn.close()
+
+
 def process_post_persist_actions(
     monitor: sqlite3.Row,
     result: MonitorResult,
@@ -4219,6 +4393,7 @@ def process_post_persist_actions(
     *,
     strict: bool,
 ) -> None:
+    _handle_queue_detected_for_waiting_tasks(monitor, result)
     if eligible:
         try:
             enqueue_checkout_for_monitor(monitor, result)
@@ -4548,7 +4723,7 @@ def execute_monitor_job(queue: SQLiteJobQueue, job: Job, *, now_iso: str) -> Non
 
 
 def _active_checkout_states() -> tuple[str, ...]:
-    return ("queued", "monitoring", "carting", "shipping", "payment", "submitting")
+    return tuple(sorted(CHECKOUT_ACTIVE_STATES))
 
 
 def _release_proxy_lock_if_owned(conn: sqlite3.Connection, account_id: int) -> None:
@@ -4637,7 +4812,7 @@ def run_checkout_account_scheduler(conn: sqlite3.Connection, *, now_iso: str) ->
           on t.workspace_id = a.workspace_id
          and t.monitor_id = b.monitor_id
          and t.is_paused = 0
-         and t.current_state in ('queued', 'monitoring', 'carting', 'shipping', 'payment', 'submitting')
+         and t.current_state in ('starting', 'waiting_for_queue', 'solving_hcaptcha', 'in_queue', 'passed_queue', 'waiting_for_monitor_input', 'monitoring_product', 'adding_to_cart', 'checking_out', 'requeued')
         order by a.id asc, t.id asc
         """
     ).fetchall()
@@ -4993,6 +5168,107 @@ def api_list_monitors():
     return jsonify([dict(r) for r in rows])
 
 
+@app.post("/api/monitors/monitor-assist/apply")
+@require_auth
+def api_apply_monitor_assist_pid():
+    body = request.json or {}
+    raw_monitor_ids = body.get("monitor_ids")
+    if not isinstance(raw_monitor_ids, list) or not raw_monitor_ids:
+        return jsonify({"error": "monitor_ids must be a non-empty list"}), 400
+    try:
+        monitor_ids = sorted({int(value) for value in raw_monitor_ids})
+    except (TypeError, ValueError):
+        return jsonify({"error": "monitor_ids must contain valid integers"}), 400
+
+    try:
+        pid = normalize_monitor_assist_pid(str(body.get("pid") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    product_url = f"https://www.pokemoncenter.com/product/{pid}"
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    placeholders = ",".join(["?"] * len(monitor_ids))
+    monitor_rows = conn.execute(
+        f"""
+        select id, retailer, product_url
+        from monitors
+        where workspace_id = ?
+          and id in ({placeholders})
+        """,
+        (workspace_id, *monitor_ids),
+    ).fetchall()
+    if not monitor_rows:
+        conn.close()
+        return jsonify({"error": "No matching monitors found"}), 404
+
+    eligible_monitor_ids = [row["id"] for row in monitor_rows if (row["retailer"] or "").strip().lower() == "pokemoncenter"]
+    if not eligible_monitor_ids:
+        conn.close()
+        return jsonify({"error": "Monitor assist currently supports pokemoncenter monitors only"}), 400
+
+    eligible_placeholders = ",".join(["?"] * len(eligible_monitor_ids))
+    conn.execute(
+        f"""
+        update monitors
+        set product_url = ?
+        where workspace_id = ?
+          and id in ({eligible_placeholders})
+        """,
+        (product_url, workspace_id, *eligible_monitor_ids),
+    )
+
+    task_rows = conn.execute(
+        f"""
+        select id, monitor_id, current_state
+        from checkout_tasks
+        where workspace_id = ?
+          and monitor_id in ({eligible_placeholders})
+        """,
+        (workspace_id, *eligible_monitor_ids),
+    ).fetchall()
+    for task in task_rows:
+        details = {
+            "event": "monitor_assist_pid_apply",
+            "pid": pid,
+            "product_url": product_url,
+            "source": "monitor_assist",
+        }
+        record_checkout_attempt(
+            conn,
+            task_id=int(task["id"]),
+            workspace_id=workspace_id,
+            monitor_id=int(task["monitor_id"]),
+            state=str(task["current_state"] or "queued"),
+            status="PID updated from monitor assist",
+            details=details,
+            error_text="PID updated from monitor assist",
+        )
+        record_task_log(
+            conn,
+            task_id=int(task["id"]),
+            workspace_id=workspace_id,
+            monitor_id=int(task["monitor_id"]),
+            level="info",
+            event_type="monitor_assist",
+            message="PID updated from monitor assist",
+            payload=details,
+        )
+
+    conn.commit()
+    conn.close()
+    return jsonify(
+        {
+            "ok": True,
+            "pid": pid,
+            "product_url": product_url,
+            "updated_monitors": len(eligible_monitor_ids),
+            "updated_tasks": len(task_rows),
+            "monitor_ids": eligible_monitor_ids,
+        }
+    )
+
+
 def get_monitor_for_workspace(
     conn: sqlite3.Connection, monitor_id: int, workspace_id: int
 ) -> sqlite3.Row | None:
@@ -5118,8 +5394,8 @@ def api_list_tasks():
                 config = json.loads(raw)
             except (TypeError, json.JSONDecodeError):
                 config = {}
-        state = row["current_state"]
-        compat_state = "idle" if state == "queued" and not row["enabled"] else ("running" if state == "monitoring" else state)
+        state = normalize_checkout_state(row["current_state"])
+        compat_state = "running" if state in CHECKOUT_ACTIVE_STATES else ("idle" if state == "idle" else state)
         payloads.append(
             {
                 "id": row["id"],
@@ -5827,6 +6103,37 @@ def api_start_checkout_task(task_id: int):
     payload = serialize_checkout_task_summary(row)
     socketio.emit("task_update", payload)
     return jsonify({"ok": True, "task": payload})
+
+
+@app.post("/api/checkout/tasks/start-now")
+@require_auth
+def api_start_checkout_tasks_now():
+    body = request.json or {}
+    task_ids = body.get("task_ids") if isinstance(body.get("task_ids"), list) else []
+    normalized_ids = [int(task_id) for task_id in task_ids if str(task_id).isdigit()]
+    if not normalized_ids:
+        return jsonify({"error": "task_ids is required"}), 400
+    conn = db()
+    workspace_id = current_workspace_id()
+    updated_tasks: list[dict[str, Any]] = []
+    for task_id in normalized_ids:
+        task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+        if not task:
+            continue
+        row = transition_checkout_task(
+            conn,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            requested_state="monitoring",
+            reason="api_start_now_override",
+        )
+        if row:
+            updated_tasks.append(serialize_task_ui(row))
+    conn.commit()
+    conn.close()
+    for payload in updated_tasks:
+        socketio.emit("task_update", payload)
+    return jsonify({"ok": True, "tasks": updated_tasks})
 
 
 @app.post("/api/checkout/tasks/<int:task_id>/run")
@@ -6880,8 +7187,8 @@ def _account_execution_read_model(conn: sqlite3.Connection, workspace_id: int) -
         select
             a.*,
             count(t.id) as queue_depth,
-            min(case when t.current_state != 'queued' then t.id end) as active_task_id,
-            min(case when t.current_state != 'queued' then t.current_state end) as active_task_state
+            min(case when t.current_state != 'idle' then t.id end) as active_task_id,
+            min(case when t.current_state != 'idle' then t.current_state end) as active_task_state
         from retailer_accounts a
         left join task_profile_bindings b
           on b.workspace_id = a.workspace_id
@@ -6890,7 +7197,7 @@ def _account_execution_read_model(conn: sqlite3.Connection, workspace_id: int) -
           on t.workspace_id = a.workspace_id
          and t.monitor_id = b.monitor_id
          and t.is_paused = 0
-         and t.current_state in ('queued', 'monitoring', 'carting', 'shipping', 'payment', 'submitting')
+         and t.current_state in ('starting', 'waiting_for_queue', 'solving_hcaptcha', 'in_queue', 'passed_queue', 'waiting_for_monitor_input', 'monitoring_product', 'adding_to_cart', 'checking_out', 'requeued')
         where a.workspace_id = ?
         group by a.id
         order by a.id asc
