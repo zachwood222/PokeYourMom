@@ -130,6 +130,14 @@ Best practice: after a drop, filter to **Checkout Details** to identify where ti
 6. Eligible checks are deduplicated and inserted into `events`.
 7. Event payloads are delivered to all enabled webhooks and logged in `deliveries`.
 
+## Canonical monitor API
+
+- Create monitor: `POST /api/monitors`
+- Get monitor: `GET /api/monitors/<id>`
+- Update monitor: `PATCH /api/monitors/<id>`
+- Delete monitor: `DELETE /api/monitors/<id>`
+- Run immediate check: `POST /api/monitors/<id>/check`
+
 ## Canonical checkout task API
 
 - Create task: `POST /api/checkout/tasks`
