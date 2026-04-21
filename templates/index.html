@@ -687,37 +687,24 @@
     }
 
     async function createTask() {
-      const taskPayload = {
-        retailer: document.getElementById('task_retailer').value,
-        product_url: document.getElementById('task_url').value,
-        profile: document.getElementById('task_profile').value,
-        account: document.getElementById('task_account').value,
-        payment: document.getElementById('task_payment').value,
-      };
-
-      const monitorPayload = {
-        retailer: taskPayload.retailer,
-        product_url: taskPayload.product_url,
-        poll_interval_seconds: Number(document.getElementById('poll_interval').value),
-      };
-      const monitorRes = await apiFetch('/api/monitors', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(monitorPayload))
-      });
-      const monitor = await monitorRes.json();
-      if (monitor.error) {
-        alert(monitor.error);
+      const monitorField = document.getElementById('task_monitor_id');
+      const taskNameField = document.getElementById('task_name');
+      const monitorIdRaw = monitorField?.value || '';
+      const monitorId = Number(monitorIdRaw);
+      if (!Number.isInteger(monitorId) || monitorId <= 0) {
+        alert('Select a valid monitor before creating a task.');
         return;
       }
+      const taskName = (taskNameField?.value || '').trim();
 
       const res = await apiFetch('/api/checkout/tasks', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          monitor_id: monitor.id,
-          task_name: `${taskPayload.retailer} task`,
-          task_config: taskPayload,
+        body: JSON.stringify(appendCaptchaToken({
+          monitor_id: monitorId,
+          task_name: taskName || `Monitor ${monitorId} task`,
           initial_state: 'queued',
-        })
+        }))
       });
       const data = await res.json();
       if (data.error) {
