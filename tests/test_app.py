@@ -1297,6 +1297,35 @@ def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
     assert members_count == 1
 
 
+def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "auth.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("DEFAULT_USER_EMAIL", "owner@example.test")
+    monkeypatch.setenv("DEFAULT_USER_NAME", "Owner User")
+    monkeypatch.setenv("DEFAULT_BEARER_TOKEN", "seed-token")
+
+    import app as app_module
+
+    reloaded = importlib.reload(app_module)
+    reloaded.init_db()
+    reloaded.init_db()
+
+    conn = sqlite3.connect(db_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "select name from sqlite_master where type='table' and name in ('users', 'workspace_members')"
+        ).fetchall()
+    }
+    users_count = conn.execute("select count(*) from users").fetchone()[0]
+    members_count = conn.execute("select count(*) from workspace_members").fetchone()[0]
+    conn.close()
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
 def test_api_routes_require_auth(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -1801,6 +1830,73 @@ def test_monitor_failure_trends_returns_seeded_counts(tmp_path, monkeypatch):
     assert resp.status_code == 200
     assert payload["trends"] == [
         {"monitor_id": monitor_id, "failures_last_24h": 1, "failures_last_7d": 2}
+    ]
+
+
+def test_monitor_failure_trends_includes_zero_counts_and_excludes_other_workspaces(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    now = datetime.now(timezone.utc)
+
+    conn = app_module.db()
+    own_monitor_with_failures = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/with-failures', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    ).lastrowid
+    own_monitor_without_failures = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'target', 'https://example.com/no-failures', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into monitor_failures(monitor_id, workspace_id, error_text, failed_at)
+        values (?, 1, 'err-1', ?), (?, 1, 'err-2', ?)
+        """,
+        (
+            own_monitor_with_failures,
+            (now - timedelta(hours=3)).isoformat(),
+            own_monitor_with_failures,
+            (now - timedelta(days=2)).isoformat(),
+        ),
+    )
+
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    other_monitor_id = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'bestbuy', 'https://example.com/other', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into monitor_failures(monitor_id, workspace_id, error_text, failed_at)
+        values (?, ?, 'other-err', ?)
+        """,
+        (other_monitor_id, other_workspace, (now - timedelta(hours=1)).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ops/monitor-failure-trends", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert set(payload.keys()) == {"trends"}
+    trends = sorted(payload["trends"], key=lambda row: row["monitor_id"])
+    assert trends == [
+        {"monitor_id": own_monitor_with_failures, "failures_last_24h": 1, "failures_last_7d": 2},
+        {"monitor_id": own_monitor_without_failures, "failures_last_24h": 0, "failures_last_7d": 0},
     ]
 
 
