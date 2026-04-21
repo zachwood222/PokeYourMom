@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 FIXTURES = Path(__file__).parent / "fixtures"
+REQUIRED_FIXTURE_NAMES = ("in_stock", "out_of_stock", "ambiguous")
 
 
 def fixture_case(
@@ -20,6 +21,30 @@ def fixture_case(
         expected_status,
         id=f"{retailer}:{category}:{fixture_name}",
     )
+
+
+PARSER_FIXTURE_EXPECTATIONS = {
+    "walmart": {
+        "in_stock": (True, "in_stock"),
+        "out_of_stock": (False, "out_or_unknown"),
+        "ambiguous": (False, "out_or_unknown"),
+    },
+    "target": {
+        "in_stock": (True, "in_stock"),
+        "out_of_stock": (False, "out_or_unknown"),
+        "ambiguous": (False, "out_or_unknown"),
+    },
+    "bestbuy": {
+        "in_stock": (True, "in_stock"),
+        "out_of_stock": (False, "out_or_unknown"),
+        "ambiguous": (False, "out_or_unknown"),
+    },
+    "pokemoncenter": {
+        "in_stock": (True, "in_stock"),
+        "out_of_stock": (False, "out_or_unknown"),
+        "ambiguous": (False, "out_or_unknown"),
+    },
+}
 
 
 PARSER_FIXTURE_CASES = [

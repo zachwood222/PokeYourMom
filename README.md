@@ -65,6 +65,13 @@ The last two commands are explicit migration-safety checks for:
 - `POST /api/monitors/:id/check` to run an immediate check.
 - `GET /api/workspace/usage-limits` to retrieve plan limits + current usage snapshot.
 
+Monitor check response compatibility notes:
+
+- `POST /api/monitors/:id/check` now includes `availability_reason` and `parser_confidence`.
+- Existing response fields are unchanged.
+- `parser_confidence` is normalized to the range `[0.0, 1.0]`; if unavailable/invalid, it is `null`.
+- Clients that do not use these new fields can safely ignore them.
+
 Example:
 
 ```bash
@@ -137,9 +144,11 @@ The regression harness in `tests/test_parser_fixtures.py` asserts two expectatio
 
 - `expected_in_stock` (`True`/`False`)
 - `expected_status` (`in_stock` or `out_or_unknown`)
+- failure output includes the exact fixture path (for example `walmart/ambiguous.html`) to make regressions easy to triage.
 
 To add a new fixture case:
 
 1. Add the HTML snapshot in `tests/fixtures/<retailer>/`.
-2. Register a `pytest.param(...)` case in `tests/parser_fixture_harness.py` (case IDs are formatted as `<retailer>:<fixture_name>`).
-3. Run `pytest tests/test_parser_fixtures.py` to validate the new snapshot.
+2. Register the expected output in `PARSER_FIXTURE_EXPECTATIONS` in `tests/parser_fixture_harness.py`.
+3. Ensure each retailer still includes the required baseline snapshots: `in_stock`, `out_of_stock`, and `ambiguous`.
+4. Run `pytest tests/test_parser_fixtures.py` to validate the new snapshot.
