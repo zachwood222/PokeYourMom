@@ -354,6 +354,10 @@
               <label class="small">Original MSRP Cents (Pokemon only)</label>
               <input id="msrp_cents" type="number" placeholder="499" />
             </div>
+            <div style="margin-top:10px;">
+              <label class="small">Poll Interval (seconds)</label>
+              <input id="poll_interval" type="number" value="20" />
+            </div>
             <input id="captcha_token" type="hidden" value="" />
             {% if captcha_site_key %}
             <div style="margin-top:10px;">
@@ -677,22 +681,55 @@
 
       const maxPrice = document.getElementById('max_price_cents').value;
       const msrp = document.getElementById('msrp_cents').value;
+      const retailerEl = document.getElementById('retailer');
+      const productUrlEl = document.getElementById('product_url');
+      const pollIntervalEl = document.getElementById('poll_interval');
+      const keywordEl = document.getElementById('keyword');
+      const maxPriceEl = document.getElementById('max_price_cents');
+      const msrpEl = document.getElementById('msrp_cents');
+
+      const maxPrice = maxPriceEl?.value || '';
+      const msrp = msrpEl?.value || '';
+      const pollIntervalRaw = (pollIntervalEl?.value || '').trim();
+      const pollIntervalParsed = pollIntervalRaw === '' ? 20 : Number(pollIntervalRaw);
+      if (!Number.isFinite(pollIntervalParsed) || pollIntervalParsed <= 0) {
+        alert('Poll interval must be a valid positive number of seconds.');
+        return;
+      }
+
       const payload = {
-        retailer: document.getElementById('retailer').value,
-        product_url: document.getElementById('product_url').value,
-        poll_interval_seconds: Number(document.getElementById('poll_interval').value),
-        keyword: document.getElementById('keyword').value || null,
+        retailer: retailerEl?.value || '',
+        product_url: productUrlEl?.value || '',
+        poll_interval_seconds: pollIntervalParsed,
+        keyword: keywordEl?.value || null,
         max_price_cents: maxPrice ? Number(maxPrice) : null,
         msrp_cents: msrp ? Number(msrp) : null,
       };
 
-      const res = await apiFetch('/api/monitors', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))
-      });
-      const data = await res.json();
-      alert(data.error || `Monitor added (id=${data.id})`);
-      await loadMonitors();
-      await loadDashboardSummary();
+      try {
+        const res = await apiFetch('/api/monitors', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))
+        });
+
+        let data;
+        try {
+          data = await res.json();
+        } catch (error) {
+          alert(`Failed to parse monitor API response: ${error?.message || error}`);
+          return;
+        }
+
+        if (!res.ok || data.error) {
+          alert(data?.error || `Failed to add monitor (HTTP ${res.status}).`);
+          return;
+        }
+
+        alert(`Monitor added (id=${data.id})`);
+        await loadMonitors();
+        await loadDashboardSummary();
+      } catch (error) {
+        alert(`Failed to add monitor due to a network or fetch error: ${error?.message || error}`);
+      }
     }
 
     async function createTask() {
@@ -721,18 +758,24 @@
       const monitor = await monitorRes.json();
       if (monitor.error) {
         alert(monitor.error);
+      const monitorField = document.getElementById('task_monitor_id');
+      const taskNameField = document.getElementById('task_name');
+      const monitorIdRaw = monitorField?.value || '';
+      const monitorId = Number(monitorIdRaw);
+      if (!Number.isInteger(monitorId) || monitorId <= 0) {
+        alert('Select a valid monitor before creating a task.');
         return;
       }
+      const taskName = (taskNameField?.value || '').trim();
 
       const res = await apiFetch('/api/checkout/tasks', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          monitor_id: monitor.id,
-          task_name: `${taskPayload.retailer} task`,
-          task_config: taskPayload,
+        body: JSON.stringify(appendCaptchaToken({
+          monitor_id: monitorId,
+          task_name: taskName || `Monitor ${monitorId} task`,
           initial_state: 'queued',
-        })
+        }))
       });
       const data = await res.json();
       if (data.error) {

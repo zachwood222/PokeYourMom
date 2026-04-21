@@ -98,6 +98,20 @@ RETAILER_CATEGORY_SUPPORT = {
     "walmart": {"pokemon"},
     "bestbuy": {"pokemon"},
 }
+POKEMON_CENTER_TASK_GROUP_SCHEMA_VERSION = 2
+POKEMON_CENTER_SITES = {"us", "ca", "uk"}
+POKEMON_CENTER_MODES = {"default", "create_account", "newsletter_subscribe"}
+POKEMON_CENTER_DEFAULT_TASK_FIELDS = {
+    "site": "us",
+    "mode": "default",
+    "monitor_input": "",
+    "product_quantity": 1,
+    "monitor_delay_ms": 3500,
+    "queue_entry_delay_ms": None,
+    "discount_code": None,
+    "wait_for_queue": False,
+    "loop_checkout": False,
+}
 DEFAULT_WORKSPACE = {
     "name": "My Workspace",
     "plan": DEFAULT_PLAN if DEFAULT_PLAN in PLAN_LIMITS else "basic",
@@ -635,6 +649,124 @@ def normalize_legacy_task_state(raw_state: Any) -> str:
     if state not in CHECKOUT_TASK_STATES:
         return "queued"
     return state
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _is_pokemon_center_task_config(task_config: dict[str, Any], monitor_row: sqlite3.Row | None = None) -> bool:
+    monitor_retailer = (monitor_row["retailer"] if monitor_row else "") or ""
+    return (
+        str(task_config.get("retailer") or "").strip().lower() == "pokemoncenter"
+        or str(monitor_retailer).strip().lower() == "pokemoncenter"
+    )
+
+
+def normalize_task_config_for_monitor(
+    task_config: dict[str, Any] | None,
+    *,
+    monitor_row: sqlite3.Row | None = None,
+) -> dict[str, Any]:
+    normalized = dict(task_config or {})
+    if monitor_row and not normalized.get("retailer"):
+        normalized["retailer"] = monitor_row["retailer"]
+    if monitor_row and not normalized.get("product_url"):
+        normalized["product_url"] = monitor_row["product_url"]
+    if not _is_pokemon_center_task_config(normalized, monitor_row):
+        return normalized
+
+    site = str(normalized.get("site") or POKEMON_CENTER_DEFAULT_TASK_FIELDS["site"]).strip().lower()
+    normalized["site"] = site if site in POKEMON_CENTER_SITES else POKEMON_CENTER_DEFAULT_TASK_FIELDS["site"]
+
+    mode = str(normalized.get("mode") or POKEMON_CENTER_DEFAULT_TASK_FIELDS["mode"]).strip().lower()
+    normalized["mode"] = mode if mode in POKEMON_CENTER_MODES else POKEMON_CENTER_DEFAULT_TASK_FIELDS["mode"]
+
+    monitor_input = normalized.get("monitor_input")
+    normalized["monitor_input"] = str(monitor_input).strip() if monitor_input is not None else ""
+
+    quantity = _coerce_optional_int(normalized.get("product_quantity"))
+    normalized["product_quantity"] = quantity if quantity and quantity > 0 else POKEMON_CENTER_DEFAULT_TASK_FIELDS["product_quantity"]
+
+    monitor_delay = _coerce_optional_int(normalized.get("monitor_delay_ms"))
+    normalized["monitor_delay_ms"] = (
+        monitor_delay if monitor_delay is not None else POKEMON_CENTER_DEFAULT_TASK_FIELDS["monitor_delay_ms"]
+    )
+    normalized["queue_entry_delay_ms"] = _coerce_optional_int(normalized.get("queue_entry_delay_ms"))
+
+    discount = normalized.get("discount_code")
+    discount_normalized = str(discount).strip() if discount is not None else ""
+    normalized["discount_code"] = discount_normalized or None
+
+    normalized["wait_for_queue"] = bool(normalized.get("wait_for_queue", POKEMON_CENTER_DEFAULT_TASK_FIELDS["wait_for_queue"]))
+    normalized["loop_checkout"] = bool(normalized.get("loop_checkout", POKEMON_CENTER_DEFAULT_TASK_FIELDS["loop_checkout"]))
+
+    products = normalized.get("products")
+    if isinstance(products, list):
+        patched_products = []
+        for product in products:
+            if isinstance(product, dict):
+                copy = dict(product)
+                copy["skip_if_oos"] = bool(copy.get("skip_if_oos", False))
+                patched_products.append(copy)
+            else:
+                patched_products.append(product)
+        normalized["products"] = patched_products
+
+    normalized["task_group_version"] = POKEMON_CENTER_TASK_GROUP_SCHEMA_VERSION
+    return normalized
+
+
+def run_pokemon_center_task_group_config_migration(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        create table if not exists schema_migrations (
+            key text primary key,
+            applied_at text not null
+        )
+        """
+    )
+    migration_key = "2026_04_21_checkout_task_group_pokemoncenter_defaults_v2"
+    already_applied = conn.execute(
+        "select 1 from schema_migrations where key = ?",
+        (migration_key,),
+    ).fetchone()
+    if already_applied:
+        return
+
+    rows = conn.execute(
+        """
+        select ct.id, ct.task_config, m.retailer, m.product_url
+        from checkout_tasks ct
+        join monitors m on m.id = ct.monitor_id
+        where m.retailer = 'pokemoncenter'
+        """
+    ).fetchall()
+    for row in rows:
+        raw_config = row["task_config"] or "{}"
+        try:
+            parsed_config = json.loads(raw_config)
+        except (TypeError, json.JSONDecodeError):
+            parsed_config = {}
+        normalized = normalize_task_config_for_monitor(
+            parsed_config if isinstance(parsed_config, dict) else {},
+            monitor_row=row,
+        )
+        conn.execute(
+            "update checkout_tasks set task_config = ?, updated_at = ? where id = ?",
+            (json.dumps(normalized), utc_now(), row["id"]),
+        )
+
+    conn.execute(
+        "insert into schema_migrations(key, applied_at) values (?, ?)",
+        (migration_key, utc_now()),
+    )
 
 
 def run_legacy_tasks_migration(conn: sqlite3.Connection) -> None:
@@ -1333,6 +1465,8 @@ def init_db() -> None:
     ensure_column(conn, "checkout_attempts", "step", "text")
     ensure_column(conn, "checkout_attempts", "error", "text")
     ensure_column(conn, "checkout_attempts", "updated_at", "text")
+    run_legacy_tasks_migration(conn)
+    run_pokemon_center_task_group_config_migration(conn)
     conn.commit()
     conn.close()
 
@@ -2174,10 +2308,11 @@ def create_event_and_deliver(
             continue
         status, code, body = "queued", None, ""
         try:
+            target_url = resolve_webhook_url(conn, hook)
             req = perform_request(
                 task_key=f"webhook-{hook['id']}",
                 method="POST",
-                url=hook["webhook_url"],
+                url=target_url,
                 workspace_id=monitor["workspace_id"],
                 proxy_url=None,
                 timeout=8,
@@ -2511,6 +2646,11 @@ def create_checkout_task(
     initial_state: str = "queued",
 ) -> sqlite3.Row:
     task_config = dict(task_config or {})
+    monitor_row = conn.execute(
+        "select retailer, product_url from monitors where id = ? and workspace_id = ?",
+        (monitor_id, workspace_id),
+    ).fetchone()
+    task_config = normalize_task_config_for_monitor(task_config, monitor_row=monitor_row)
     if "proxy_policy" in task_config:
         task_config["proxy_policy"] = normalize_proxy_policy(task_config.get("proxy_policy"))
     normalized_state = normalize_checkout_state(initial_state, allow_control_states=False)
@@ -2766,9 +2906,12 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     payload = dict(row)
     config_raw = payload.get("task_config")
     try:
-        payload["task_config"] = json.loads(config_raw) if config_raw else {}
+        parsed_config = json.loads(config_raw) if config_raw else {}
     except (TypeError, json.JSONDecodeError):
-        payload["task_config"] = {}
+        parsed_config = {}
+    payload["task_config"] = normalize_task_config_for_monitor(
+        parsed_config if isinstance(parsed_config, dict) else {},
+    )
     return payload
 
 
@@ -3181,9 +3324,12 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     payload = dict(row)
     config_raw = payload.get("task_config")
     try:
-        payload["task_config"] = json.loads(config_raw) if config_raw else {}
+        parsed_config = json.loads(config_raw) if config_raw else {}
     except (TypeError, json.JSONDecodeError):
-        payload["task_config"] = {}
+        parsed_config = {}
+    payload["task_config"] = normalize_task_config_for_monitor(
+        parsed_config if isinstance(parsed_config, dict) else {},
+    )
     return payload
 
 
@@ -3654,9 +3800,12 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     payload = dict(row)
     config_raw = payload.get("task_config")
     try:
-        payload["task_config"] = json.loads(config_raw) if config_raw else {}
+        parsed_config = json.loads(config_raw) if config_raw else {}
     except (TypeError, json.JSONDecodeError):
-        payload["task_config"] = {}
+        parsed_config = {}
+    payload["task_config"] = normalize_task_config_for_monitor(
+        parsed_config if isinstance(parsed_config, dict) else {},
+    )
     return payload
 
 
@@ -5331,13 +5480,15 @@ def api_create_checkout_task():
         return jsonify({"error": binding_error}), 400
 
     initial_state = body.get("initial_state", "queued")
+    raw_task_config = body.get("task_config") if isinstance(body.get("task_config"), dict) else None
+    normalized_task_config = normalize_task_config_for_monitor(raw_task_config, monitor_row=monitor)
     try:
         task = create_checkout_task(
             conn,
             workspace_id=workspace_id,
             monitor_id=int(monitor_id),
             task_name=(body.get("task_name") or "").strip() or None,
-            task_config=body.get("task_config") if isinstance(body.get("task_config"), dict) else None,
+            task_config=normalized_task_config,
             initial_state=initial_state,
         )
     except ValueError as exc:
@@ -6139,10 +6290,11 @@ def api_test_webhook(webhook_id: int):
     started = time.perf_counter()
     conn = db()
     try:
+        target_url = resolve_webhook_url(conn, hook)
         req = perform_request(
             task_key=f"webhook-test-{webhook_id}",
             method="POST",
-            url=hook["webhook_url"],
+            url=target_url,
             workspace_id=workspace_id,
             proxy_url=None,
             timeout=8,
