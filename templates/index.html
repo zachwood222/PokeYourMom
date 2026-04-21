@@ -802,7 +802,26 @@
     const TASK_VIRTUALIZATION_THRESHOLD = 120;
     const TASK_VIRTUAL_ROW_HEIGHT = 52;
     const TASK_VIRTUAL_BUFFER = 8;
+    let taskMonitorsById = new Map();
     const toArray = (value, key) => Array.isArray(value) ? value : (value && Array.isArray(value[key]) ? value[key] : []);
+    function toggleTaskSelected(taskId, isSelected) {
+      if (isSelected) {
+        selectedTaskIds.add(taskId);
+      } else {
+        selectedTaskIds.delete(taskId);
+      }
+    }
+
+    function renderStatusChips() {}
+    function updateTaskSelectionSummary() {}
+
+    function getSelectedTaskMonitorRetailer() {
+      const monitorId = Number(document.getElementById('task_monitor_id')?.value || '');
+      return taskMonitorsById.get(monitorId)?.retailer || null;
+    }
+
+    function updateTaskModeFields() {}
+
     function getCaptchaToken() {
       return (document.getElementById('captcha_token')?.value || "").trim();
     }
@@ -1074,9 +1093,6 @@
       if (taskErrorEl) taskErrorEl.textContent = taskValidationError || '';
       if (taskValidationError) return;
       const monitorId = Number(monitorIdRaw);
-      const taskName = (document.getElementById('task_name')?.value || '').trim();
-      const mode = (document.getElementById('task_mode')?.value || 'default').trim();
-      const site = (document.getElementById('task_site')?.value || 'us').trim();
       const monitoredRetailer = getSelectedTaskMonitorRetailer();
 
       if (!Number.isInteger(monitorId) || monitorId <= 0) {
@@ -1304,6 +1320,8 @@
       const normalized = String(state || 'unknown').toLowerCase();
       const safeText = normalized.replace(/[^a-z0-9_-]/g, '_');
       return `<span class="state-pill state-${safeText}">${normalized}</span>`;
+    }
+
     function taskStateTone(state) {
       const normalized = (state || '').toLowerCase();
       if (['success', 'verification_code_received'].includes(normalized)) return 'success';
@@ -1377,11 +1395,6 @@
           </td>
         `;
         tbody.appendChild(tr);
-      }
-      if (useVirtualization) {
-        const bottomSpacer = document.createElement('tr');
-        bottomSpacer.innerHTML = `<td colspan="9" style="height:${Math.max(0, (rows.length - end) * TASK_VIRTUAL_ROW_HEIGHT)}px; padding:0; border:0;"></td>`;
-        tbody.appendChild(bottomSpacer);
       }
       renderStatusChips();
       updateTaskSelectionSummary();
