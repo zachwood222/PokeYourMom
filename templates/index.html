@@ -310,6 +310,7 @@
     }
 
     .warn { color: #f7b955; font-size: 13px; }
+    .inline-error { color: #ff8e8e; font-size: 12px; margin-top: 8px; }
     .config-warn {
       display: none;
       margin: 16px;
@@ -464,6 +465,7 @@
               <label>Monitor</label>
               <select id="task_monitor_id"></select>
               <div class="helper">Choose a monitor source for this automation task.</div>
+              <p class="small">Create a monitor first in “Add Product Monitor”.</p>
             </div>
             <div class="dense-form-row">
               <label>Task Name (Optional)</label>
@@ -472,6 +474,8 @@
             </div>
           </div>
           <button class="btn-primary" style="margin-top:10px;" onclick="createTask()">Create Task</button>
+          <div id="create_task_error" class="inline-error"></div>
+          <button style="margin-top:10px;" onclick="createTask()">Create Task</button>
         </div>
 
         <div class="card" style="margin-top:14px;">
@@ -534,6 +538,10 @@
               <label class="small">Original MSRP Cents (Pokemon only)</label>
               <input id="msrp_cents" type="number" placeholder="499" />
             </div>
+            <div style="margin-top:10px;">
+              <label class="small">Poll Interval (seconds)</label>
+              <input id="poll_interval" type="number" value="20" />
+            </div>
             <input id="captcha_token" type="hidden" value="" />
             {% if captcha_site_key %}
             <div style="margin-top:10px;">
@@ -541,6 +549,7 @@
               <div id="captcha_widget" class="cf-turnstile" data-sitekey="{{ captcha_site_key }}" data-theme="dark" data-callback="onCaptchaSuccess" data-expired-callback="onCaptchaExpired" data-error-callback="onCaptchaError"></div>
             </div>
             {% endif %}
+            <div id="monitor_input_error" class="inline-error"></div>
             <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
           </div>
 
@@ -848,27 +857,77 @@
     }
 
     async function addMonitor() {
+      const monitorInput = document.getElementById('product_url')?.value || '';
+      const monitorValidationError = validateMonitorInputClient(monitorInput, {isEditFlow: false, existingProductCount: 0});
+      const monitorErrorEl = document.getElementById('monitor_input_error');
+      if (monitorErrorEl) monitorErrorEl.textContent = monitorValidationError || '';
+      if (monitorValidationError) return;
+
       const maxPrice = document.getElementById('max_price_cents').value;
       const msrp = document.getElementById('msrp_cents').value;
+      const retailerEl = document.getElementById('retailer');
+      const productUrlEl = document.getElementById('product_url');
+      const pollIntervalEl = document.getElementById('poll_interval');
+      const keywordEl = document.getElementById('keyword');
+      const maxPriceEl = document.getElementById('max_price_cents');
+      const msrpEl = document.getElementById('msrp_cents');
+
+      const maxPrice = maxPriceEl?.value || '';
+      const msrp = msrpEl?.value || '';
+      const pollIntervalRaw = (pollIntervalEl?.value || '').trim();
+      const pollIntervalParsed = pollIntervalRaw === '' ? 20 : Number(pollIntervalRaw);
+      if (!Number.isFinite(pollIntervalParsed) || pollIntervalParsed <= 0) {
+        alert('Poll interval must be a valid positive number of seconds.');
+        return;
+      }
+
       const payload = {
-        retailer: document.getElementById('retailer').value,
-        product_url: document.getElementById('product_url').value,
-        poll_interval_seconds: Number(document.getElementById('poll_interval').value),
-        keyword: document.getElementById('keyword').value || null,
+        retailer: retailerEl?.value || '',
+        product_url: productUrlEl?.value || '',
+        poll_interval_seconds: pollIntervalParsed,
+        keyword: keywordEl?.value || null,
         max_price_cents: maxPrice ? Number(maxPrice) : null,
         msrp_cents: msrp ? Number(msrp) : null,
       };
 
-      const res = await apiFetch('/api/monitors', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))
-      });
-      const data = await res.json();
-      alert(data.error || `Monitor added (id=${data.id})`);
-      await loadMonitors();
-      await loadDashboardSummary();
+      try {
+        const res = await apiFetch('/api/monitors', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))
+        });
+
+        let data;
+        try {
+          data = await res.json();
+        } catch (error) {
+          alert(`Failed to parse monitor API response: ${error?.message || error}`);
+          return;
+        }
+
+        if (!res.ok || data.error) {
+          alert(data?.error || `Failed to add monitor (HTTP ${res.status}).`);
+          return;
+        }
+
+        alert(`Monitor added (id=${data.id})`);
+        await loadMonitors();
+        await loadDashboardSummary();
+      } catch (error) {
+        alert(`Failed to add monitor due to a network or fetch error: ${error?.message || error}`);
+      }
     }
 
     async function createTask() {
+      const monitorId = (document.getElementById('task_monitor_id')?.value || '').trim();
+      const taskName = (document.getElementById('task_name')?.value || '').trim();
+
+      if (!monitorId) {
+        alert('Select a monitor before creating a task.');
+      const taskInput = document.getElementById('task_url')?.value || '';
+      const taskValidationError = validateMonitorInputClient(taskInput, {isEditFlow: false, existingProductCount: 0});
+      const taskErrorEl = document.getElementById('create_task_error');
+      if (taskErrorEl) taskErrorEl.textContent = taskValidationError || '';
+      if (taskValidationError) return;
+
       const taskPayload = {
         retailer: document.getElementById('task_retailer').value,
         product_url: document.getElementById('task_url').value,
@@ -888,26 +947,75 @@
       const monitor = await monitorRes.json();
       if (monitor.error) {
         alert(monitor.error);
+      const monitorField = document.getElementById('task_monitor_id');
+      const taskNameField = document.getElementById('task_name');
+      const monitorIdRaw = monitorField?.value || '';
+      const monitorId = Number(monitorIdRaw);
+      if (!Number.isInteger(monitorId) || monitorId <= 0) {
+        alert('Select a valid monitor before creating a task.');
         return;
       }
 
-      const res = await apiFetch('/api/checkout/tasks', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          monitor_id: monitor.id,
-          task_name: `${taskPayload.retailer} task`,
-          task_config: taskPayload,
-          initial_state: 'queued',
-        })
-      });
-      const data = await res.json();
-      if (data.error) {
-        alert(data.error);
-        return;
+      const payload = {
+        monitor_id: monitorId,
+        initial_state: 'queued',
+      };
+
+      if (taskName) {
+        payload.task_name = taskName;
       }
-      await loadTasks();
-      selectTask(data.id);
+
+      try {
+        const res = await apiFetch('/api/checkout/tasks', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(appendCaptchaToken(payload))
+        });
+
+        let data = null;
+        try {
+          data = await res.json();
+        } catch (error) {
+          alert(`Failed to parse task API response: ${error?.message || error}`);
+          return;
+        }
+
+        if (!res.ok || data?.error) {
+          alert(data?.error || `Failed to create task (HTTP ${res.status}).`);
+          return;
+        }
+
+        await loadTasks();
+        selectTask(data.id);
+      } catch (error) {
+        alert(`Failed to create task due to a network or fetch error: ${error?.message || error}`);
+      }
+    }
+
+    function validateMonitorInputClient(rawInput, options = {}) {
+      const value = (rawInput || '').trim();
+      if (!value) return 'Product input is required.';
+      if (value.toLowerCase() === 'placeholder') return null;
+      if (value.startsWith('http://') || value.startsWith('https://')) return null;
+
+      const segments = value.split(',').map(s => s.trim());
+      if (segments.some(s => !s)) return 'invalid PID format: empty segment';
+      const quickEditMode = segments.length > 1 || segments.some(s => s.includes(':'));
+      if (quickEditMode && (!options.isEditFlow || options.existingProductCount !== 1)) {
+        return 'Quick Edit is only allowed when editing a task with exactly one product.';
+      }
+
+      for (const segment of segments) {
+        const [pid, qtyRaw] = segment.split(':');
+        if (!/^\d{2}-\d{5}-\d{3}$/.test((pid || '').trim())) {
+          return 'invalid PID format';
+        }
+        if (qtyRaw !== undefined) {
+          const qtyText = qtyRaw.trim();
+          if (!/^\d+$/.test(qtyText) || Number(qtyText) <= 0) return 'invalid quantity (must be an integer > 0)';
+        }
+      }
+      return null;
     }
 
     function taskErrorLabel(value) {
@@ -1040,12 +1148,25 @@
     async function loadMonitors() {
       const rows = await apiFetch('/api/monitors').then(r => r.json());
       const taskMonitorSelect = document.getElementById('task_monitor_id');
-      if (taskMonitorSelect) {
-        taskMonitorSelect.innerHTML = rows
-          .map((m) => `<option value="${m.id}">#${m.id} ${m.retailer} - ${m.product_url}</option>`)
-          .join('');
-      }
       const tbody = document.getElementById('monitors');
+      if (!Array.isArray(rows)) {
+        if (taskMonitorSelect) {
+          taskMonitorSelect.innerHTML = '<option disabled selected>Unable to load monitors (check API auth)</option>';
+        }
+        if (tbody) {
+          tbody.innerHTML = '';
+        }
+        return;
+      }
+      if (taskMonitorSelect) {
+        if (rows.length === 0) {
+          taskMonitorSelect.innerHTML = '<option disabled selected>No monitors yet — add one below first</option>';
+        } else {
+          taskMonitorSelect.innerHTML = rows
+            .map((m) => `<option value="${m.id}">#${m.id} ${m.retailer} - ${m.product_url}</option>`)
+            .join('');
+        }
+      }
       tbody.innerHTML = '';
       for (const r of rows) {
         const tr = document.createElement('tr');
