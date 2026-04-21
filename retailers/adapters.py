@@ -245,6 +245,7 @@ class TargetAdapter(DefaultRetailerAdapter):
             "add to cart",
             "ship it",
             "pick up",
+            "limited stock",
         ]
         out_markers = [
             '"availability":"outofstock"',
@@ -252,6 +253,7 @@ class TargetAdapter(DefaultRetailerAdapter):
             "out of stock",
             "sold out",
             "unavailable",
+            "currently unavailable online",
         ]
         if category == "sports_cards":
             in_markers.extend(["same day delivery", "shipping available"])
