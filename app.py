@@ -132,6 +132,7 @@ worker_lock = threading.Lock()
 
 CHECKOUT_TASK_STATES = {
     "queued",
+    "waiting_for_queue",
     "monitoring",
     "carting",
     "shipping",
@@ -2355,7 +2356,7 @@ def normalize_checkout_state(raw_state: Any, *, allow_control_states: bool = Tru
     valid_states = CHECKOUT_TASK_STATES if allow_control_states else CHECKOUT_TASK_STATES - {"paused", "stopped"}
     if state not in valid_states:
         raise ValueError(
-            "Invalid checkout state. Expected one of: queued, monitoring, carting, shipping, payment, verification_pending, verification_code_received, submitting, success, failed"
+            "Invalid checkout state. Expected one of: queued, waiting_for_queue, monitoring, carting, shipping, payment, verification_pending, verification_code_received, submitting, success, failed"
         )
     return state
 
@@ -2782,14 +2783,14 @@ def transition_checkout_task(
         state=normalized_state,
         status="transition",
         details={"reason": reason},
-        error_text=transition_error,
+        error_text=error_text,
     )
     record_task_log(
         conn,
         task_id=task_id,
         workspace_id=workspace_id,
         monitor_id=row["monitor_id"],
-        level="info" if not transition_error else "error",
+        level="info" if not error_text else "error",
         event_type="state_transition",
         message=f"Task transitioned to {normalized_state}",
         payload={"reason": reason},
@@ -3682,24 +3683,26 @@ def enqueue_checkout_for_monitor(
         conn.close()
         return existing["id"]
 
+    task_config = {
+        "retailer": monitor["retailer"],
+        "category": monitor["category"],
+        "product_url": monitor["product_url"],
+    }
+    initial_state = "waiting_for_queue" if bool(task_config.get("wait_for_queue")) else "queued"
     task = create_checkout_task(
         conn,
         workspace_id=monitor["workspace_id"],
         monitor_id=monitor["id"],
         task_name=f"Monitor {monitor['id']} checkout",
-        task_config={
-            "retailer": monitor["retailer"],
-            "category": monitor["category"],
-            "product_url": monitor["product_url"],
-        },
-        initial_state="queued",
+        task_config=task_config,
+        initial_state=initial_state,
     )
     record_checkout_attempt(
         conn,
         task_id=task["id"],
         workspace_id=monitor["workspace_id"],
         monitor_id=monitor["id"],
-        state="queued",
+        state=initial_state,
         status="enqueued",
         details={
             "reason": reason,
@@ -3809,13 +3812,17 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return payload
 
 
+def serialize_checkout_task_summary(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    return serialize_task_ui(row)
+
+
 def serialize_task_ui(row: sqlite3.Row | None) -> dict[str, Any] | None:
     payload = serialize_checkout_task(row)
     if payload is None:
         return None
     config = payload.get("task_config") or {}
     current_state = str(payload.get("current_state") or "queued")
-    state = "running" if current_state == "monitoring" else ("idle" if current_state == "queued" else current_state)
+    state = "running" if current_state == "monitoring" else ("idle" if current_state in {"queued", "waiting_for_queue"} else current_state)
     return {
         "id": payload["id"],
         "current_state": current_state,
@@ -3836,7 +3843,7 @@ def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return None
     config = payload.get("task_config") or {}
     current_state = str(payload.get("current_state") or "queued")
-    state = "running" if current_state == "monitoring" else ("idle" if current_state == "queued" else current_state)
+    state = "running" if current_state == "monitoring" else ("idle" if current_state in {"queued", "waiting_for_queue"} else current_state)
     return {
         "id": payload["id"],
         "state": state,
@@ -4078,6 +4085,7 @@ def emit_monitor_events(monitor: sqlite3.Row, result: MonitorResult, eligible: b
         "price_cents": result.price_cents,
         "availability_reason": result.availability_reason,
         "parser_confidence": result.parser_confidence,
+        "queue_detected": bool(getattr(result, "queue_detected", False)),
         "checked_at": utc_now(),
     }
     try:
@@ -4130,6 +4138,44 @@ def persist_monitor_state(monitor: sqlite3.Row, result: MonitorResult, eligible:
     conn.commit()
     conn.close()
 
+def _handle_queue_detected_for_waiting_tasks(monitor: sqlite3.Row, result: MonitorResult) -> None:
+    if monitor["retailer"] != "pokemoncenter" or not bool(getattr(result, "queue_detected", False)):
+        return
+    conn = db()
+    waiting_tasks = conn.execute(
+        """
+        select *
+        from checkout_tasks
+        where workspace_id = ?
+          and monitor_id = ?
+          and current_state = 'waiting_for_queue'
+          and is_paused = 0
+        order by id asc
+        """,
+        (monitor["workspace_id"], monitor["id"]),
+    ).fetchall()
+    transitioned = 0
+    for task in waiting_tasks:
+        task_config = parse_json_object(task["task_config"])
+        if not bool(task_config.get("wait_for_queue")):
+            continue
+        delay_ms = _coerce_optional_int(task_config.get("queue_entry_delay_ms"))
+        if delay_ms and delay_ms > 0:
+            time.sleep(delay_ms / 1000)
+        updated = transition_checkout_task(
+            conn,
+            task_id=task["id"],
+            workspace_id=task["workspace_id"],
+            requested_state="monitoring",
+            reason="queue_detected_event",
+        )
+        if updated:
+            transitioned += 1
+    if transitioned:
+        conn.commit()
+    conn.close()
+
+
 def process_post_persist_actions(
     monitor: sqlite3.Row,
     result: MonitorResult,
@@ -4137,6 +4183,7 @@ def process_post_persist_actions(
     *,
     strict: bool,
 ) -> None:
+    _handle_queue_detected_for_waiting_tasks(monitor, result)
     if eligible:
         try:
             enqueue_checkout_for_monitor(monitor, result)
@@ -4466,7 +4513,7 @@ def execute_monitor_job(queue: SQLiteJobQueue, job: Job, *, now_iso: str) -> Non
 
 
 def _active_checkout_states() -> tuple[str, ...]:
-    return ("queued", "monitoring", "carting", "shipping", "payment", "submitting")
+    return ("queued", "waiting_for_queue", "monitoring", "carting", "shipping", "payment", "submitting")
 
 
 def _release_proxy_lock_if_owned(conn: sqlite3.Connection, account_id: int) -> None:
@@ -5640,6 +5687,37 @@ def api_start_checkout_task(task_id: int):
     payload = serialize_checkout_task_summary(row)
     socketio.emit("task_update", payload)
     return jsonify({"ok": True, "task": payload})
+
+
+@app.post("/api/checkout/tasks/start-now")
+@require_auth
+def api_start_checkout_tasks_now():
+    body = request.json or {}
+    task_ids = body.get("task_ids") if isinstance(body.get("task_ids"), list) else []
+    normalized_ids = [int(task_id) for task_id in task_ids if str(task_id).isdigit()]
+    if not normalized_ids:
+        return jsonify({"error": "task_ids is required"}), 400
+    conn = db()
+    workspace_id = current_workspace_id()
+    updated_tasks: list[dict[str, Any]] = []
+    for task_id in normalized_ids:
+        task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+        if not task:
+            continue
+        row = transition_checkout_task(
+            conn,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            requested_state="monitoring",
+            reason="api_start_now_override",
+        )
+        if row:
+            updated_tasks.append(serialize_task_ui(row))
+    conn.commit()
+    conn.close()
+    for payload in updated_tasks:
+        socketio.emit("task_update", payload)
+    return jsonify({"ok": True, "tasks": updated_tasks})
 
 
 @app.post("/api/checkout/tasks/<int:task_id>/run")

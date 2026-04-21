@@ -3264,38 +3264,6 @@ def test_checkout_task_lifecycle_start_pause_stop(tmp_path, monkeypatch):
         },
         headers=_auth_headers(),
     )
-        },
-        headers=_auth_headers(),
-    )
-    assert create_monitor_resp.status_code == 201
-    monitor_id = create_monitor_resp.get_json()["id"]
-
-    create_resp = client.post(
-        "/api/checkout/tasks",
-        json={
-            "monitor_id": monitor_id,
-            "task_name": "Lifecycle task",
-            "task_config": {"profile": "default", "account": "acct-1", "payment": "amex"},
-        },
-        headers=_auth_headers(),
-    )
-    monitor = create_monitor_resp.get_json()
-    assert create_monitor_resp.status_code == 201
-
-    create_resp = client.post(
-        "/api/checkout/tasks",
-        json={
-            "monitor_id": monitor["id"],
-            "task_config": {
-                "retailer": "target",
-                "product_url": "https://www.target.com/p/abc",
-                "profile": "default",
-                "account": "acct-1",
-                "payment": "amex",
-            },
-        },
-        headers=_auth_headers(),
-    )
     assert create_resp.status_code == 201
     task_id = create_resp.get_json()["id"]
 
@@ -4416,7 +4384,7 @@ def test_check_monitor_enqueues_checkout_task_for_eligible_stock(tmp_path, monke
     assert check_resp.get_json()["eligible_for_alert"] is True
 
     conn = app_module.db()
-    task = conn.execute("select * from checkout_tasks where monitor_id = ?", (monitor["id"],)).fetchone()
+    task = conn.execute("select * from checkout_tasks where monitor_id = ?", (monitor_id,)).fetchone()
     attempt_count = conn.execute(
         "select count(*) as c from checkout_attempts where task_id = ?",
         (task["id"],),
@@ -4432,6 +4400,100 @@ def test_check_monitor_enqueues_checkout_task_for_eligible_stock(tmp_path, monke
     assert attempt_count >= 2
     assert log_count >= 2
 
+
+def test_queue_detected_moves_waiting_for_queue_tasks_to_monitoring(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    now = app_module.utc_now()
+    monitor_id = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, category, product_url, poll_interval_seconds, enabled, created_at)
+        values (1, 'pokemoncenter', 'pokemon', 'https://www.pokemoncenter.com/product/test', 20, 1, ?)
+        """,
+        (now,),
+    ).lastrowid
+    task = app_module.create_checkout_task(
+        conn,
+        workspace_id=1,
+        monitor_id=monitor_id,
+        task_name='Queue waiting task',
+        task_config={"retailer": "pokemoncenter", "wait_for_queue": True, "queue_entry_delay_ms": 0},
+        initial_state='waiting_for_queue',
+    )
+    conn.commit()
+    conn.close()
+
+    def fake_fetch(_monitor):
+        return app_module.MonitorResult(
+            in_stock=False,
+            price_cents=None,
+            title="Pokemon Center Queue",
+            status_text="queue_detected",
+            availability_reason="pokemoncenter_queue_detected",
+            queue_detected=True,
+        )
+
+    monkeypatch.setattr(app_module, "fetch_monitor", fake_fetch)
+
+    first_check = client.post(f"/api/monitors/{monitor_id}/check", headers=_auth_headers())
+    assert first_check.status_code == 200
+
+    conn = app_module.db()
+    updated = conn.execute("select * from checkout_tasks where id = ?", (task["id"],)).fetchone()
+    conn.close()
+    assert updated is not None
+    assert updated["current_state"] == "monitoring"
+
+
+def test_start_now_override_endpoint_transitions_waiting_tasks(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_monitor_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://example.com/item",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    monitor = create_monitor_resp.get_json()
+    assert create_monitor_resp.status_code == 201
+
+    account_resp = client.post(
+        "/api/accounts",
+        json={"retailer": "walmart", "username": "w-user", "encrypted_credential_ref": "cred-ref"},
+        headers=_auth_headers(),
+    )
+    assert account_resp.status_code == 201
+
+    binding_resp = client.post(
+        "/api/task-profile-bindings",
+        json={"monitor_id": monitor["id"], "retailer_account_id": account_resp.get_json()["id"]},
+        headers=_auth_headers(),
+    )
+    assert binding_resp.status_code == 201
+
+    create_task_resp = client.post(
+        "/api/checkout/tasks",
+        json={"monitor_id": monitor["id"], "initial_state": "waiting_for_queue", "task_name": "Waiting task"},
+        headers=_auth_headers(),
+    )
+    assert create_task_resp.status_code == 201
+    task = create_task_resp.get_json()
+
+    override_resp = client.post(
+        "/api/checkout/tasks/start-now",
+        json={"task_ids": [task["id"]]},
+        headers=_auth_headers(),
+    )
+    assert override_resp.status_code == 200
+    payload = override_resp.get_json()
+    assert payload["ok"] is True
+    assert payload["tasks"][0]["current_state"] == "monitoring"
 
 def test_checkout_task_lifecycle_routes(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)

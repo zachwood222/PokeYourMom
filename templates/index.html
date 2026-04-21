@@ -311,13 +311,17 @@
             </div>
           </div>
           <div id="create_task_error" class="inline-error"></div>
+          <p class="small" title="For Pokemon Center tasks using wait_for_queue=true, tasks remain in waiting_for_queue until the monitor detects queue pages. Use Start Now if the monitor misses queue detection.">Queue-wait tasks depend on Pokémon Center monitor queue detection. If detection is missed, use <strong>Start Now</strong> to override and continue manually.</p>
           <button style="margin-top:10px;" onclick="createTask()">Create Task</button>
         </div>
 
         <div class="card" style="margin-top:14px;">
           <h2 class="section-title">Live Task Table</h2>
+          <div class="actions" style="margin-bottom:10px;">
+            <button onclick="startSelectedTasksNow()" title="Force selected waiting_for_queue tasks into monitoring when queue detection is missed.">Start Now (Selected)</button>
+          </div>
           <table>
-            <thead><tr><th>ID</th><th>Monitor</th><th>Retailer</th><th>State</th><th>Last Transition</th><th>Last Error</th><th>Actions</th></tr></thead>
+            <thead><tr><th>ID</th><th>Select</th><th>Monitor</th><th>Retailer</th><th>State</th><th>Last Transition</th><th>Last Error</th><th>Actions</th></tr></thead>
             <tbody id="tasks"></tbody>
           </table>
         </div>
@@ -847,6 +851,7 @@
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td>${task.id}</td>
+          <td><input type="checkbox" class="task-select" value="${task.id}" /></td>
           <td>${task.monitor_id || '-'}</td>
           <td>${task.retailer}</td>
           <td>${task.state}</td>
@@ -854,6 +859,7 @@
           <td>${taskErrorLabel(task.last_error)}</td>
           <td class="actions">
             <button onclick="startTask(${task.id})">Start</button>
+            <button onclick="startTaskNow(${task.id})" title="Override waiting_for_queue when monitor misses queue.">Start Now</button>
             <button onclick="runTask(${task.id})">Run</button>
             <button onclick="pauseTask(${task.id})">Pause</button>
             <button onclick="stopTask(${task.id})">Stop</button>
@@ -875,6 +881,31 @@
 
     async function startTask(id) {
       await apiFetch(`/api/checkout/tasks/${id}/start`, {method: 'POST'});
+      await loadTasks();
+    }
+
+    async function startTaskNow(id) {
+      await apiFetch('/api/checkout/tasks/start-now', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({task_ids: [id]})
+      });
+      await loadTasks();
+    }
+
+    async function startSelectedTasksNow() {
+      const ids = Array.from(document.querySelectorAll('.task-select:checked'))
+        .map((el) => Number(el.value))
+        .filter((id) => Number.isInteger(id) && id > 0);
+      if (ids.length === 0) {
+        alert('Select at least one task to use Start Now override.');
+        return;
+      }
+      await apiFetch('/api/checkout/tasks/start-now', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({task_ids: ids})
+      });
       await loadTasks();
     }
 
