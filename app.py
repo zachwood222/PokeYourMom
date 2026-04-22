@@ -4609,6 +4609,7 @@ def api_dashboard_commerce():
     spent_total_cents = sum(int(row["last_price_cents"] or 0) for row in successful)
     checkout_count = len(successful)
     average_order_value_cents = 0 if checkout_count == 0 else int(round(spent_total_cents / checkout_count))
+    success_rate = 0.0 if (checkout_count + decline_count) == 0 else checkout_count / (checkout_count + decline_count)
 
     return jsonify(
         {
