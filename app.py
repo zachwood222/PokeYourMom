@@ -13,12 +13,16 @@ import time
 import traceback
 import hashlib
 import hmac
+import smtplib
 
 from cryptography.fernet import Fernet, InvalidToken
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from enum import Enum
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from functools import wraps
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 
 import requests
@@ -116,6 +120,11 @@ TASK_STEP_DELAY_SECONDS = float(os.getenv("TASK_STEP_DELAY_SECONDS", "0.5"))
 QUEUE_ENQUEUE_JITTER_SECONDS = float(os.getenv("QUEUE_ENQUEUE_JITTER_SECONDS", "1.25"))
 STRICT_API_AUTH_TOKEN = (os.getenv("STRICT_API_AUTH_TOKEN", "1") or "").strip().lower() not in {"0", "false", "no", "off"}
 CHECKOUT_CAPTCHA_SOLVE_PROVIDER = os.getenv("CHECKOUT_CAPTCHA_SOLVE_PROVIDER", "manual")
+ALERT_WEBHOOK_URL = (os.getenv("ALERT_WEBHOOK_URL", "") or "").strip()
+ALERT_DISCORD_WEBHOOK = (os.getenv("ALERT_DISCORD_WEBHOOK", "") or "").strip()
+ALERT_EMAIL_CONFIG_RAW = (os.getenv("ALERT_EMAIL_CONFIG", "") or "").strip()
+ALERT_PUSHOVER_TOKEN = (os.getenv("ALERT_PUSHOVER_TOKEN", "") or "").strip()
+ALERT_PUSHOVER_USER = (os.getenv("ALERT_PUSHOVER_USER", "") or "").strip()
 
 PLAN_LIMITS = {
     "basic": {"max_monitors": 20, "min_poll_seconds": 20},
@@ -803,6 +812,112 @@ def log(
     )
     print(json.dumps(entry, sort_keys=True))
     socketio.emit("log", entry)
+
+
+class NotificationType(Enum):
+    PRICE_DROP = "price_drop"
+    BACK_IN_STOCK = "back_in_stock"
+    PRICE_CHANGE = "price_change"
+    STOCK_CHANGE = "stock_change"
+
+
+@dataclass
+class NotificationConfig:
+    webhook_url: Optional[str] = None
+    email_config: Optional[dict[str, Any]] = None
+    pushover_token: Optional[str] = None
+    pushover_user: Optional[str] = None
+    discord_webhook: Optional[str] = None
+
+
+def _load_notification_config() -> NotificationConfig:
+    email_config: dict[str, Any] | None = None
+    if ALERT_EMAIL_CONFIG_RAW:
+        try:
+            parsed = json.loads(ALERT_EMAIL_CONFIG_RAW)
+            if isinstance(parsed, dict):
+                email_config = parsed
+        except json.JSONDecodeError:
+            log("ALERT_EMAIL_CONFIG is not valid JSON; email notifications disabled.", level="warning")
+    return NotificationConfig(
+        webhook_url=ALERT_WEBHOOK_URL or None,
+        email_config=email_config,
+        pushover_token=ALERT_PUSHOVER_TOKEN or None,
+        pushover_user=ALERT_PUSHOVER_USER or None,
+        discord_webhook=ALERT_DISCORD_WEBHOOK or None,
+    )
+
+
+class MonitorAlertNotifier:
+    def __init__(self, config: NotificationConfig):
+        self.config = config
+
+    def enabled(self) -> bool:
+        return any(
+            [
+                self.config.webhook_url,
+                self.config.email_config,
+                self.config.discord_webhook,
+                self.config.pushover_token and self.config.pushover_user,
+            ]
+        )
+
+    def send(self, message: dict[str, str]) -> None:
+        if self.config.webhook_url:
+            self._send_json(self.config.webhook_url, message)
+        if self.config.discord_webhook:
+            self._send_json(
+                self.config.discord_webhook,
+                {"content": f"**{message['title']}**\n{message['body']}"},
+            )
+        if self.config.pushover_token and self.config.pushover_user:
+            self._send_form(
+                "https://api.pushover.net/1/messages.json",
+                {
+                    "token": self.config.pushover_token,
+                    "user": self.config.pushover_user,
+                    "title": message["title"],
+                    "message": message["body"],
+                },
+            )
+        if self.config.email_config:
+            self._send_email(message)
+
+    def _send_json(self, url: str, payload: dict[str, Any]) -> None:
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            resp.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            log(f"Notification POST failed: {exc}", level="warning")
+
+    def _send_form(self, url: str, payload: dict[str, Any]) -> None:
+        try:
+            resp = requests.post(url, data=payload, timeout=10)
+            resp.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            log(f"Notification form POST failed: {exc}", level="warning")
+
+    def _send_email(self, message: dict[str, str]) -> None:
+        cfg = self.config.email_config or {}
+        required = ["smtp_server", "smtp_port", "smtp_user", "smtp_password", "from_email", "to_email"]
+        if any(not cfg.get(k) for k in required):
+            log("Email notification skipped; ALERT_EMAIL_CONFIG is missing required fields.", level="warning")
+            return
+        msg = MIMEMultipart()
+        msg["From"] = str(cfg["from_email"])
+        msg["To"] = str(cfg["to_email"])
+        msg["Subject"] = message["title"]
+        msg.attach(MIMEText(message["body"], "plain"))
+        try:
+            with smtplib.SMTP(str(cfg["smtp_server"]), int(cfg["smtp_port"]), timeout=10) as client:
+                client.starttls()
+                client.login(str(cfg["smtp_user"]), str(cfg["smtp_password"]))
+                client.send_message(msg)
+        except Exception as exc:  # noqa: BLE001
+            log(f"Notification email failed: {exc}", level="warning")
+
+
+NOTIFIER = MonitorAlertNotifier(_load_notification_config())
 
 
 captcha_verifier = CaptchaVerifier(
@@ -2686,6 +2801,63 @@ def alert_eligibility(monitor: sqlite3.Row, result: MonitorResult) -> bool:
     return keyword_ok and price_ok and msrp_ok
 
 
+def _notification_type_for_result(
+    monitor: sqlite3.Row, result: MonitorResult, eligible: bool
+) -> NotificationType | None:
+    previous_in_stock = None if monitor["last_in_stock"] is None else bool(monitor["last_in_stock"])
+    previous_price = monitor["last_price_cents"]
+    current_in_stock = bool(result.in_stock)
+    current_price = result.price_cents
+
+    if eligible and current_in_stock and not previous_in_stock:
+        return NotificationType.BACK_IN_STOCK
+    if previous_price is not None and current_price is not None and current_price < previous_price:
+        return NotificationType.PRICE_DROP
+    if previous_price is not None and current_price is not None and current_price != previous_price:
+        return NotificationType.PRICE_CHANGE
+    if previous_in_stock is not None and current_in_stock != previous_in_stock:
+        return NotificationType.STOCK_CHANGE
+    return None
+
+
+def _format_monitor_notification_message(
+    monitor: sqlite3.Row,
+    result: MonitorResult,
+    *,
+    eligible: bool,
+    notification_type: NotificationType,
+) -> dict[str, str]:
+    product_name = result.title or f"{monitor['retailer']} monitor {monitor['id']}"
+    price_label = cents_to_dollars(result.price_cents)
+    stock_label = "✅ In Stock" if result.in_stock else "❌ Out of Stock"
+    title = f"📊 Monitor update: {product_name}"
+    body = (
+        f"Type: {notification_type.value}\n"
+        f"Retailer: {monitor['retailer']}\n"
+        f"Price: {price_label}\n"
+        f"Stock: {stock_label}\n"
+        f"Eligible for alert: {'yes' if eligible else 'no'}\n"
+        f"Link: {monitor['product_url']}"
+    )
+    if notification_type == NotificationType.BACK_IN_STOCK:
+        title = f"🎉 BACK IN STOCK! {product_name}"
+    elif notification_type == NotificationType.PRICE_DROP:
+        title = f"💰 PRICE DROP! {product_name}"
+    return {"title": title, "body": body}
+
+
+def send_monitor_change_notifications(monitor: sqlite3.Row, result: MonitorResult, eligible: bool) -> None:
+    if not NOTIFIER.enabled():
+        return
+    notification_type = _notification_type_for_result(monitor, result, eligible)
+    if notification_type is None:
+        return
+    message = _format_monitor_notification_message(
+        monitor, result, eligible=eligible, notification_type=notification_type
+    )
+    NOTIFIER.send(message)
+
+
 def dedupe_key(monitor: sqlite3.Row, result: MonitorResult) -> str:
     bucket = (result.price_cents or -1) // 100
     minute = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
@@ -4050,6 +4222,7 @@ def _checkout_step_carting(
 def run_monitor_pipeline_once(monitor: sqlite3.Row) -> dict[str, Any]:
     result = fetch_monitor(monitor)
     eligible = alert_eligibility(monitor, result)
+    send_monitor_change_notifications(monitor, result, eligible)
     persist_monitor_state(monitor, result, eligible)
     emit_monitor_events(monitor, result, eligible)
     parser_metadata = parser_metadata_payload(result)
@@ -4278,6 +4451,7 @@ def execute_monitor_job(queue: SQLiteJobQueue, job: Job, *, now_iso: str) -> Non
         return
     try:
         eligible = alert_eligibility(monitor, result)
+        send_monitor_change_notifications(monitor, result, eligible)
         persist_monitor_state(monitor, result, eligible)
     except Exception as exc:  # noqa: BLE001
         step = "persist"
