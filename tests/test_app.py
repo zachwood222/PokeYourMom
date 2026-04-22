@@ -8066,3 +8066,68 @@ def test_monitor_assist_apply_updates_monitor_and_logs_task_history(tmp_path, mo
     assert monitor_row["product_url"] == "https://www.pokemoncenter.com/product/12-34567-890"
     assert attempt_row["step"] == "PID updated from monitor assist"
     assert attempt_row["error_text"] == "PID updated from monitor assist"
+
+
+def test_dashboard_commerce_returns_expected_aggregates(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    now_iso = app_module.utc_now()
+
+    conn = app_module.db()
+    monitor_id = conn.execute(
+        """
+        insert into monitors(
+            workspace_id,
+            retailer,
+            product_url,
+            poll_interval_seconds,
+            last_price_cents,
+            created_at
+        ) values (?, ?, ?, ?, ?, ?)
+        """,
+        (1, "target", "https://example.com/product", 20, 2599, now_iso),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into checkout_tasks(
+            workspace_id,
+            monitor_id,
+            task_name,
+            task_config,
+            current_state,
+            created_at,
+            updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (1, monitor_id, "Pokemon Elite Trainer Box", json.dumps({"quantity": 2}), "success", now_iso, now_iso),
+    )
+    conn.execute(
+        """
+        insert into checkout_tasks(
+            workspace_id,
+            monitor_id,
+            task_name,
+            task_config,
+            current_state,
+            created_at,
+            updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (1, monitor_id, "Pokemon Elite Trainer Box", json.dumps({"quantity": 1}), "decline", now_iso, now_iso),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/dashboard/commerce", headers=_auth_headers())
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["checkouts_total"] == 1
+    assert payload["declines_total"] == 1
+    assert payload["spent_total_cents"] == 5198
+    assert payload["average_order_value_cents"] == 5198
+    assert payload["success_rate"] == 0.5
+    assert payload["sites_checkouts"] == [{"site": "target", "checkouts": 1}]
+    assert payload["amount_spent_daily"] == [{"date": now_iso[:10], "spent_cents": 5198}]
+    assert len(payload["product_orders"]) == 1
+    assert payload["product_orders"][0]["product_name"] == "Pokemon Elite Trainer Box"
