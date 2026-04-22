@@ -1,11 +1,97 @@
 # Stock Sentinel Documentation
 
-Stock Sentinel is a Flask-based monitor and alert bot for retailer product availability.
+Stock Sentinel is a Flask-based monitor, alert, and experimental checkout task bot for retailer product availability.
+
+## UI Overview
+
+The Cheddah dashboard is organized into tabs along the left sidebar. Each tab corresponds to a major feature area.
+
+### Sidebar Structure
+
+Cheddah is split into three sections:
+
+- **Operations:** Dashboard, Tasks, Alerts, Logs
+- **Setup:** Accounts, Profiles, Proxies, IMAP
+- **System:** Settings
+
+### Main Tabs (What each does)
+
+- **Dashboard:** Real-time performance and health overview
+- **Tasks:** Live Target/PKC task status per account
+- **Alerts:** Discord monitor setup (keywords/TCIN + trigger behavior)
+- **Accounts:** Target accounts, CVV/proxy/session management
+- **Profiles:** Shipping + payment profiles
+- **Proxies:** Proxy groups and testing
+- **IMAP:** Auto email-code handling for Target verification
+- **Logs:** Event history, filtering, timeline analysis, JSON export
+- **Settings:** Updates, captcha provider setup, cleanup tools
+
+### Status Bar (Bottom Left)
+
+Shows:
+
+- backend connection state
+- number of running tasks
+- active alert channels
+
+✅ Green "Connected" means backend is healthy.
+
+## Dashboard: What to Watch First
+
+### Core KPIs
+
+- Checkouts
+- Today
+- Total Spent
+- Avg Time
+
+### Live activity
+
+- running tasks + per-account status
+- PKC queue/browser queue instances
+- stock monitor count
+- Discord alert activity + matched keyword
+- account session state (active / expiring / failed)
+- proxy/session indicators
+- live success/failure feed and login errors
+
+### Additional stats
+
+- Last Checkout
+- Best Time
+- This Week
+- Top Account
+
+### Color readiness
+
+- 🟢 active
+- 🟡 expiring soon
+- 🔴 failed
+
+## Logs: Best Tab for Debugging
+
+### Tracks
+
+- checkouts
+- logins
+- task events
+- monitor polls
+- errors
+
+### Includes
+
+- counters by type (checkout/login/error/total)
+- filters (All, Checkouts, Details, Logins, Tasks, Monitors, Errors)
+- JSON export
+- clear all
+- checkout timeline with elapsed time per step
+
+Best practice: after a drop, filter to **Checkout Details** to identify where time was spent or where failures occurred.
 
 ## Architecture at a glance
 
 - **Web app/API:** Flask (`app.py`) provides dashboard routes and JSON endpoints.
-- **Storage:** SQLite tables for workspaces, monitors, events, webhooks, delivery results, and billing schema state.
+- **Storage:** SQLite tables for workspaces, monitors, checkout tasks (`checkout_tasks`, `checkout_attempts`, `task_logs`), events, webhooks, delivery results, and billing schema state.
 - **Background checks:** in-process monitor loop polls enabled monitors and emits events.
 - **Notifications:** Discord webhooks receive rich embeds when a monitor is eligible.
 
@@ -33,6 +119,26 @@ Stock Sentinel is a Flask-based monitor and alert bot for retailer product avail
     - `cancel_at_period_end`
     - plan mapping fields: `plan_code`, `plan_interval`, `plan_lookup_key`
     - `created_at`, `updated_at`
+
+
+## Secret encryption and key management
+
+Stored credentials in `account_secrets` are encrypted with Fernet (AEAD-style authenticated encryption) and include a `key_version` metadata field.
+
+Expected environment configuration:
+
+- `SECRET_ENCRYPTION_KEY_VERSION`: active key version used for all new writes (for example, `v2`).
+- `SECRET_ENCRYPTION_KEYS`: comma-separated version map such as `v1:<key>,v2:<key>`.
+- `SECRET_ENCRYPTION_KEY`: compatibility fallback for the active version when `SECRET_ENCRYPTION_KEYS` is not set.
+
+Rotation expectations:
+
+1. Add the new key/version to `SECRET_ENCRYPTION_KEYS`.
+2. Flip `SECRET_ENCRYPTION_KEY_VERSION` to the new version.
+3. Keep older versions configured until all secrets have been read at least once and transparently re-encrypted.
+4. Remove retired keys only after migration is complete and validated.
+
+Legacy ciphertext (pre-migration custom crypto) is still readable and is automatically re-encrypted into the active Fernet key/version on successful read.
 
 ## Runtime flow
 
