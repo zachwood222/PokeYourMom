@@ -467,7 +467,7 @@ def decrypt_secret_value_with_details(ciphertext: str, key_version: str | None =
     return _decrypt_legacy_secret_value(ciphertext), LEGACY_SECRET_KEY_VERSION, True
 
 
-SENSITIVE_FIELD_MARKERS = ("token", "secret", "password", "authorization", "webhook_url")
+SENSITIVE_FIELD_MARKERS = ("token", "secret", "password", "authorization")
 
 
 def redact_sensitive_payload(value: Any) -> Any:
@@ -2599,6 +2599,34 @@ def evaluate_page(
     return parse_monitor_html(html=html, keyword=keyword, retailer=retailer)
 
 
+def cents_to_dollars(cents: int | None) -> str:
+    if cents is None:
+        return "N/A"
+    return f"${(int(cents) / 100):.2f}"
+
+
+def _build_request_behavior_policy(
+    monitor: sqlite3.Row | None,
+    workspace: sqlite3.Row | None,
+) -> RequestBehaviorPolicy | None:
+    raw_monitor = monitor["behavior_metadata"] if monitor and "behavior_metadata" in monitor.keys() else None
+    raw_workspace = workspace["behavior_metadata"] if workspace and "behavior_metadata" in workspace.keys() else None
+    for raw in (raw_monitor, raw_workspace):
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        try:
+            return RequestBehaviorPolicy(**payload)
+        except TypeError:
+            continue
+    return None
+
+
 def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; StockSentinel/1.0; +https://example.com)",
@@ -2655,6 +2683,31 @@ def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
     keyword = (monitor["keyword"] or "").strip() or None
     category = (monitor["category"] or "").strip() or "pokemon"
     return evaluate_page(r.text, keyword=keyword, retailer=monitor["retailer"], category=category)
+
+
+def persist_monitor_state(monitor: sqlite3.Row, result: MonitorResult, eligible: bool) -> None:
+    conn = db()
+    try:
+        conn.execute(
+            """
+            update monitors
+            set last_checked_at = ?,
+                last_in_stock = ?,
+                last_price_cents = ?,
+                failure_streak = 0,
+                last_error = null
+            where id = ?
+            """,
+            (
+                utc_now(),
+                int(bool(result.in_stock)),
+                result.price_cents,
+                monitor["id"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def alert_eligibility(monitor: sqlite3.Row, result: MonitorResult) -> bool:
@@ -2776,6 +2829,41 @@ def get_or_create_monitor_automation_policy(
         """,
         (workspace_id, monitor_id),
     ).fetchone()
+
+
+def should_send_to_webhook(monitor: sqlite3.Row, hook: sqlite3.Row, eligible: bool) -> bool:
+    if not bool(hook["enabled"]):
+        return False
+    if bool(hook["notify_restock_only"]) and not eligible:
+        return False
+    if eligible:
+        return bool(hook["notify_success"])
+    return bool(hook["notify_failures"])
+
+
+def update_webhook_health(
+    conn: sqlite3.Connection,
+    webhook_id: int,
+    *,
+    status: str,
+    status_code: int | None = None,
+    error_text: str | None = None,
+    tested: bool = False,
+) -> None:
+    now_iso = utc_now()
+    conn.execute(
+        """
+        update webhooks
+        set last_delivery_status = ?,
+            last_delivery_at = ?,
+            last_error = ?,
+            last_status_code = ?,
+            last_tested_at = case when ? then ? else last_tested_at end,
+            fail_streak = case when ? = 'sent' then 0 else coalesce(fail_streak, 0) + 1 end
+        where id = ?
+        """,
+        (status, now_iso, (error_text or "")[:1000] or None, status_code, int(tested), now_iso, status, webhook_id),
+    )
 
 
 def create_event_and_deliver(
@@ -3425,13 +3513,13 @@ def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
     secret_id = webhook["webhook_secret_id"]
     if secret_id:
         row = conn.execute(
-            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            "select ciphertext, key_version from account_secrets where id = ? and workspace_id = ?",
             (secret_id, webhook["workspace_id"]),
         ).fetchone()
         if row and row["ciphertext"]:
             try:
-                return decrypt_secret_value(row["ciphertext"])
-            except ValueError:
+                return decrypt_secret_value(row["ciphertext"], key_version=row["key_version"])
+            except Exception:
                 pass
     return str(webhook["webhook_url"] or "")
 
@@ -3476,13 +3564,13 @@ def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
     secret_id = webhook["webhook_secret_id"]
     if secret_id:
         row = conn.execute(
-            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            "select ciphertext, key_version from account_secrets where id = ? and workspace_id = ?",
             (secret_id, webhook["workspace_id"]),
         ).fetchone()
         if row and row["ciphertext"]:
             try:
-                return decrypt_secret_value(row["ciphertext"])
-            except ValueError:
+                return decrypt_secret_value(row["ciphertext"], key_version=row["key_version"])
+            except Exception:
                 pass
     return str(webhook["webhook_url"] or "")
 
@@ -3938,8 +4026,43 @@ def emit_monitor_events(monitor: sqlite3.Row, result: MonitorResult, eligible: b
     try:
         socketio.emit("monitor_update", payload)
     except Exception as exc:  # noqa: BLE001
-        # Best-effort telemetry; never fail monitor execution because of socket emit issues.
-        print(json.dumps(format_log_entry("warning", f"monitor_update_emit_failed: {exc}", workspace_id=monitor["workspace_id"], monitor_id=monitor["id"])))
+        print(
+            json.dumps(
+                format_log_entry(
+                    "warning",
+                    f"monitor_update_emit_failed: {exc}",
+                    workspace_id=monitor["workspace_id"],
+                    monitor_id=monitor["id"],
+                )
+            )
+        )
+
+
+def create_monitor_error_events(monitor: sqlite3.Row, error_text: str) -> None:
+    payload = {
+        "monitor_id": monitor["id"],
+        "workspace_id": monitor["workspace_id"],
+        "retailer": monitor["retailer"],
+        "status_text": "error",
+        "error": (error_text or "")[:500],
+        "checked_at": utc_now(),
+    }
+    try:
+        socketio.emit("monitor_error", payload)
+    except Exception:
+        return
+
+
+def process_post_persist_actions(
+    monitor: sqlite3.Row,
+    result: MonitorResult,
+    eligible: bool,
+    *,
+    strict: bool = False,
+) -> None:
+    emit_monitor_events(monitor, result, eligible)
+    if eligible:
+        create_event_and_deliver(monitor, result, eligible=eligible)
 
 
 def serialize_checkout_task_summary(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -3959,8 +4082,9 @@ def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return None
     payload = dict(row)
     payload["webhook_url"] = redact_webhook_url(payload.get("webhook_url") or "")
-    payload = redact_sensitive_payload(payload)
     return payload
+
+
 def _classify_checkout_step_failure(step: str, exc: Exception, attempt_number: int) -> tuple[bool, str]:
     policy = CHECKOUT_STEP_RETRY_POLICY[step]
     if isinstance(exc, (ValueError, PermissionError)):
@@ -4231,6 +4355,29 @@ class SQLiteJobQueue:
             """,
             (status, next_run_at, payload_json, error_text[:500], now_iso, job_id),
         )
+
+
+STEP_RETRY_POLICY: dict[str, dict[str, float]] = {
+    "fetch": {"base_seconds": 2.0},
+    "persist": {"base_seconds": 1.0},
+    "notify": {"base_seconds": 1.0},
+}
+
+
+def _classify_step_failure(step: str, exc: Exception, attempt_number: int) -> tuple[bool, str]:
+    if step not in STEP_RETRY_POLICY:
+        return False, "unknown_step"
+    if isinstance(exc, (ValueError, PermissionError)):
+        return False, "terminal_validation_error"
+    if attempt_number >= 3:
+        return False, "terminal_max_attempts_exceeded"
+    if isinstance(exc, (requests.RequestException, TimeoutError, ConnectionError, sqlite3.OperationalError)):
+        return True, "retryable_exception"
+    return False, "terminal_unclassified"
+
+
+def _exponential_backoff_seconds(base: float, attempt: int) -> float:
+    return min(300.0, max(0.0, float(base)) * (2 ** max(0, attempt - 1)))
 
 
 def execute_monitor_job(queue: SQLiteJobQueue, job: Job, *, now_iso: str) -> None:
@@ -4519,7 +4666,6 @@ def worker_loop() -> None:
             conn.commit()
             conn.close()
         if not job:
-            time.sleep(WORKER_IDLE_SLEEP_SECONDS)
             idle_jitter = random.uniform(0.0, max(WORKER_IDLE_SLEEP_JITTER_SECONDS, 0.0))
             time.sleep(WORKER_IDLE_SLEEP_SECONDS + idle_jitter)
         else:
@@ -5465,7 +5611,7 @@ def api_test_webhook(webhook_id: int):
         req = perform_request(
             task_key=f"webhook-test-{webhook_id}",
             method="POST",
-            url=hook["webhook_url"],
+            url=target_url,
             workspace_id=workspace_id,
             proxy_url=None,
             timeout=8,

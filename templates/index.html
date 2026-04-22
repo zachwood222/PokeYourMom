@@ -624,6 +624,61 @@
     }
     .task-modal-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
 
+    .app-shell {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      min-height: 100vh;
+    }
+    .side-nav {
+      border-right: 1px solid #2b356a;
+      background: linear-gradient(180deg, #0b1020 0%, #090d18 100%);
+      padding: 14px 12px;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 12px;
+      transition: width .2s ease, padding .2s ease;
+      width: 260px;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: hidden;
+    }
+    .side-nav.collapsed {
+      width: 74px;
+      padding: 14px 8px;
+    }
+    .side-head { display:flex; align-items:center; gap:10px; }
+    .brand-copy h2 { margin: 0; font-size: 15px; }
+    .brand-copy p { margin: 2px 0 0; color: var(--muted); font-size: 11px; }
+    .collapse-btn { width:auto; margin-left:auto; padding:6px 8px; }
+    .side-menu { display:grid; gap:6px; align-content:start; }
+    .nav-link {
+      text-align: left;
+      border: 1px solid transparent;
+      background: transparent;
+      color: #c6d2eb;
+    }
+    .nav-link.active,
+    .nav-link:hover {
+      background: linear-gradient(180deg, rgba(93, 124, 255, 0.22), rgba(93, 124, 255, 0.11));
+      border-color: #42557d;
+      color: #eef2ff;
+    }
+    .side-nav.collapsed .brand-copy,
+    .side-nav.collapsed .nav-link,
+    .side-nav.collapsed .side-foot .small,
+    .side-nav.collapsed .side-foot .section-title { display:none; }
+    .side-nav.collapsed .side-head { justify-content: center; }
+    .side-nav.collapsed .collapse-btn { margin-left: 0; }
+    .side-nav.collapsed .status-value { font-size: 12px; }
+    .app-main { padding: 16px; }
+    .main-topbar {
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      margin-bottom: 10px;
+    }
+
 
     .tasks-clone-shell {
       display: grid;
@@ -698,6 +753,13 @@
     .task-modal-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
 
     @media (max-width: 1080px) {
+      .app-shell { grid-template-columns: 1fr; }
+      .side-nav { position: static; height: auto; width: 100%; grid-template-rows: auto auto auto; }
+      .side-nav.collapsed { width: 100%; }
+      .side-nav.collapsed .brand-copy,
+      .side-nav.collapsed .nav-link,
+      .side-nav.collapsed .side-foot .small,
+      .side-nav.collapsed .side-foot .section-title { display: initial; }
       .layout { grid-template-columns: 1fr; }
       .tasks-clone-shell { grid-template-columns: 1fr; }
       .tasks-clone-groups { position: static; }
@@ -717,76 +779,53 @@
   </style>
 </head>
 <body>
-  <header class="topbar">
-    <div class="topbar-left">
-      <div class="app-mark"></div>
-      <nav class="top-nav">
-        <button type="button" class="active" data-tab="home">Dashboard</button>
-        <button type="button" data-tab="monitors">Tasks</button>
-        <button type="button" data-tab="profiles">Profiles</button>
-        <button type="button" data-tab="webhooks">Proxies</button>
-        <button type="button" data-tab="logs">Captcha</button>
-        <button type="button" data-tab="settings">Settings</button>
-      </nav>
-    </div>
-    <div class="topbar-right" id="clock">--:--:--</div>
-  </header>
   <div id="api_auth_warning" class="config-warn" role="alert" aria-live="polite">
     API auth token is not configured. API requests to <code>/api/*</code> will return <code>401 Unauthorized</code>
     until <code>API_AUTH_TOKEN</code> is set to a non-empty bearer token.
   </div>
 
-  <div class="layout">
-    <aside class="sidebar sidebar-themed">
-      <div class="sidebar-brand">
-        <h2 class="hero-title">PokeYourMom AIO</h2>
-        <p class="subtitle">Version 1.0.1</p>
+  <div class="app-shell">
+    <aside id="side_nav" class="side-nav expanded">
+      <div class="side-head">
+        <div class="app-mark"></div>
+        <div class="brand-copy">
+          <h2>PokeYourMom AIO</h2>
+          <p>v1.0.1</p>
+        </div>
+        <button type="button" class="collapse-btn" onclick="toggleSidebar()">☰</button>
       </div>
-      <div class="card">
-        <h3 class="section-title">System Status</h3>
+      <nav class="side-menu">
+        <button type="button" class="nav-link active" data-tab="home">Home</button>
+        <button type="button" class="nav-link" data-tab="monitors">Tasks</button>
+        <button type="button" class="nav-link" data-tab="releases">Releases</button>
+        <button type="button" class="nav-link" data-tab="automation">Automation</button>
+        <button type="button" class="nav-link" data-tab="webhooks">Proxies</button>
+        <button type="button" class="nav-link" data-tab="profiles">Profiles</button>
+        <button type="button" class="nav-link" data-tab="generator">Account Generator</button>
+        <button type="button" class="nav-link" data-tab="sessions">Sessions</button>
+        <button type="button" class="nav-link" data-tab="logs">Captcha</button>
+        <button type="button" class="nav-link" data-tab="settings">Settings</button>
+      </nav>
+      <div class="side-foot card">
+        <h3 class="section-title">System</h3>
         <div id="runtime_running_badge" class="status-value">READY</div>
         <div id="runtime_latest_check_badge" class="small">N/A</div>
-      </div>
-      <div class="card">
-        <h3 class="section-title">Quick Metrics</h3>
-        <div class="kpi-grid">
-          <div><div class="kpi-label">Monitors</div><div id="kpi_total_monitors_side" class="kpi-value">0</div></div>
-          <div><div class="kpi-label">Enabled</div><div id="kpi_enabled_monitors_side" class="kpi-value">0</div></div>
-          <div><div class="kpi-label">Events 24h</div><div id="kpi_events_24h_side" class="kpi-value">0</div></div>
-          <div><div class="kpi-label">Success</div><div id="kpi_success_rate_side" class="kpi-value">0%</div></div>
-        </div>
-      </div>
-      <div class="card">
-        <h3 class="section-title">Discord Cook Feed</h3>
-        <div id="discord_alert_widget_status" class="discord-alert-status">Loading subscriptions…</div>
-        <input id="discord_subscription_guild" class="compact-input" placeholder="Guild ID" />
-        <input id="discord_subscription_channel" class="compact-input" placeholder="Channel ID" />
-        <input id="discord_subscription_name" class="compact-input" placeholder="Source Name (e.g. Cook Group)" />
-        <div class="actions" style="margin-bottom:8px;">
-          <button onclick="createDiscordSubscription()">Add Source</button>
-          <button onclick="loadDiscordAlertWidget()">Refresh</button>
-        </div>
-        <select id="discord_subscription_id" class="compact-input"></select>
-        <input id="discord_alert_title" class="compact-input" placeholder="Alert Title" />
-        <input id="discord_alert_url" class="compact-input" placeholder="Product URL" />
-        <input id="discord_alert_sku" class="compact-input" placeholder="SKU (optional)" />
-        <input id="discord_alert_retailer" class="compact-input" placeholder="Retailer (optional)" />
-        <textarea id="discord_alert_message" class="compact-input" placeholder="Alert message body" rows="2"></textarea>
-        <div class="actions" style="margin-bottom:8px;">
-          <button onclick="ingestDiscordAlert()">Ingest Alert + Auto Task</button>
-        </div>
-        <div id="discord_alert_feed" class="discord-alert-feed">
-          <div class="small">No alerts ingested yet.</div>
-        </div>
-      </div>
-      <div class="card">
-        <h3 class="section-title">Up To Date</h3>
-        <div id="meta" class="small">Checking version info…</div>
+        <div class="small" style="margin-top:8px;">Monitors: <span id="kpi_total_monitors_side">0</span></div>
+        <div class="small">Enabled: <span id="kpi_enabled_monitors_side">0</span></div>
+        <div class="small">Events 24h: <span id="kpi_events_24h_side">0</span></div>
+        <div class="small">Success: <span id="kpi_success_rate_side">0%</span></div>
+        <div id="meta" class="small" style="margin-top:8px;">Checking version info…</div>
         <div class="actions" style="margin-top:10px;"><button onclick="checkUpdates()">Check for Updates</button></div>
       </div>
     </aside>
 
-    <main class="content">
+    <main class="content app-main">
+      <div class="main-topbar">
+        <div>
+          <p class="small">Home / Overview</p>
+        </div>
+        <div class="topbar-right" id="clock">--:--:--</div>
+      </div>
       <section id="tab-home" class="tab active dashboard-shell">
         <div class="dashboard-headline">
           <h1>Dashboard</h1>
@@ -1086,6 +1125,16 @@
         </div>
       </section>
 
+      <section id="tab-releases" class="tab">
+        <h1>Releases</h1>
+        <div class="card"><p class="small">Track drop calendars, release notes, and site-specific launch plans from one place.</p></div>
+      </section>
+
+      <section id="tab-automation" class="tab">
+        <h1>Automation</h1>
+        <div class="card"><p class="small">Automation policy presets and guardrails will appear here.</p></div>
+      </section>
+
       <section id="tab-profiles" class="tab">
         <h1>Profiles</h1>
         <p class="small">Create reusable checkout vaults with shipping + billing, store logins, and tokenized PayPal/card references.</p>
@@ -1199,7 +1248,7 @@
             </select>
             <div class="actions" style="margin-top:10px;">
               <button onclick="savePlan()">Save Plan</button>
-              <button onclick="toggleLoop()" id="loopBtn">Start Monitor Loop</button>
+              <button onclick="toggleLoop()" id="loopBtnSettings">Start Monitor Loop</button>
             </div>
           </div>
           <div class="card">
@@ -1227,6 +1276,16 @@
             <tbody id="schedules"></tbody>
           </table>
         </div>
+      </section>
+
+      <section id="tab-generator" class="tab">
+        <h1>Account Generator</h1>
+        <div class="card"><p class="small">Create and manage generated accounts for supported sites.</p></div>
+      </section>
+
+      <section id="tab-sessions" class="tab">
+        <h1>Sessions</h1>
+        <div class="card"><p class="small">Inspect active sessions, cookie jars, and profile bindings.</p></div>
       </section>
 
       <section id="tab-logs" class="tab">
@@ -1680,22 +1739,30 @@
       setTimeout(() => toast.remove(), 3500);
     }
 
+    function syncLoopButtonLabels() {
+      const label = loopRunning ? 'Stop Monitor Loop' : 'Start Monitor Loop';
+      const primaryBtn = document.getElementById('loopBtn');
+      const settingsBtn = document.getElementById('loopBtnSettings');
+      if (primaryBtn) primaryBtn.textContent = label;
+      if (settingsBtn) settingsBtn.textContent = label;
+    }
+
     function setTab(tab) {
       const tabPane = document.getElementById(`tab-${tab}`);
-      const tabBtn = document.querySelector(`.top-nav button[data-tab="${tab}"]`);
+      const tabBtn = document.querySelector(`.side-menu .nav-link[data-tab="${tab}"]`);
       if (!tabPane || !tabBtn) {
         console.warn(`Unknown tab requested: ${tab}`);
         return;
       }
       document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
-      document.querySelectorAll('.top-nav button[data-tab]').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.side-menu .nav-link[data-tab]').forEach(el => el.classList.remove('active'));
       tabPane.classList.add('active');
       tabBtn.classList.add('active');
       window.location.hash = `tab-${tab}`;
     }
 
     function initializeTabNavigation() {
-      document.querySelectorAll('.top-nav button[data-tab]').forEach((button) => {
+      document.querySelectorAll('.side-menu .nav-link[data-tab]').forEach((button) => {
         button.addEventListener('click', () => {
           const target = button.dataset.tab;
           if (target) setTab(target);
@@ -1705,6 +1772,20 @@
       if (hashTab) {
         setTab(hashTab);
       }
+    }
+
+    function toggleSidebar() {
+      const sidebar = document.getElementById('side_nav');
+      if (!sidebar) return;
+      sidebar.classList.toggle('collapsed');
+      localStorage.setItem('side_nav_collapsed', sidebar.classList.contains('collapsed') ? '1' : '0');
+    }
+
+    function initializeSidebarState() {
+      const sidebar = document.getElementById('side_nav');
+      if (!sidebar) return;
+      const collapsed = localStorage.getItem('side_nav_collapsed') === '1';
+      sidebar.classList.toggle('collapsed', collapsed);
     }
 
     function renderApiAuthWarning() {
@@ -1872,7 +1953,7 @@
       document.getElementById('runtime_running_badge').textContent = data.running ? 'CONNECTED' : 'READY';
       document.getElementById('runtime_latest_check_badge').textContent = data.latest_check_at || 'N/A';
       loopRunning = !!data.running;
-      document.getElementById('loopBtn').textContent = loopRunning ? 'Stop Monitor Loop' : 'Start Monitor Loop';
+      syncLoopButtonLabels();
       await loadOpsMetrics();
       await loadOpsTrends();
     }
@@ -3265,7 +3346,7 @@
       const endpoint = loopRunning ? '/api/stop' : '/api/start';
       await apiFetch(endpoint, {method: 'POST'});
       loopRunning = !loopRunning;
-      document.getElementById('loopBtn').textContent = loopRunning ? 'Stop Monitor Loop' : 'Start Monitor Loop';
+      syncLoopButtonLabels();
       await loadDashboardSummary();
     }
 
@@ -3284,6 +3365,7 @@
     }
 
     initializeTabNavigation();
+    initializeSidebarState();
     renderApiAuthWarning();
     hydrateTaskGroups();
     ensureDefaultTaskGroups();
