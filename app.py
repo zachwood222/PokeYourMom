@@ -1358,6 +1358,7 @@ def init_db() -> None:
             monitor_id integer not null,
             task_name text,
             task_config text,
+            autopilot_profile_id integer,
             active_proxy_id integer,
             active_proxy_lease_key text,
             current_state text not null default 'idle',
@@ -1370,6 +1371,7 @@ def init_db() -> None:
             last_transition_at text,
             foreign key(workspace_id) references workspaces(id),
             foreign key(monitor_id) references monitors(id),
+            foreign key(autopilot_profile_id) references autopilot_profiles(id),
             foreign key(active_proxy_id) references proxies(id)
         );
 
@@ -1577,6 +1579,28 @@ def init_db() -> None:
             foreign key(payment_method_id) references payment_methods(id)
         );
 
+
+        create table if not exists autopilot_profiles (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            name text not null,
+            preset text not null default 'balanced',
+            budget_daily_cap_cents integer,
+            budget_session_cap_cents integer,
+            max_attempts_per_sku integer not null default 3,
+            max_attempts_per_site integer not null default 6,
+            retailer_priority_json text not null default '[]',
+            proxy_rotation_strategy text not null default 'sticky',
+            account_rotation_strategy text not null default 'sticky',
+            captcha_loop_threshold integer not null default 3,
+            decline_threshold integer not null default 2,
+            antibot_threshold integer not null default 2,
+            enabled integer not null default 1,
+            created_at text not null,
+            updated_at text not null,
+            foreign key(workspace_id) references workspaces(id)
+        );
+
         create table if not exists alert_subscriptions (
             id integer primary key autoincrement,
             workspace_id integer not null,
@@ -1732,6 +1756,7 @@ def init_db() -> None:
     ensure_column(conn, "checkout_attempts", "error", "text")
     ensure_column(conn, "checkout_attempts", "updated_at", "text")
     ensure_column(conn, "checkout_tasks", "status_timestamps_json", "text")
+    ensure_column(conn, "checkout_tasks", "autopilot_profile_id", "integer")
     ensure_column(conn, "captcha_harvesters", "notes", "text")
     ensure_column(conn, "captcha_harvesters", "last_tested_at", "text")
     run_legacy_tasks_migration(conn)
@@ -3050,6 +3075,7 @@ def create_checkout_task(
     task_name: str | None = None,
     task_config: dict[str, Any] | None = None,
     initial_state: str = "idle",
+    autopilot_profile_id: int | None = None,
 ) -> sqlite3.Row:
     task_config = dict(task_config or {})
     monitor_row = conn.execute(
@@ -3060,6 +3086,13 @@ def create_checkout_task(
     if "proxy_policy" in task_config:
         task_config["proxy_policy"] = normalize_proxy_policy(task_config.get("proxy_policy"))
     normalized_state = normalize_checkout_state(initial_state, allow_control_states=False)
+    if autopilot_profile_id is not None:
+        profile_row = conn.execute(
+            "select id from autopilot_profiles where id = ? and workspace_id = ?",
+            (autopilot_profile_id, workspace_id),
+        ).fetchone()
+        if not profile_row:
+            raise ValueError("autopilot_profile_id not found")
     now_iso = utc_now()
     cur = conn.execute(
         """
@@ -3068,6 +3101,7 @@ def create_checkout_task(
             monitor_id,
             task_name,
             task_config,
+            autopilot_profile_id,
             current_state,
             enabled,
             is_paused,
@@ -3076,13 +3110,14 @@ def create_checkout_task(
             updated_at,
             last_transition_at
         )
-        values (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
+        values (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
         """,
         (
             workspace_id,
             monitor_id,
             task_name,
             json.dumps(task_config or {}),
+            autopilot_profile_id,
             normalized_state,
             json.dumps({normalized_state: now_iso}),
             now_iso,
@@ -3751,6 +3786,13 @@ def _compute_retry_preset(
     group_max = _coerce_optional_int(group_limits.get("max_retries"))
     if group_max is not None and group_max > 0:
         max_attempts = min(max_attempts, group_max)
+    autopilot = task_config.get("autopilot") if isinstance(task_config.get("autopilot"), dict) else {}
+    sku_max = _coerce_optional_int(autopilot.get("max_attempts_per_sku"))
+    site_max = _coerce_optional_int(autopilot.get("max_attempts_per_site"))
+    if sku_max is not None and sku_max > 0:
+        max_attempts = min(max_attempts, sku_max)
+    if site_max is not None and site_max > 0:
+        max_attempts = min(max_attempts, site_max)
     return {"max_attempts": max(1, max_attempts), "base_backoff_seconds": float(preset["base_backoff_seconds"])}
 
 
@@ -4587,69 +4629,270 @@ def api_dashboard_commerce():
         """
         select
             ct.id as checkout_task_id,
-            ct.task_name,
-            ct.task_config,
             ct.current_state,
-            ct.updated_at,
             m.retailer,
-            m.product_url,
-            m.last_price_cents
+            coalesce(m.last_price_cents, 0) as price_cents,
+            date(coalesce(ct.updated_at, ct.created_at)) as day_bucket
         from checkout_tasks ct
         join monitors m on m.id = ct.monitor_id
         where ct.workspace_id = ?
-        order by datetime(ct.updated_at) desc, ct.id desc
+        """,
+        (workspace_id,),
+    ).fetchall()
+
+    spent_total_cents = sum(int(r["price_cents"] or 0) for r in rows if str(r["current_state"] or "") == "success")
+    checkout_count = sum(1 for r in rows if str(r["current_state"] or "") == "success")
+    success_rate = 0.0 if not rows else checkout_count / len(rows)
+
+    daily_spend: dict[str, int] = {}
+    site_totals: dict[str, int] = {}
+    for row in rows:
+        state = str(row["current_state"] or "")
+        if state != "success":
+            continue
+        day = str(row["day_bucket"] or "")
+        if day:
+            daily_spend[day] = daily_spend.get(day, 0) + int(row["price_cents"] or 0)
+        site = str(row["retailer"] or "unknown")
+        site_totals[site] = site_totals.get(site, 0) + 1
+
+    average_order_value_cents = 0 if checkout_count == 0 else int(round(spent_total_cents / checkout_count))
+
+    autopilot_rows = conn.execute(
+        """
+        select
+            ct.id as task_id,
+            ap.id as profile_id,
+            ap.name as profile_name,
+            ap.budget_daily_cap_cents,
+            ap.budget_session_cap_cents,
+            ct.current_state,
+            ct.last_error,
+            coalesce(m.last_price_cents, 0) as estimated_price_cents
+        from checkout_tasks ct
+        left join autopilot_profiles ap on ap.id = ct.autopilot_profile_id
+        left join monitors m on m.id = ct.monitor_id
+        where ct.workspace_id = ?
+          and ct.autopilot_profile_id is not null
+        order by ct.id desc
+        limit 25
         """,
         (workspace_id,),
     ).fetchall()
     conn.close()
 
-    successful = [row for row in rows if str(row["current_state"] or "").strip().lower() == "success"]
-    declines = [row for row in rows if str(row["current_state"] or "").strip().lower() == "decline"]
-
-def _ingest_stripe_event(event: dict[str, Any]) -> tuple[bool, int, dict[str, Any]]:
-    event_id = event.get("id")
-    event_type = event.get("type", "")
-    if not event_id:
-        return False, 400, {"error": "Missing Stripe event id"}
-
-    daily_points = [{"date": date, "spent_cents": amount} for date, amount in sorted(daily_spend_cents.items())][-14:]
-    sites = [
-        {"site": site, "checkouts": count}
-        for site, count in sorted(site_totals.items(), key=lambda item: (-item[1], item[0]))
-    ]
-    average_order_value_cents = 0 if checkout_count == 0 else int(round(spent_total_cents / checkout_count))
-
-    conn = db()
-    metrics = {
-        "checks_total": conn.execute(
-            "select count(*) as c from monitors where workspace_id = ? and last_checked_at is not null",
-            (workspace_id,),
-        ).fetchone()["c"],
-        "checks_failed_total": conn.execute(
-            "select count(*) as c from monitors where workspace_id = ? and failure_streak > 0",
-            (workspace_id,),
-        ).fetchone()["c"],
-        "alerts_created_total": conn.execute(
-            """
-            select count(*) as c from events e
-            join monitors m on m.id = e.monitor_id
-            where m.workspace_id = ?
-            """,
-            (event_id, utc_now(), event_type, workspace_id),
+    autopilot = []
+    for row in autopilot_rows:
+        estimated = int(row["estimated_price_cents"] or 0)
+        daily_cap = row["budget_daily_cap_cents"]
+        session_cap = row["budget_session_cap_cents"]
+        cap = session_cap if session_cap is not None else daily_cap
+        consumed_ratio = 0.0 if not cap else min(1.0, estimated / max(1, int(cap)))
+        autopilot.append(
+            {
+                "task_id": row["task_id"],
+                "profile_id": row["profile_id"],
+                "profile_name": row["profile_name"],
+                "state": row["current_state"],
+                "spend_consumed_cents": estimated,
+                "spend_cap_cents": cap,
+                "spend_consumed_ratio": round(consumed_ratio, 4),
+                "pause_reason": row["last_error"],
+            }
         )
-        if insert_result.rowcount == 0:
-            conn.rollback()
-            conn.close()
-            return True, 200, {"ok": True, "noop": True}
-        if event_type in STRIPE_SUBSCRIPTION_EVENT_TYPES:
-            sync_billing_subscription_event(conn, event)
-        conn.commit()
-    except sqlite3.DatabaseError as exc:
-        conn.rollback()
-        conn.close()
-        return False, 400, {"error": f"Database error: {exc}"}
+
+    daily_points = [{"date": date, "spent_cents": amount} for date, amount in sorted(daily_spend.items())][-14:]
+    sites = [{"site": site, "checkouts": count} for site, count in sorted(site_totals.items(), key=lambda item: (-item[1], item[0]))]
+
+    return jsonify(
+        {
+            "success_rate": round(success_rate, 4),
+            "average_order_value_cents": average_order_value_cents,
+            "spent_total_cents": spent_total_cents,
+            "daily_spend": daily_points,
+            "sites": sites,
+            "autopilot": autopilot,
+        }
+    )
+
+
+def _handle_stripe_webhook_request():
+    payload = request.get_data(cache=False, as_text=False)
+    signature_header = request.headers.get("Stripe-Signature")
+    try:
+        verify_stripe_webhook_signature(payload, signature_header)
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+
+    try:
+        event = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return jsonify({"error": "Invalid JSON payload"}), 400
+    ok, status_code, payload = _ingest_stripe_event(event)
+    return jsonify(payload), status_code
+
+
+@app.get("/api/workspace")
+@require_auth
+def api_workspace():
+    row = get_workspace(current_workspace_id())
+    return jsonify({"workspace": dict(row), "user": current_user_context()})
+
+
+@app.post("/api/workspace/plan")
+@require_auth
+def api_update_plan():
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
+    plan = (request.json or {}).get("plan", "basic")
+    if plan not in PLAN_LIMITS:
+        return jsonify({"error": "Invalid plan"}), 400
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    conn.execute("update workspaces set plan = ? where id = ?", (plan, workspace_id))
+    conn.execute("update workspaces set plan = ? where id = ?", (plan, current_workspace_id()))
+    conn.commit()
     conn.close()
-    return True, 200, {"ok": True, "noop": False}
+    return jsonify({"ok": True, "plan": plan})
+
+
+@app.post("/api/billing/subscription-events")
+@require_auth
+def api_sync_billing_subscription_event():
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
+    body = request.json or {}
+    subscription = body.get("subscription") if isinstance(body.get("subscription"), dict) else {}
+    payload = {
+        "provider": body.get("provider", "stripe"),
+        "provider_subscription_id": body.get("provider_subscription_id") or subscription.get("id"),
+        "provider_customer_id": body.get("provider_customer_id") or subscription.get("customer_id"),
+        "status": body.get("status") or subscription.get("status"),
+        "plan_code": body.get("plan_code") or subscription.get("plan_code"),
+        "plan_lookup_key": body.get("plan_lookup_key") or subscription.get("plan_lookup_key"),
+        "cancel_at_period_end": body.get("cancel_at_period_end", subscription.get("cancel_at_period_end")),
+        "current_period_end": body.get("current_period_end") or subscription.get("current_period_end"),
+        "source": body.get("source") or "billing_subscriptions",
+    }
+    try:
+        result = sync_billing_subscription_payload(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
+
+
+@app.get("/api/monitors")
+@require_auth
+def api_list_monitors():
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    rows = conn.execute(
+        "select * from monitors where workspace_id = ? order by id desc",
+        (workspace_id,),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+def get_monitor_for_workspace(
+    conn: sqlite3.Connection, monitor_id: int, workspace_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (monitor_id, workspace_id),
+    ).fetchone()
+
+
+@app.get("/api/monitors/<int:monitor_id>")
+@require_auth
+def api_get_monitor(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    conn.close()
+    if not row:
+        return jsonify({"error": "Monitor not found"}), 404
+    return jsonify(dict(row))
+
+
+@app.get("/api/dashboard/summary")
+@require_auth
+def api_dashboard_summary():
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    total_monitors = conn.execute(
+        "select count(*) as c from monitors where workspace_id = ?", (workspace_id,)
+    ).fetchone()["c"]
+    enabled_monitors = conn.execute(
+        "select count(*) as c from monitors where workspace_id = ? and enabled = 1", (workspace_id,)
+    ).fetchone()["c"]
+    checks_last_24h = conn.execute(
+        """
+        select count(*) as c from monitors
+        where workspace_id = ?
+          and last_checked_at is not null
+          and datetime(last_checked_at) >= datetime('now', '-1 day')
+        """,
+        (workspace_id,),
+    ).fetchone()["c"]
+    latest_check = conn.execute(
+        "select max(last_checked_at) as latest_check from monitors where workspace_id = ?",
+        (workspace_id,),
+    ).fetchone()["latest_check"]
+    events_24h = conn.execute(
+        """
+        select count(*) as c from events e
+        join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ?
+          and datetime(e.event_time) >= datetime('now', '-1 day')
+        """,
+        (workspace_id,),
+    ).fetchone()["c"]
+    events_7d = conn.execute(
+        """
+        select count(*) as c from events e
+        join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ?
+          and datetime(e.event_time) >= datetime('now', '-7 day')
+        """,
+        (workspace_id,),
+    ).fetchone()["c"]
+    deliveries_total = conn.execute(
+        """
+        select count(*) as c from deliveries d
+        join events e on e.id = d.event_id
+        join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ?
+        """,
+        (workspace_id,),
+    ).fetchone()["c"]
+    deliveries_sent = conn.execute(
+        """
+        select count(*) as c from deliveries d
+        join events e on e.id = d.event_id
+        join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ? and d.status = 'sent'
+        """,
+        (workspace_id,),
+    ).fetchone()["c"]
+    conn.close()
+
+    success_rate = 0.0 if deliveries_total == 0 else (deliveries_sent / deliveries_total)
+    return jsonify(
+        {
+            "total_monitors": total_monitors,
+            "enabled_monitors": enabled_monitors,
+            "checks_last_24h": checks_last_24h,
+            "latest_check_at": latest_check,
+            "events_last_24h": events_24h,
+            "events_last_7d": events_7d,
+            "delivery_success_rate": round(success_rate, 4),
+            "worker_running": worker_running,
+            "app_role": APP_ROLE,
+        }
+    )
 
 
 def _handle_stripe_webhook_request():
@@ -6163,6 +6406,635 @@ def api_delete_schedule(schedule_id: int):
     conn.close()
     return jsonify({"ok": True})
 
+
+
+
+AUTOPILOT_PRESET_DEFAULTS = {
+    "safe": {
+        "budget_daily_cap_cents": 15_000,
+        "budget_session_cap_cents": 6_000,
+        "max_attempts_per_sku": 2,
+        "max_attempts_per_site": 3,
+        "proxy_rotation_strategy": "sticky",
+        "account_rotation_strategy": "sticky",
+        "captcha_loop_threshold": 2,
+        "decline_threshold": 1,
+        "antibot_threshold": 1,
+    },
+    "balanced": {
+        "budget_daily_cap_cents": 40_000,
+        "budget_session_cap_cents": 15_000,
+        "max_attempts_per_sku": 3,
+        "max_attempts_per_site": 6,
+        "proxy_rotation_strategy": "adaptive",
+        "account_rotation_strategy": "round_robin",
+        "captcha_loop_threshold": 3,
+        "decline_threshold": 2,
+        "antibot_threshold": 2,
+    },
+    "aggressive": {
+        "budget_daily_cap_cents": 120_000,
+        "budget_session_cap_cents": 60_000,
+        "max_attempts_per_sku": 6,
+        "max_attempts_per_site": 12,
+        "proxy_rotation_strategy": "always_rotate",
+        "account_rotation_strategy": "always_rotate",
+        "captcha_loop_threshold": 5,
+        "decline_threshold": 4,
+        "antibot_threshold": 4,
+    },
+}
+
+
+def _normalize_autopilot_profile_payload(body: dict[str, Any], *, allow_partial: bool = False) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if not allow_partial or "name" in body:
+        name = str(body.get("name") or "").strip()
+        if not allow_partial and not name:
+            raise ValueError("name is required")
+        if name:
+            payload["name"] = name
+
+    if not allow_partial or "preset" in body:
+        preset = str(body.get("preset") or "balanced").strip().lower()
+        if preset not in AUTOPILOT_PRESET_DEFAULTS:
+            raise ValueError("preset must be safe, balanced, or aggressive")
+        payload["preset"] = preset
+
+    int_fields = (
+        "budget_daily_cap_cents",
+        "budget_session_cap_cents",
+        "max_attempts_per_sku",
+        "max_attempts_per_site",
+        "captcha_loop_threshold",
+        "decline_threshold",
+        "antibot_threshold",
+    )
+    for field in int_fields:
+        if allow_partial and field not in body:
+            continue
+        raw = body.get(field)
+        if raw is None:
+            payload[field] = None
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{field} must be an integer")
+        if value < 0:
+            raise ValueError(f"{field} must be >= 0")
+        payload[field] = value
+
+    for strategy_field in ("proxy_rotation_strategy", "account_rotation_strategy"):
+        if allow_partial and strategy_field not in body:
+            continue
+        value = str(body.get(strategy_field) or "sticky").strip().lower()
+        if not value:
+            value = "sticky"
+        payload[strategy_field] = value
+
+    if not allow_partial or "retailer_priority" in body:
+        priorities = body.get("retailer_priority")
+        if priorities is None:
+            priorities = []
+        if not isinstance(priorities, list):
+            raise ValueError("retailer_priority must be an array")
+        payload["retailer_priority_json"] = json.dumps([str(item).strip().lower() for item in priorities if str(item).strip()])
+
+    if not allow_partial or "enabled" in body:
+        payload["enabled"] = int(bool(body.get("enabled", True)))
+
+    preset = payload.get("preset")
+    if preset:
+        defaults = AUTOPILOT_PRESET_DEFAULTS[preset]
+        for key, value in defaults.items():
+            payload.setdefault(key, value)
+
+    return payload
+
+
+def _serialize_autopilot_profile(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    raw_priorities = payload.pop("retailer_priority_json", "[]")
+    try:
+        parsed_priorities = json.loads(raw_priorities) if raw_priorities else []
+    except (TypeError, json.JSONDecodeError):
+        parsed_priorities = []
+    payload["retailer_priority"] = parsed_priorities if isinstance(parsed_priorities, list) else []
+    return payload
+
+
+def _task_autopilot_guard(conn: sqlite3.Connection, task: sqlite3.Row) -> tuple[bool, str | None, dict[str, Any]]:
+    profile_id = task["autopilot_profile_id"]
+    if not profile_id:
+        return True, None, {}
+    profile = conn.execute(
+        "select * from autopilot_profiles where id = ? and workspace_id = ?",
+        (profile_id, task["workspace_id"]),
+    ).fetchone()
+    if not profile:
+        return False, "autopilot_profile_missing", {}
+    if int(profile["enabled"] or 0) == 0:
+        return False, "autopilot_profile_disabled", dict(profile)
+
+    monitor = conn.execute("select retailer, coalesce(last_price_cents, 0) as price from monitors where id = ?", (task["monitor_id"],)).fetchone()
+    estimated_price = int((monitor["price"] if monitor else 0) or 0)
+
+    total_success_spend = conn.execute(
+        """
+        select coalesce(sum(coalesce(m.last_price_cents, 0)), 0) as spent
+        from checkout_attempts a
+        join checkout_tasks t on t.id = a.task_id
+        join monitors m on m.id = t.monitor_id
+        where t.workspace_id = ?
+          and t.autopilot_profile_id = ?
+          and a.status = 'success'
+        """,
+        (task["workspace_id"], profile_id),
+    ).fetchone()["spent"]
+    daily_cap = profile["budget_daily_cap_cents"]
+    session_cap = profile["budget_session_cap_cents"]
+    if session_cap is not None and int(total_success_spend) + estimated_price > int(session_cap):
+        return False, "session_budget_cap_reached", dict(profile)
+    if daily_cap is not None and int(total_success_spend) + estimated_price > int(daily_cap):
+        return False, "daily_budget_cap_reached", dict(profile)
+
+    attempts = conn.execute(
+        """
+        select count(*) as c
+        from checkout_attempts
+        where task_id = ? and status in ('failed', 'retrying')
+        """,
+        (task["id"],),
+    ).fetchone()["c"]
+    if int(attempts or 0) >= int(profile["max_attempts_per_site"] or 0):
+        return False, "max_attempts_per_site_reached", dict(profile)
+
+    return True, None, dict(profile)
+
+
+def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqlite3.Row | None:
+    conn = db()
+    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+    if not task:
+        conn.close()
+        return None
+    allowed, reason, profile = _task_autopilot_guard(conn, task)
+    if not allowed:
+        updated = transition_checkout_task(
+            conn,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            requested_state="paused",
+            reason="autopilot_guard",
+            error_text=reason,
+        )
+        record_task_log(
+            conn,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            monitor_id=task["monitor_id"],
+            level="warning",
+            event_type="autopilot_paused",
+            message=f"Autopilot paused task: {reason}",
+            payload={"reason": reason, "autopilot_profile_id": task["autopilot_profile_id"]},
+        )
+        conn.commit()
+        conn.close()
+        return updated
+
+    config = parse_json_object(task["task_config"])
+    if profile:
+        config["autopilot"] = {
+            "max_attempts_per_sku": profile.get("max_attempts_per_sku"),
+            "max_attempts_per_site": profile.get("max_attempts_per_site"),
+        }
+    for step in CHECKOUT_STEP_SEQUENCE:
+        try:
+            preset = _compute_retry_preset(step=step, failure_class="network", task_config=config)
+            if preset["max_attempts"] <= 0:
+                raise CheckoutRetryableError("autopilot_attempts_blocked")
+            transition_checkout_task(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                requested_state=step,
+                reason="state_machine_step",
+            )
+            record_checkout_attempt(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                monitor_id=task["monitor_id"],
+                state=step,
+                step=step,
+                status="success",
+                details={"strategy_state": profile.get("preset") if profile else None, "retry": preset},
+            )
+        except Exception as exc:  # noqa: BLE001
+            record_checkout_attempt(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                monitor_id=task["monitor_id"],
+                state=step,
+                step=step,
+                status="failed",
+                error_text=str(exc),
+                details={"strategy_state": profile.get("preset") if profile else None},
+            )
+            transition_checkout_task(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                requested_state="error",
+                reason="state_machine_error",
+                error_text=str(exc),
+            )
+            conn.commit()
+            row = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+            conn.close()
+            return row
+
+    updated = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        requested_state="success",
+        reason="state_machine_complete",
+    )
+    conn.commit()
+    conn.close()
+    return updated
+
+
+@app.post("/api/autopilot-profiles")
+@require_auth
+def api_create_autopilot_profile():
+    body = request.json or {}
+    try:
+        normalized = _normalize_autopilot_profile_payload(body, allow_partial=False)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    now_iso = utc_now()
+    conn = db()
+    cur = conn.execute(
+        """
+        insert into autopilot_profiles(
+            workspace_id, name, preset,
+            budget_daily_cap_cents, budget_session_cap_cents,
+            max_attempts_per_sku, max_attempts_per_site,
+            retailer_priority_json,
+            proxy_rotation_strategy, account_rotation_strategy,
+            captcha_loop_threshold, decline_threshold, antibot_threshold,
+            enabled, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            current_workspace_id(),
+            normalized["name"],
+            normalized.get("preset", "balanced"),
+            normalized.get("budget_daily_cap_cents"),
+            normalized.get("budget_session_cap_cents"),
+            normalized.get("max_attempts_per_sku", 3),
+            normalized.get("max_attempts_per_site", 6),
+            normalized.get("retailer_priority_json", "[]"),
+            normalized.get("proxy_rotation_strategy", "sticky"),
+            normalized.get("account_rotation_strategy", "sticky"),
+            normalized.get("captcha_loop_threshold", 3),
+            normalized.get("decline_threshold", 2),
+            normalized.get("antibot_threshold", 2),
+            normalized.get("enabled", 1),
+            now_iso,
+            now_iso,
+        ),
+    )
+    row = conn.execute("select * from autopilot_profiles where id = ?", (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(_serialize_autopilot_profile(row)), 201
+
+
+@app.get("/api/autopilot-profiles")
+@require_auth
+def api_list_autopilot_profiles():
+    conn = db()
+    rows = conn.execute(
+        "select * from autopilot_profiles where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([_serialize_autopilot_profile(r) for r in rows])
+
+
+@app.get("/api/autopilot-profiles/<int:profile_id>")
+@require_auth
+def api_get_autopilot_profile(profile_id: int):
+    conn = db()
+    row = conn.execute(
+        "select * from autopilot_profiles where id = ? and workspace_id = ?",
+        (profile_id, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Autopilot profile not found"}), 404
+    return jsonify(_serialize_autopilot_profile(row))
+
+
+@app.patch("/api/autopilot-profiles/<int:profile_id>")
+@require_auth
+def api_update_autopilot_profile(profile_id: int):
+    body = request.json or {}
+    try:
+        normalized = _normalize_autopilot_profile_payload(body, allow_partial=True)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not normalized:
+        return jsonify({"error": "No mutable fields provided"}), 400
+    normalized["updated_at"] = utc_now()
+    conn = db()
+    row = conn.execute(
+        "select id from autopilot_profiles where id = ? and workspace_id = ?",
+        (profile_id, current_workspace_id()),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "Autopilot profile not found"}), 404
+    for key, value in normalized.items():
+        conn.execute(
+            f"update autopilot_profiles set {key} = ? where id = ? and workspace_id = ?",
+            (value, profile_id, current_workspace_id()),
+        )
+    row = conn.execute(
+        "select * from autopilot_profiles where id = ? and workspace_id = ?",
+        (profile_id, current_workspace_id()),
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(_serialize_autopilot_profile(row))
+
+
+@app.delete("/api/autopilot-profiles/<int:profile_id>")
+@require_auth
+def api_delete_autopilot_profile(profile_id: int):
+    conn = db()
+    cur = conn.execute(
+        "delete from autopilot_profiles where id = ? and workspace_id = ?",
+        (profile_id, current_workspace_id()),
+    )
+    conn.execute(
+        "update checkout_tasks set autopilot_profile_id = null where workspace_id = ? and autopilot_profile_id = ?",
+        (current_workspace_id(), profile_id),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Autopilot profile not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.post("/api/autopilot-profiles/simulate")
+@require_auth
+def api_simulate_autopilot_profile():
+    body = request.json or {}
+    profile_id = body.get("autopilot_profile_id")
+    if profile_id is None:
+        try:
+            profile = _normalize_autopilot_profile_payload(body.get("profile") or {}, allow_partial=False)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+    else:
+        conn = db()
+        row = conn.execute(
+            "select * from autopilot_profiles where id = ? and workspace_id = ?",
+            (int(profile_id), current_workspace_id()),
+        ).fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"error": "Autopilot profile not found"}), 404
+        profile = dict(row)
+
+    estimated_price = int(body.get("estimated_price_cents") or 0)
+    consumed_today = int(body.get("spent_today_cents") or 0)
+    site_attempts = int(body.get("site_attempts") or 0)
+
+    budget_cap = profile.get("budget_session_cap_cents") or profile.get("budget_daily_cap_cents")
+    stop_reasons: list[str] = []
+    if budget_cap is not None and consumed_today + estimated_price > int(budget_cap):
+        stop_reasons.append("budget_cap")
+    if site_attempts >= int(profile.get("max_attempts_per_site") or 0):
+        stop_reasons.append("max_attempts_per_site")
+
+    behavior = {
+        "preset": profile.get("preset", "balanced"),
+        "rotation": {
+            "proxy": profile.get("proxy_rotation_strategy", "sticky"),
+            "account": profile.get("account_rotation_strategy", "sticky"),
+        },
+        "thresholds": {
+            "captcha_loops": profile.get("captcha_loop_threshold", 3),
+            "declines": profile.get("decline_threshold", 2),
+            "antibot": profile.get("antibot_threshold", 2),
+        },
+    }
+    return jsonify(
+        {
+            "ok": True,
+            "can_start": len(stop_reasons) == 0,
+            "estimated_behavior_summary": (
+                f"{behavior['preset'].title()} profile with {behavior['rotation']['proxy']} proxy rotation "
+                f"and site max attempts {profile.get('max_attempts_per_site')}"
+            ),
+            "stop_reasons": stop_reasons,
+            "strategy_state": behavior,
+            "spend": {
+                "consumed_cents": consumed_today,
+                "estimated_order_cents": estimated_price,
+                "cap_cents": budget_cap,
+            },
+        }
+    )
+
+
+@app.post("/api/checkout/tasks")
+@require_auth
+def api_create_checkout_task_v2():
+    body = request.json or {}
+    try:
+        monitor_id = int(body.get("monitor_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "monitor_id is required"}), 400
+    workspace_id = current_workspace_id()
+    task_name = (body.get("task_name") or "").strip() or None
+    task_config = body.get("task_config") if isinstance(body.get("task_config"), dict) else {}
+    initial_state = body.get("initial_state") or "queued"
+    autopilot_profile_id = body.get("autopilot_profile_id")
+    if autopilot_profile_id is None and isinstance(task_config, dict):
+        autopilot_profile_id = task_config.get("autopilot_profile_id")
+    if autopilot_profile_id is not None:
+        try:
+            autopilot_profile_id = int(autopilot_profile_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "autopilot_profile_id must be numeric"}), 400
+
+    conn = db()
+    monitor = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    if not monitor:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+    try:
+        row = create_checkout_task(
+            conn,
+            workspace_id=workspace_id,
+            monitor_id=monitor_id,
+            task_name=task_name,
+            task_config=task_config,
+            initial_state=initial_state,
+            autopilot_profile_id=autopilot_profile_id,
+        )
+    except ValueError as exc:
+        conn.close()
+        return jsonify({"error": str(exc)}), 400
+    conn.commit()
+    payload = serialize_checkout_task(row)
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/start")
+@require_auth
+def api_start_checkout_task_v2(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="monitoring_product",
+        reason="api_start",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/pause")
+@require_auth
+def api_pause_checkout_task_v2(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="paused",
+        reason="api_pause",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/stop")
+@require_auth
+def api_stop_checkout_task_v2(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="stopped",
+        reason="api_stop",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.get("/api/checkout/tasks/<int:task_id>/state")
+@require_auth
+def api_checkout_task_state_v2(task_id: int):
+    conn = db()
+    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    last_attempt = conn.execute(
+        """
+        select id, state, step, status, details, error_text, created_at
+        from checkout_attempts
+        where task_id = ?
+        order by id desc
+        limit 1
+        """,
+        (task_id,),
+    ).fetchone()
+    conn.close()
+    payload = {
+        "task_id": task_id,
+        "current_state": row["current_state"],
+        "last_error": row["last_error"],
+        "last_transition_at": row["last_transition_at"],
+        "autopilot_profile_id": row["autopilot_profile_id"],
+        "last_attempt": dict(last_attempt) if last_attempt else None,
+    }
+    return jsonify(payload)
+
+
+@app.get("/api/dashboard/autopilot")
+@require_auth
+def api_dashboard_autopilot():
+    workspace_id = current_workspace_id()
+    conn = db()
+    rows = conn.execute(
+        """
+        select
+            ct.id as task_id,
+            ct.current_state,
+            ct.last_error,
+            ap.id as profile_id,
+            ap.name as profile_name,
+            ap.preset,
+            ap.budget_daily_cap_cents,
+            ap.budget_session_cap_cents,
+            coalesce(m.last_price_cents, 0) as spend_consumed_cents
+        from checkout_tasks ct
+        left join autopilot_profiles ap on ap.id = ct.autopilot_profile_id
+        left join monitors m on m.id = ct.monitor_id
+        where ct.workspace_id = ?
+          and ct.autopilot_profile_id is not null
+        order by ct.id desc
+        limit 100
+        """,
+        (workspace_id,),
+    ).fetchall()
+    conn.close()
+    payload = []
+    for row in rows:
+        cap = row["budget_session_cap_cents"] if row["budget_session_cap_cents"] is not None else row["budget_daily_cap_cents"]
+        consumed = int(row["spend_consumed_cents"] or 0)
+        payload.append(
+            {
+                "task_id": row["task_id"],
+                "profile_id": row["profile_id"],
+                "profile_name": row["profile_name"],
+                "strategy_state": row["preset"],
+                "spend_consumed_cents": consumed,
+                "spend_cap_cents": cap,
+                "automatic_pause_reason": row["last_error"],
+                "current_state": row["current_state"],
+            }
+        )
+    return jsonify({"rows": payload})
 
 @app.post("/api/start")
 @require_auth

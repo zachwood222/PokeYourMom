@@ -48,14 +48,18 @@ PARSER_FIXTURE_EXPECTATIONS = {
 
 
 PARSER_FIXTURE_CASES = [
-    fixture_case(retailer, fixture_name, expected_in_stock, expected_status)
+    fixture_case(retailer, "default", fixture_name, expected_in_stock, expected_status)
     for retailer, fixtures in PARSER_FIXTURE_EXPECTATIONS.items()
     for fixture_name, (expected_in_stock, expected_status) in fixtures.items()
 ]
 
 
-def load_fixture_html(retailer: str, fixture_name: str) -> str:
-    fixture_path = FIXTURES / retailer / f"{fixture_name}.html"
+def load_fixture_html(retailer: str, fixture_name: str, *, category: str = "default") -> str:
+    category_normalized = (category or "default").strip().lower()
+    if category_normalized in {"", "default"}:
+        fixture_path = FIXTURES / retailer / f"{fixture_name}.html"
+    else:
+        fixture_path = FIXTURES / retailer / category_normalized / f"{fixture_name}.html"
     if not fixture_path.exists():
         raise FileNotFoundError(f"Missing parser fixture: {retailer}/{fixture_name}.html")
     return fixture_path.read_text(encoding="utf-8")
