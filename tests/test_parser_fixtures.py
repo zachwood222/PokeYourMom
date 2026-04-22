@@ -18,19 +18,20 @@ def test_fixture_suite_contains_required_snapshots_per_retailer(retailer):
 
 
 @pytest.mark.parametrize(
-    "retailer,fixture_name,expected_in_stock,expected_status",
+    "retailer,category,fixture_name,expected_in_stock,expected_status",
     PARSER_FIXTURE_CASES,
 )
 def test_evaluate_page_matches_fixture_expectations(
     tmp_path,
     monkeypatch,
     retailer,
+    category,
     fixture_name,
     expected_in_stock,
     expected_status,
 ):
     app_module = _load_app(tmp_path, monkeypatch)
-    html = load_fixture_html(retailer, fixture_name)
+    html = load_fixture_html(retailer, fixture_name, category=category)
 
     result = app_module.evaluate_page(html, retailer=retailer)
     fixture_id = f"{retailer}/{fixture_name}.html"

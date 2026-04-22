@@ -1,11 +1,97 @@
 # Stock Sentinel Documentation
 
-Stock Sentinel is a Flask-based monitor and alert bot for retailer product availability.
+Stock Sentinel is a Flask-based monitor, alert, and experimental checkout task bot for retailer product availability.
+
+## UI Overview
+
+The Cheddah dashboard is organized into tabs along the left sidebar. Each tab corresponds to a major feature area.
+
+### Sidebar Structure
+
+Cheddah is split into three sections:
+
+- **Operations:** Dashboard, Tasks, Alerts, Logs
+- **Setup:** Accounts, Profiles, Proxies, IMAP
+- **System:** Settings
+
+### Main Tabs (What each does)
+
+- **Dashboard:** Real-time performance and health overview
+- **Tasks:** Live Target/PKC task status per account
+- **Alerts:** Discord monitor setup (keywords/TCIN + trigger behavior)
+- **Accounts:** Target accounts, CVV/proxy/session management
+- **Profiles:** Shipping + payment profiles
+- **Proxies:** Proxy groups and testing
+- **IMAP:** Auto email-code handling for Target verification
+- **Logs:** Event history, filtering, timeline analysis, JSON export
+- **Settings:** Updates, captcha provider setup, cleanup tools
+
+### Status Bar (Bottom Left)
+
+Shows:
+
+- backend connection state
+- number of running tasks
+- active alert channels
+
+✅ Green "Connected" means backend is healthy.
+
+## Dashboard: What to Watch First
+
+### Core KPIs
+
+- Checkouts
+- Today
+- Total Spent
+- Avg Time
+
+### Live activity
+
+- running tasks + per-account status
+- PKC queue/browser queue instances
+- stock monitor count
+- Discord alert activity + matched keyword
+- account session state (active / expiring / failed)
+- proxy/session indicators
+- live success/failure feed and login errors
+
+### Additional stats
+
+- Last Checkout
+- Best Time
+- This Week
+- Top Account
+
+### Color readiness
+
+- 🟢 active
+- 🟡 expiring soon
+- 🔴 failed
+
+## Logs: Best Tab for Debugging
+
+### Tracks
+
+- checkouts
+- logins
+- task events
+- monitor polls
+- errors
+
+### Includes
+
+- counters by type (checkout/login/error/total)
+- filters (All, Checkouts, Details, Logins, Tasks, Monitors, Errors)
+- JSON export
+- clear all
+- checkout timeline with elapsed time per step
+
+Best practice: after a drop, filter to **Checkout Details** to identify where time was spent or where failures occurred.
 
 ## Architecture at a glance
 
 - **Web app/API:** Flask (`app.py`) provides dashboard routes and JSON endpoints.
-- **Storage:** SQLite tables for workspaces, monitors, events, webhooks, delivery results, and billing schema state.
+- **Storage:** SQLite tables for workspaces, monitors, checkout tasks (`checkout_tasks`, `checkout_attempts`, `task_logs`), events, webhooks, delivery results, and billing schema state.
 - **Background checks:** in-process monitor loop polls enabled monitors and emits events.
 - **Notifications:** Discord webhooks receive rich embeds when a monitor is eligible.
 
@@ -43,6 +129,14 @@ Stock Sentinel is a Flask-based monitor and alert bot for retailer product avail
 5. Eligibility logic applies stock markers + optional keyword/price/MSRP filters.
 6. Eligible checks are deduplicated and inserted into `events`.
 7. Event payloads are delivered to all enabled webhooks and logged in `deliveries`.
+
+## Canonical monitor API
+
+- Create monitor: `POST /api/monitors`
+- Get monitor: `GET /api/monitors/<id>`
+- Update monitor: `PATCH /api/monitors/<id>`
+- Delete monitor: `DELETE /api/monitors/<id>`
+- Run immediate check: `POST /api/monitors/<id>/check`
 
 ## Canonical checkout task API
 
