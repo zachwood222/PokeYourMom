@@ -2741,7 +2741,6 @@ def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
     assert members_count == 1
 
 
-def test_api_routes_require_auth(tmp_path, monkeypatch):
 def test_webhook_routes_allow_authorized_workspace_access(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()

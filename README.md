@@ -48,9 +48,14 @@ The last two commands are explicit migration-safety checks for:
 ## API quick start
 
 - API authentication is required for all `/api/*` routes.
-- Set `API_AUTH_TOKEN` (defaults to `dev-token`) and send either:
+- In production/non-dev environments, set `API_AUTH_TOKEN` and `SECRET_ENCRYPTION_KEY` explicitly before startup.
+- In local development mode (`APP_ENV=development`), safe local defaults are used (`API_AUTH_TOKEN=dev-token`, `SECRET_ENCRYPTION_KEY=local-dev-secret-key`).
+- Send either:
   - `Authorization: Bearer <token>`, or
   - `X-API-Token: <token>`
+- CORS behavior:
+  - Development mode allows `*`.
+  - Production mode requires explicit origins via `ALLOWED_ORIGINS` (comma-separated, for example `https://app.example.com,https://admin.example.com`).
 - `POST /api/webhooks` to add Discord webhook.
 - `POST /api/monitors` to add product monitor.
 - `POST /api/checkout/tasks` to create a checkout task for an existing monitor.
@@ -86,13 +91,34 @@ Monitor check response compatibility notes:
 Example:
 
 ```bash
-curl -H "Authorization: Bearer dev-token" http://localhost:5000/api/workspace
+curl -H "Authorization: Bearer ${API_AUTH_TOKEN}" http://localhost:5000/api/workspace
 ```
 
 Usage limits snapshot example:
 
 ```bash
-curl -H "Authorization: Bearer dev-token" http://localhost:5000/api/workspace/usage-limits
+curl -H "Authorization: Bearer ${API_AUTH_TOKEN}" http://localhost:5000/api/workspace/usage-limits
+```
+
+### Environment variables (security-sensitive)
+
+Required in non-dev (`APP_ENV` not set to `development`/`test`):
+
+- `API_AUTH_TOKEN`: bearer token required by `/api/*` routes.
+- `SECRET_ENCRYPTION_KEY`: secret key used for encrypt/decrypt of stored sensitive values.
+
+Recommended in non-dev:
+
+- `ALLOWED_ORIGINS`: comma-separated CORS allowlist for Socket.IO/browser clients.
+
+Safe production example:
+
+```bash
+export APP_ENV=production
+export API_AUTH_TOKEN='replace-with-strong-random-token'
+export SECRET_ENCRYPTION_KEY='replace-with-32+-char-random-secret'
+export ALLOWED_ORIGINS='https://app.example.com,https://admin.example.com'
+python app.py
 ```
 
 ```json

@@ -41,8 +41,35 @@ from tasks.parsers import MonitorInputValidationError, parse_monitor_input
 from network.session_manager import RequestResult, SessionManager
 from network.session_manager import RequestBehaviorPolicy
 
+def _current_app_mode() -> str:
+    return (
+        os.getenv("FLASK_ENV")
+        or os.getenv("APP_ENV")
+        or os.getenv("ENV")
+        or os.getenv("PYTHON_ENV")
+        or ""
+    ).strip().lower()
+
+
+def is_dev_environment() -> bool:
+    mode = _current_app_mode()
+    if mode in {"dev", "development", "local", "test", "testing"}:
+        return True
+    return (os.getenv("FLASK_DEBUG", "0") or "").strip() == "1"
+
+
+def _parse_allowed_origins(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+IS_DEV_ENVIRONMENT = is_dev_environment()
+RAW_ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = "*" if IS_DEV_ENVIRONMENT else _parse_allowed_origins(RAW_ALLOWED_ORIGINS)
+
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS, async_mode="threading")
 session_manager = SessionManager()
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
@@ -62,8 +89,14 @@ APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
 RELEASE_CHANNEL = os.getenv("RELEASE_CHANNEL", "stable")
 CORRELATION_ID_HEADER = "X-Correlation-ID"
 _api_auth_token_raw = os.getenv("API_AUTH_TOKEN")
-API_AUTH_TOKEN = _api_auth_token_raw.strip() if _api_auth_token_raw is not None else "dev-token"
-SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY", "local-dev-secret-key")
+API_AUTH_TOKEN = (
+    _api_auth_token_raw.strip()
+    if _api_auth_token_raw is not None
+    else ("dev-token" if IS_DEV_ENVIRONMENT else "")
+)
+SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY") or (
+    "local-dev-secret-key" if IS_DEV_ENVIRONMENT else ""
+)
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_WEBHOOK_TOLERANCE_SECONDS = int(os.getenv("STRIPE_WEBHOOK_TOLERANCE_SECONDS", "300"))
 UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
@@ -270,31 +303,24 @@ def parse_json_object(raw: str | None) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def is_dev_environment() -> bool:
-    mode = (
-        os.getenv("FLASK_ENV")
-        or os.getenv("APP_ENV")
-        or os.getenv("ENV")
-        or os.getenv("PYTHON_ENV")
-        or ""
-    ).strip().lower()
-    if mode in {"dev", "development", "local", "test", "testing"}:
-        return True
-    return (os.getenv("FLASK_DEBUG", "0") or "").strip() == "1"
-
-
 def validate_startup_configuration() -> None:
-    if API_AUTH_TOKEN:
-        return
-    warning_message = (
-        "API_AUTH_TOKEN is empty after normalization. /api/* endpoints will return 401 "
-        "unless requests include a valid bearer token."
-    )
-    log(warning_message, level="error")
-    if STRICT_API_AUTH_TOKEN and not is_dev_environment():
-        raise RuntimeError(
-            f"{warning_message} Set API_AUTH_TOKEN to a non-empty value before startup."
-        )
+    missing_env_vars: list[str] = []
+    if not API_AUTH_TOKEN:
+        missing_env_vars.append("API_AUTH_TOKEN")
+    if not SECRET_ENCRYPTION_KEY:
+        missing_env_vars.append("SECRET_ENCRYPTION_KEY")
+
+    if missing_env_vars:
+        missing_env_text = ", ".join(missing_env_vars)
+        message = f"Missing required environment variables: {missing_env_text}."
+        log(message, level="error")
+        if not is_dev_environment():
+            raise RuntimeError(
+                f"{message} Set explicit values before starting in non-development environments."
+            )
+
+    if not IS_DEV_ENVIRONMENT and (ALLOWED_ORIGINS == "*" or "*" in ALLOWED_ORIGINS):
+        raise RuntimeError("Wildcard CORS is disabled outside development mode.")
 
 
 def verify_stripe_webhook_signature(payload: bytes, signature_header: str | None) -> None:
