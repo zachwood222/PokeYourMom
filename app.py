@@ -3623,6 +3623,16 @@ def _checkout_step_monitoring(
         raise ValueError("monitor_missing")
 
 
+def _checkout_step_carting(
+    _conn: sqlite3.Connection,
+    _task: sqlite3.Row,
+    _monitor: sqlite3.Row | None,
+    _config: dict[str, Any],
+    _attempt_number: int,
+) -> None:
+    return None
+
+
 def run_monitor_pipeline_once(monitor: sqlite3.Row) -> dict[str, Any]:
     result = fetch_monitor(monitor)
     eligible = alert_eligibility(monitor, result)
@@ -3669,6 +3679,7 @@ def _checkout_step_payment(
     if not config.get("payment"):
         raise ValueError("payment_method_missing")
     fail_step = str(config.get("simulate_fail_step") or "")
+    fail_error = str(config.get("simulate_fail_error") or "")
     fail_times = int(config.get("simulate_fail_times") or 0)
     if fail_step in {"payment", "checking_out"} and attempt_number <= fail_times:
         if bool(config.get("simulate_retryable", True)):
@@ -4249,6 +4260,7 @@ def _checkout_step_payment(
     if not config.get("payment"):
         raise ValueError("payment_method_missing")
     fail_step = str(config.get("simulate_fail_step") or "")
+    fail_error = str(config.get("simulate_fail_error") or "")
     fail_times = int(config.get("simulate_fail_times") or 0)
     if fail_step in {"payment", "checking_out"} and attempt_number <= fail_times:
         if bool(config.get("simulate_retryable", True)):
