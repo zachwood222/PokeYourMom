@@ -150,6 +150,31 @@ Legacy ciphertext (pre-migration custom crypto) is still readable and is automat
 6. Eligible checks are deduplicated and inserted into `events`.
 7. Event payloads are delivered to all enabled webhooks and logged in `deliveries`.
 
+## Security/runtime configuration
+
+### Required environment variables in production
+
+When running with a non-development environment (for example `APP_ENV=production`), startup fails fast unless these are set:
+
+- `API_AUTH_TOKEN`: required API bearer token for `/api/*` endpoints.
+- `SECRET_ENCRYPTION_KEY`: encryption/HMAC key for sensitive stored values.
+
+### CORS policy
+
+- Development mode permits wildcard origins (`*`) for local iteration.
+- Non-development mode uses `ALLOWED_ORIGINS` (comma-separated) as the CORS allowlist.
+- Wildcard `*` is rejected outside development mode.
+
+Safe example:
+
+```bash
+export APP_ENV=production
+export API_AUTH_TOKEN='replace-with-strong-random-token'
+export SECRET_ENCRYPTION_KEY='replace-with-32+-char-random-secret'
+export ALLOWED_ORIGINS='https://app.example.com,https://admin.example.com'
+python app.py
+```
+
 ## Canonical checkout task API
 
 - Create task: `POST /api/checkout/tasks`
