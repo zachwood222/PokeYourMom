@@ -5158,7 +5158,6 @@ def api_dashboard_commerce():
     )
 
 
-
 @app.get("/api/ops/monitor-failure-trends")
 @require_auth
 def api_monitor_failure_trends():
@@ -5300,9 +5299,7 @@ def api_delete_monitor_dup2(monitor_id: int):
     conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
     conn.commit()
     conn.close()
-    assert challenge is not None
-    emit_captcha_challenge_update(challenge)
-    return jsonify(serialize_challenge(challenge)), 201
+    return jsonify({"ok": True})
 
 
 @app.post("/api/checkout/captcha-challenges/<int:challenge_id>/manual-solve")
@@ -5312,14 +5309,11 @@ def api_submit_manual_captcha_solution(challenge_id: int):
     solved_token = (body.get("solved_token") or "").strip()
     if not solved_token:
         return jsonify({"error": "solved_token is required"}), 400
-
-@app.get("/api/monitors/<int:monitor_id>")
-@require_auth
-def api_get_monitor_dup3(monitor_id: int):
-    workspace_id = get_workspace_id_for_request()
     conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
+    row = conn.execute(
+        "select * from captcha_challenges where id = ? and workspace_id = ?",
+        (challenge_id, current_workspace_id()),
+    ).fetchone()
     if not row:
         conn.close()
         return jsonify({"error": "Captcha challenge not found"}), 404
@@ -5507,10 +5501,18 @@ def api_list_alert_events():
     conn = db()
     rows = conn.execute(
         """
-        select ae.*, s.guild_id, s.channel_id, s.source_name
+        select
+            ae.*,
+            s.guild_id,
+            s.channel_id,
+            s.source_name,
+            count(a.id) as action_count,
+            max(a.task_id) as latest_task_id
         from alert_events ae
         join alert_subscriptions s on s.id = ae.subscription_id
+        left join alert_event_actions a on a.event_id = ae.id
         where ae.workspace_id = ?
+        group by ae.id
         order by ae.id desc
         limit 200
         """,
