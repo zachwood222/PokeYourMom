@@ -4490,7 +4490,7 @@ def get_monitor_for_workspace(
 
 @app.get("/api/monitors/<int:monitor_id>")
 @require_auth
-def api_get_monitor(monitor_id: int):
+def api_get_monitor_dup2(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
     row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
@@ -4605,12 +4605,39 @@ def api_dashboard_commerce():
 
     successful = [row for row in rows if str(row["current_state"] or "").strip().lower() == "success"]
     declines = [row for row in rows if str(row["current_state"] or "").strip().lower() == "decline"]
+    checkout_count = len(successful)
+    decline_count = len(declines)
+    site_totals: dict[str, int] = {}
+    daily_spend_cents: dict[str, int] = {}
+    product_orders: list[dict[str, Any]] = []
+    spent_total_cents = 0
 
-def _ingest_stripe_event(event: dict[str, Any]) -> tuple[bool, int, dict[str, Any]]:
-    event_id = event.get("id")
-    event_type = event.get("type", "")
-    if not event_id:
-        return False, 400, {"error": "Missing Stripe event id"}
+    for row in successful:
+        site = str(row["retailer"] or "unknown").strip().lower() or "unknown"
+        site_totals[site] = site_totals.get(site, 0) + 1
+
+        updated_at = str(row["updated_at"] or "").strip()
+        day_key = updated_at[:10] if len(updated_at) >= 10 else updated_at
+
+        task_config = parse_json_field(row["task_config"], {})
+        quantity = int(task_config.get("quantity", 1) or 1)
+        price_cents = int(row["last_price_cents"] or 0)
+        spent_cents = max(0, quantity) * max(0, price_cents)
+        spent_total_cents += spent_cents
+        if day_key:
+            daily_spend_cents[day_key] = daily_spend_cents.get(day_key, 0) + spent_cents
+
+        product_orders.append(
+            {
+                "site": site,
+                "product_name": row["task_name"] or "Product",
+                "product_url": row["product_url"],
+                "quantity": quantity,
+                "price_cents": price_cents,
+                "spent_cents": spent_cents,
+                "purchased_at": row["updated_at"],
+            }
+        )
 
     daily_points = [{"date": date, "spent_cents": amount} for date, amount in sorted(daily_spend_cents.items())][-14:]
     sites = [
@@ -4618,71 +4645,20 @@ def _ingest_stripe_event(event: dict[str, Any]) -> tuple[bool, int, dict[str, An
         for site, count in sorted(site_totals.items(), key=lambda item: (-item[1], item[0]))
     ]
     average_order_value_cents = 0 if checkout_count == 0 else int(round(spent_total_cents / checkout_count))
+    success_rate = 0.0 if (checkout_count + decline_count) == 0 else checkout_count / (checkout_count + decline_count)
 
-    conn = db()
-    metrics = {
-        "checks_total": conn.execute(
-            "select count(*) as c from monitors where workspace_id = ? and last_checked_at is not null",
-            (workspace_id,),
-        ).fetchone()["c"],
-        "checks_failed_total": conn.execute(
-            "select count(*) as c from monitors where workspace_id = ? and failure_streak > 0",
-            (workspace_id,),
-        ).fetchone()["c"],
-        "alerts_created_total": conn.execute(
-            """
-            select count(*) as c from events e
-            join monitors m on m.id = e.monitor_id
-            where m.workspace_id = ?
-            """,
-            (event_id, utc_now(), event_type, workspace_id),
-        )
-        if insert_result.rowcount == 0:
-            conn.rollback()
-            conn.close()
-            return True, 200, {"ok": True, "noop": True}
-        if event_type in STRIPE_SUBSCRIPTION_EVENT_TYPES:
-            sync_billing_subscription_event(conn, event)
-        conn.commit()
-    except sqlite3.DatabaseError as exc:
-        conn.rollback()
-        conn.close()
-        return False, 400, {"error": f"Database error: {exc}"}
-    conn.close()
-    return True, 200, {"ok": True, "noop": False}
-
-
-def _handle_stripe_webhook_request():
-    payload = request.get_data(cache=False, as_text=False)
-    signature_header = request.headers.get("Stripe-Signature")
-    try:
-        verify_stripe_webhook_signature(payload, signature_header)
-    except PermissionError as exc:
-        return jsonify({"error": str(exc)}), 401
-
-    try:
-        event = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return jsonify({"error": "Invalid JSON payload"}), 400
-    ok, status_code, payload = _ingest_stripe_event(event)
-    return jsonify(payload), status_code
-
-
-@app.post("/api/billing/stripe/webhook")
-def api_billing_stripe_webhook():
-    return _handle_stripe_webhook_request()
-
-
-@app.post("/api/stripe/webhook")
-def api_stripe_webhook():
-    return _handle_stripe_webhook_request()
-
-
-@app.get("/api/workspace")
-@require_auth
-def api_workspace():
-    row = get_workspace(current_workspace_id())
-    return jsonify({"workspace": dict(row), "user": current_user_context()})
+    return jsonify(
+        {
+            "checkouts_total": checkout_count,
+            "declines_total": decline_count,
+            "spent_total_cents": spent_total_cents,
+            "average_order_value_cents": average_order_value_cents,
+            "success_rate": round(success_rate, 4),
+            "product_orders": sorted(product_orders, key=lambda item: str(item.get("purchased_at") or ""), reverse=True)[:25],
+            "sites_checkouts": sites,
+            "amount_spent_daily": daily_points,
+        }
+    )
 
 
 @app.get("/api/workspace/usage-limits")
@@ -4878,7 +4854,7 @@ def api_update_monitor(monitor_id: int):
 
 @app.delete("/api/monitors/<int:monitor_id>")
 @require_auth
-def api_delete_monitor(monitor_id: int):
+def api_delete_monitor_dup2(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
     row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
@@ -4914,7 +4890,7 @@ def get_monitor_for_workspace(
 
 @app.get("/api/monitors/<int:monitor_id>")
 @require_auth
-def api_get_monitor(monitor_id: int):
+def api_get_monitor_dup3(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
     row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
