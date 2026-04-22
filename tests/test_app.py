@@ -2741,7 +2741,6 @@ def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
     assert members_count == 1
 
 
-def test_api_routes_require_auth(tmp_path, monkeypatch):
 def test_webhook_routes_allow_authorized_workspace_access(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -8066,3 +8065,102 @@ def test_monitor_assist_apply_updates_monitor_and_logs_task_history(tmp_path, mo
     assert monitor_row["product_url"] == "https://www.pokemoncenter.com/product/12-34567-890"
     assert attempt_row["step"] == "PID updated from monitor assist"
     assert attempt_row["error_text"] == "PID updated from monitor assist"
+
+
+def test_checkout_lifecycle_routes_are_bound_to_dedicated_handlers(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+
+    rules = {rule.rule: (rule.endpoint, sorted(rule.methods)) for rule in app_module.app.url_map.iter_rules()}
+
+    assert rules["/api/checkout/tasks/<int:task_id>/start"][0] == "api_start_checkout_task"
+    assert rules["/api/checkout/tasks/<int:task_id>/pause"][0] == "api_pause_checkout_task"
+    assert rules["/api/checkout/tasks/<int:task_id>/state"][0] == "api_checkout_task_state"
+
+    assert rules["/api/checkout/tasks/<int:task_id>/start"][1] == ["OPTIONS", "POST"]
+    assert rules["/api/checkout/tasks/<int:task_id>/pause"][1] == ["OPTIONS", "POST"]
+    assert rules["/api/checkout/tasks/<int:task_id>/state"][1] == ["GET", "HEAD", "OPTIONS"]
+
+
+
+def test_checkout_captcha_routes_use_dedicated_handlers_and_schema(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_monitor_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://www.target.com/p/abc",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    assert create_monitor_resp.status_code == 201
+    monitor_id = create_monitor_resp.get_json()["id"]
+
+    create_task_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor_id,
+            "task_config": {
+                "retailer": "target",
+                "product_url": "https://www.target.com/p/abc",
+            },
+        },
+        headers=_auth_headers(),
+    )
+    assert create_task_resp.status_code == 201
+    task_id = create_task_resp.get_json()["id"]
+
+    create_challenge_resp = client.post(
+        f"/api/checkout/tasks/{task_id}/captcha-challenges",
+        json={"provider": "manual"},
+        headers=_auth_headers(),
+    )
+    assert create_challenge_resp.status_code == 201
+    challenge = create_challenge_resp.get_json()
+    challenge_id = challenge["id"]
+    assert challenge["task_id"] == task_id
+    assert challenge["status"] == "pending"
+
+    list_challenge_resp = client.get(
+        f"/api/checkout/tasks/{task_id}/captcha-challenges",
+        headers=_auth_headers(),
+    )
+    assert list_challenge_resp.status_code == 200
+    listed = list_challenge_resp.get_json()
+    assert isinstance(listed, list)
+    assert listed[0]["id"] == challenge_id
+
+    solve_resp = client.post(
+        f"/api/checkout/captcha-challenges/{challenge_id}/manual-solve",
+        json={"solved_token": "manual-token", "operator_note": "solved in dashboard"},
+        headers=_auth_headers(),
+    )
+    assert solve_resp.status_code == 200
+    solved_payload = solve_resp.get_json()
+    assert solved_payload["ok"] is True
+    assert solved_payload["challenge"]["status"] == "solved"
+    assert solved_payload["challenge"]["manual_payload"]["operator_note"] == "solved in dashboard"
+
+    handoff_resp = client.post(
+        f"/api/checkout/captcha-challenges/{challenge_id}/handoff-token",
+        headers=_auth_headers(),
+    )
+    assert handoff_resp.status_code == 200
+    handoff_payload = handoff_resp.get_json()
+    assert handoff_payload["ok"] is True
+    assert handoff_payload["challenge_id"] == challenge_id
+    assert handoff_payload["handoff_token"]
+
+    consume_resp = client.post(
+        "/api/internal/checkout/captcha-handoffs/consume",
+        json={"handoff_token": handoff_payload["handoff_token"]},
+        headers=_auth_headers(),
+    )
+    assert consume_resp.status_code == 200
+    consume_payload = consume_resp.get_json()
+    assert consume_payload["ok"] is True
+    assert consume_payload["challenge_id"] == challenge_id
+    assert consume_payload["task_id"] == task_id
+    assert consume_payload["solved_token"] == "manual-token"
