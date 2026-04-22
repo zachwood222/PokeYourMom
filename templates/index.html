@@ -2410,6 +2410,132 @@
       }
     }
 
+    async function createCaptchaHarvester() {
+      const payload = {
+        name: (document.getElementById('captcha_name')?.value || '').trim() || 'Harvester',
+        proxy_url: (document.getElementById('captcha_proxy')?.value || '').trim() || null,
+        auto_click_enabled: document.getElementById('captcha_auto_click')?.checked ?? true,
+        auto_solve_mode: document.getElementById('captcha_auto_solve_mode')?.value || 'off',
+      };
+      const res = await apiFetch('/api/captcha/harvesters', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken(payload)),
+      });
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Failed to create harvester (HTTP ${res.status})`, true);
+        return;
+      }
+      const nameEl = document.getElementById('captcha_name');
+      const proxyEl = document.getElementById('captcha_proxy');
+      if (nameEl) nameEl.value = '';
+      if (proxyEl) proxyEl.value = '';
+      showToast(`Created captcha harvester #${data.id}.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function loadCaptchaHarvesters() {
+      const rows = await apiFetch('/api/captcha/harvesters').then(r => r.json()).catch(() => []);
+      const tbody = document.getElementById('captcha_harvesters');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+      const records = Array.isArray(rows) ? rows : [];
+      if (!records.length) {
+        tbody.innerHTML = '<tr><td colspan="7">No harvesters yet. Click Add Captcha to create one.</td></tr>';
+        return;
+      }
+      for (const row of records) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${row.id}</td>
+          <td>${row.name || '-'}</td>
+          <td>${row.gmail_email || '-'}</td>
+          <td>${row.proxy_url || '-'}</td>
+          <td>${row.auto_solve_mode || 'off'}<div class="muted">Auto Click: ${row.auto_click_enabled ? 'on' : 'off'}</div></td>
+          <td>${row.session_status || '-'}<div class="muted">Local AI: ${row.local_ai_status || '-'}</div></td>
+          <td class="actions">
+            <button onclick="signinCaptchaHarvester(${row.id})">YouTube</button>
+            <button onclick="saveCaptchaHarvester(${row.id})">💾 Save</button>
+            <button onclick="testCaptchaLocalAi(${row.id})">Test AI</button>
+            <button onclick="clearCaptchaHarvester(${row.id})">🧽 Erase</button>
+            <button onclick="deleteCaptchaHarvester(${row.id})">🗑 Delete</button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function signinCaptchaHarvester(id) {
+      const gmail_email = prompt('Enter Gmail for this harvester:');
+      if (!gmail_email) return;
+      const res = await apiFetch(`/api/captcha/harvesters/${id}/youtube-signin`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken({gmail_email})),
+      });
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Sign-in failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} signed in.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function saveCaptchaHarvester(id) {
+      const auto_solve_mode = document.getElementById('captcha_auto_solve_mode')?.value || 'off';
+      const auto_click_enabled = document.getElementById('captcha_auto_click')?.checked ?? true;
+      const proxy_url = (document.getElementById('captcha_proxy')?.value || '').trim() || null;
+      const res = await apiFetch(`/api/captcha/harvesters/${id}`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken({auto_solve_mode, auto_click_enabled, proxy_url})),
+      });
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Save failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} saved.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function testCaptchaLocalAi(id) {
+      const res = await apiFetch(`/api/captcha/harvesters/${id}/local-ai-test`, {method: 'POST'});
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Local AI test failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} local AI is ready.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function clearCaptchaHarvester(id) {
+      const res = await apiFetch(`/api/captcha/harvesters/${id}/clear`, {method: 'POST'});
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Clear failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} cleared.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function deleteCaptchaHarvester(id) {
+      const confirmed = confirm(`Delete captcha harvester #${id}?`);
+      if (!confirmed) return;
+      const res = await apiFetch(`/api/captcha/harvesters/${id}`, {method: 'DELETE'});
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Delete failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} deleted.`);
+      await loadCaptchaHarvesters();
+    }
+
     async function testWebhook(id) {
       const data = await apiFetch(`/api/webhooks/${id}/test`, {method: 'POST'}).then(r => r.json());
       alert(JSON.stringify(data));
@@ -2887,6 +3013,7 @@
     loadWorkspace();
     loadMeta();
     loadWebhooks();
+    loadCaptchaHarvesters();
     loadProfilesPanel();
     loadMonitors();
     updateTaskModeFields();
