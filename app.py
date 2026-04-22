@@ -6000,16 +6000,6 @@ def _handle_stripe_webhook_request():
     return jsonify(payload), status_code
 
 
-@app.post("/api/billing/stripe/webhook")
-def api_billing_stripe_webhook():
-    return _handle_stripe_webhook_request()
-
-
-@app.post("/api/stripe/webhook")
-def api_stripe_webhook():
-    return _handle_stripe_webhook_request()
-
-
 @app.get("/api/workspace")
 @require_auth
 def api_workspace():
