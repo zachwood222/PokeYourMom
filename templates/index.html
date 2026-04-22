@@ -594,6 +594,79 @@
     }
     .task-modal-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
 
+
+    .tasks-clone-shell {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+    .tasks-clone-groups { position: sticky; top: 80px; }
+    .tasks-groups-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; gap:8px; }
+    .tasks-groups-head button { width:auto; padding:6px 10px; }
+    .task-group-list { max-height: 460px; overflow:auto; border:1px solid #243353; border-radius:10px; padding:6px; margin:10px 0; background:#0b1222; }
+    .task-group-item { border:1px solid #25314d; border-radius:8px; padding:8px; margin-bottom:6px; cursor:pointer; }
+    .task-group-item.active { border-color:#516bb0; background:#182442; }
+    .tasks-clone-main { padding: 12px; }
+    .tasks-clone-header { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px; }
+    .task-toolbar-actions { display:flex; gap:6px; flex-wrap:wrap; }
+    .task-toolbar-actions button { width:auto; font-size:12px; padding:7px 10px; }
+    .clone-toolbar { margin-bottom: 8px; }
+    .clone-table-scroller { max-height: 520px; }
+    .clone-table-scroller table { font-size:12px; }
+    .clone-table-scroller th, .clone-table-scroller td { white-space: nowrap; }
+    .task-group-item {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 8px;
+      text-align: left;
+      background: #10182d;
+      color: #d8e2f7;
+    }
+    .task-group-meta { display:flex; flex-direction:column; gap:2px; min-width:0; }
+    .task-group-name { font-size: 13px; font-weight: 600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .task-group-site { font-size: 11px; color:#9cb0d8; text-transform: uppercase; letter-spacing: .06em; }
+    .task-group-menu-wrap { position: relative; }
+    .task-group-menu-btn { width:auto; padding:2px 7px; background:#0c1221; border:1px solid #2a3a60; border-radius: 6px; }
+    .task-group-menu {
+      position: absolute;
+      right: 0;
+      top: 28px;
+      display: none;
+      min-width: 100px;
+      z-index: 25;
+      background: #0d1528;
+      border: 1px solid #2f4068;
+      border-radius: 8px;
+      padding: 5px;
+    }
+    .task-group-menu button { width: 100%; text-align:left; background: transparent; border: 0; padding: 7px; }
+    .task-group-menu.open { display: block; }
+    .task-icon-btn { width:auto; min-width:30px; padding:5px 7px; font-size:11px; }
+    .task-modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 6, 14, 0.72);
+      z-index: 180;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .task-modal-overlay.open { display: flex; }
+    .task-modal {
+      width: min(980px, 95vw);
+      max-height: 90vh;
+      overflow: auto;
+      background: #0d1222;
+      border: 1px solid #2b3b62;
+      border-radius: 12px;
+      padding: 14px;
+    }
+    .task-modal-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
       .tasks-clone-shell { grid-template-columns: 1fr; }
@@ -1421,6 +1494,44 @@
       if (!confirm(`Delete task #${taskId}?`)) return;
       await apiFetch(`/api/checkout/tasks/${taskId}`, {method: 'DELETE'});
       await loadTasks();
+    }
+
+    async function createTasksForSelectedMonitors() {
+      const monitorIds = selectedMonitorIds();
+      if (!monitorIds.length) {
+        showToast('Select at least one monitor first.', true);
+        return;
+      }
+      const taskCount = clampTaskCount(document.getElementById('task_count')?.value || '1');
+      const mode = (document.getElementById('task_mode')?.value || 'default').trim();
+      const profileGroup = (document.getElementById('task_profile_group')?.value || '').trim();
+      const proxyGroup = (document.getElementById('task_proxy_group')?.value || '').trim();
+      const checkoutProxyGroup = (document.getElementById('task_checkout_proxy_group')?.value || '').trim();
+      const queueDelayRaw = (document.getElementById('task_queue_entry_delay_ms')?.value || '').trim();
+      let created = 0;
+      for (const monitorId of monitorIds) {
+        for (let i = 0; i < taskCount; i++) {
+          const res = await apiFetch('/api/checkout/tasks', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              monitor_id: monitorId,
+              initial_state: 'queued',
+              task_name: `auto-${monitorId}-${i + 1}`,
+              task_config: {
+                mode,
+                profile_group: profileGroup || null,
+                proxy_group: proxyGroup || null,
+                checkout_proxy_group: checkoutProxyGroup || null,
+                queue_entry_delay_ms: queueDelayRaw === '' ? null : Number(queueDelayRaw),
+              },
+            }),
+          });
+          if (res.ok) created += 1;
+        }
+      }
+      await loadTasks();
+      showToast(`Created ${created} auto-checkout bot task(s) for selected monitors.`);
     }
 
     function getSelectedTaskMonitorRetailer() {
