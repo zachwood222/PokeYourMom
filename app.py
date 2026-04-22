@@ -6449,6 +6449,94 @@ def api_dashboard_summary():
     )
 
 
+@app.get("/api/dashboard/commerce")
+@require_auth
+def api_dashboard_commerce():
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    rows = conn.execute(
+        """
+        select
+            ct.id as checkout_task_id,
+            ct.task_name,
+            ct.task_config,
+            ct.current_state,
+            ct.updated_at,
+            m.retailer,
+            m.product_url,
+            m.last_price_cents
+        from checkout_tasks ct
+        join monitors m on m.id = ct.monitor_id
+        where ct.workspace_id = ?
+        order by datetime(ct.updated_at) desc, ct.id desc
+        """,
+        (workspace_id,),
+    ).fetchall()
+    conn.close()
+
+    successful = [row for row in rows if str(row["current_state"] or "").strip().lower() == "success"]
+    declines = [row for row in rows if str(row["current_state"] or "").strip().lower() == "decline"]
+
+    checkout_count = len(successful)
+    decline_count = len(declines)
+    success_rate = 0.0 if (checkout_count + decline_count) == 0 else checkout_count / (checkout_count + decline_count)
+
+    spent_total_cents = 0
+    site_totals: dict[str, int] = {}
+    daily_spend_cents: dict[str, int] = {}
+    product_orders: list[dict[str, Any]] = []
+
+    for row in successful:
+        retailer = str(row["retailer"] or "unknown").strip().lower() or "unknown"
+        updated_at = str(row["updated_at"] or "")
+        task_config = parse_json_object(row["task_config"])
+        quantity = task_config.get("product_quantity", 1)
+        try:
+            quantity_int = max(1, int(quantity))
+        except (TypeError, ValueError):
+            quantity_int = 1
+        price_cents = max(0, int(row["last_price_cents"] or 0))
+        order_spend_cents = price_cents * quantity_int
+        spent_total_cents += order_spend_cents
+        site_totals[retailer] = site_totals.get(retailer, 0) + 1
+        order_day = updated_at[:10] if len(updated_at) >= 10 else ""
+        if order_day:
+            daily_spend_cents[order_day] = daily_spend_cents.get(order_day, 0) + order_spend_cents
+
+        product_orders.append(
+            {
+                "checkout_task_id": row["checkout_task_id"],
+                "site": retailer,
+                "product_name": row["task_name"] or f"{retailer.title()} checkout",
+                "product_url": row["product_url"],
+                "price_cents": price_cents,
+                "quantity": quantity_int,
+                "spent_cents": order_spend_cents,
+                "purchased_at": updated_at,
+            }
+        )
+
+    daily_points = [{"date": date, "spent_cents": amount} for date, amount in sorted(daily_spend_cents.items())][-14:]
+    sites = [
+        {"site": site, "checkouts": count}
+        for site, count in sorted(site_totals.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    average_order_value_cents = 0 if checkout_count == 0 else int(round(spent_total_cents / checkout_count))
+
+    return jsonify(
+        {
+            "checkouts_total": checkout_count,
+            "declines_total": decline_count,
+            "spent_total_cents": spent_total_cents,
+            "average_order_value_cents": average_order_value_cents,
+            "success_rate": round(success_rate, 4),
+            "product_orders": product_orders[:25],
+            "sites_checkouts": sites,
+            "amount_spent_daily": daily_points,
+        }
+    )
+
+
 @app.get("/api/ops/metrics")
 @require_auth
 def api_ops_metrics():
