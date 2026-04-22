@@ -164,6 +164,69 @@ def test_dashboard_template_contains_ops_metric_cards(tmp_path, monkeypatch):
     assert 'id="ops_alerts_created_total"' in html
     assert 'id="ops_webhook_sent_total"' in html
     assert 'id="ops_webhook_failed_total"' in html
+    assert 'id="discord_alert_feed"' in html
+    assert "Ingest Alert + Auto Task" in html
+
+
+def test_alert_events_endpoint_includes_action_count(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_subscription = client.post(
+        "/api/alert-subscriptions",
+        json={"guild_id": "123", "channel_id": "456", "source_name": "Cook Group"},
+        headers=_auth_headers(),
+    )
+    assert create_subscription.status_code == 201
+    subscription_id = create_subscription.get_json()["id"]
+
+    conn = app_module.db()
+    now_iso = app_module.utc_now()
+    cur = conn.execute(
+        """
+        insert into alert_events(
+            workspace_id, subscription_id, source_event_id, source, parse_status, event_time,
+            retailer, product_url, sku, title, message, payload_json, normalized_json, parse_error, created_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            1,
+            subscription_id,
+            "evt-1",
+            "discord",
+            "accepted",
+            now_iso,
+            "target",
+            "https://target.com/p/abc",
+            "SKU-1",
+            "Pokemon Restock",
+            "restock live",
+            json.dumps({"title": "Pokemon Restock"}),
+            json.dumps({"title": "Pokemon Restock"}),
+            None,
+            now_iso,
+        ),
+    )
+    event_id = int(cur.lastrowid)
+    conn.execute(
+        """
+        insert into alert_event_actions(
+            event_id, workspace_id, monitor_id, action_type, status, dedupe_key, task_id, job_id, details, created_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (event_id, 1, 99, "checkout_and_monitor", "enqueued", "dedupe-1", 1234, 5678, "{}", now_iso),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/alerts/events", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert isinstance(payload, list)
+    assert payload[0]["source_event_id"] == "evt-1"
+    assert payload[0]["action_count"] == 1
+    assert payload[0]["latest_task_id"] == 1234
 
 
 def test_workspace_endpoint_requires_auth(tmp_path, monkeypatch):
