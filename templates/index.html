@@ -512,8 +512,83 @@
     .dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
     .dot.w { background:#f2c84b; } .dot.t { background:#6d93ff; } .dot.b { background:#55d7a6; } .dot.o { background:#d76ae6; }
 
+
+    .tasks-clone-shell {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+    .tasks-clone-groups { position: sticky; top: 80px; }
+    .tasks-groups-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; gap:8px; }
+    .tasks-groups-head button { width:auto; padding:6px 10px; }
+    .task-group-list { max-height: 460px; overflow:auto; border:1px solid #243353; border-radius:10px; padding:6px; margin:10px 0; background:#0b1222; }
+    .task-group-item { border:1px solid #25314d; border-radius:8px; padding:8px; margin-bottom:6px; cursor:pointer; }
+    .task-group-item.active { border-color:#516bb0; background:#182442; }
+    .tasks-clone-main { padding: 12px; }
+    .tasks-clone-header { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px; }
+    .task-toolbar-actions { display:flex; gap:6px; flex-wrap:wrap; }
+    .task-toolbar-actions button { width:auto; font-size:12px; padding:7px 10px; }
+    .clone-toolbar { margin-bottom: 8px; }
+    .clone-table-scroller { max-height: 520px; }
+    .clone-table-scroller table { font-size:12px; }
+    .clone-table-scroller th, .clone-table-scroller td { white-space: nowrap; }
+    .task-group-item {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 8px;
+      text-align: left;
+      background: #10182d;
+      color: #d8e2f7;
+    }
+    .task-group-meta { display:flex; flex-direction:column; gap:2px; min-width:0; }
+    .task-group-name { font-size: 13px; font-weight: 600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .task-group-site { font-size: 11px; color:#9cb0d8; text-transform: uppercase; letter-spacing: .06em; }
+    .task-group-menu-wrap { position: relative; }
+    .task-group-menu-btn { width:auto; padding:2px 7px; background:#0c1221; border:1px solid #2a3a60; border-radius: 6px; }
+    .task-group-menu {
+      position: absolute;
+      right: 0;
+      top: 28px;
+      display: none;
+      min-width: 100px;
+      z-index: 25;
+      background: #0d1528;
+      border: 1px solid #2f4068;
+      border-radius: 8px;
+      padding: 5px;
+    }
+    .task-group-menu button { width: 100%; text-align:left; background: transparent; border: 0; padding: 7px; }
+    .task-group-menu.open { display: block; }
+    .task-icon-btn { width:auto; min-width:30px; padding:5px 7px; font-size:11px; }
+    .task-modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 6, 14, 0.72);
+      z-index: 180;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .task-modal-overlay.open { display: flex; }
+    .task-modal {
+      width: min(980px, 95vw);
+      max-height: 90vh;
+      overflow: auto;
+      background: #0d1222;
+      border: 1px solid #2b3b62;
+      border-radius: 12px;
+      padding: 14px;
+    }
+    .task-modal-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
+      .tasks-clone-shell { grid-template-columns: 1fr; }
+      .tasks-clone-groups { position: static; }
       .sidebar { order: 2; }
       .content { order: 1; }
       .topbar { height: auto; min-height: 62px; padding: 10px 14px; flex-wrap: wrap; gap: 8px; }
@@ -650,315 +725,187 @@
         </div>
       </section>
 
-      <section id="tab-monitors" class="tab">
-        <h1>Task Controls</h1>
-        <div class="card">
-          <h2>Quick Setup</h2>
-          <ol class="quick-setup-steps">
-            <li>Create Monitor</li>
-            <li>Enable Auto Action (Alert + Auto-buy)</li>
-          </ol>
-          <form onsubmit="createQuickSetupFlow(event)">
-            <div class="row">
-              <div>
-                <label>Retailer</label>
-                <select id="quick_retailer">
-                  <option>walmart</option>
-                  <option>target</option>
-                  <option>bestbuy</option>
-                </select>
-              </div>
-              <div>
-                <label>Poll Interval (seconds)</label>
-                <input id="quick_poll_interval" type="number" value="20" />
-              </div>
+      <section id="tab-monitors" class="tab tasks-clone-tab">
+        <div class="tasks-clone-shell">
+          <aside class="tasks-clone-groups card">
+            <div class="tasks-groups-head">
+              <h2 class="section-title">My Task Groups</h2>
+              <button type="button" onclick="createTaskGroupPrompt()">+ New Task Group</button>
             </div>
-            <label>Product URL</label>
-            <input id="quick_product_url" placeholder="https://www.walmart.com/ip/..." />
-            <div class="row" style="margin-top:10px;">
-              <div>
-                <label>Webhook Target</label>
-                <select id="quick_webhook_target"></select>
-              </div>
-              <div>
-                <label>Monitor Selection (Optional Existing)</label>
-                <select id="quick_monitor_selection"></select>
-              </div>
-            </div>
-            <details class="quick-advanced">
-              <summary>Advanced</summary>
-              <div class="row" style="margin-top:8px;">
-                <div>
-                  <label>Keyword Filter</label>
-                  <input id="quick_keyword" placeholder="pokemon" />
-                </div>
-                <div>
-                  <label>Max Price Cents</label>
-                  <input id="quick_max_price_cents" type="number" placeholder="4000" />
-                </div>
-              </div>
-              <div style="margin-top:8px;">
-                <label>Original MSRP Cents (Pokemon only)</label>
-                <input id="quick_msrp_cents" type="number" placeholder="499" />
-              </div>
-            </details>
-            <button class="btn-primary" style="margin-top:12px;" type="submit">Run Quick Setup</button>
-          </form>
-        </div>
-        <div class="kpi-grid task-summary-grid">
-          <div class="card"><div class="kpi-label">Total Tasks</div><div id="task_kpi_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Active</div><div id="task_kpi_active" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Queued</div><div id="task_kpi_queued" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Failed</div><div id="task_kpi_failed" class="kpi-value">0</div></div>
-        </div>
-        <div class="card">
-          <h2 class="section-title">Task Overview</h2>
-          <div class="metric-row">
-            <div class="metric-tile"><span id="metric_total" class="value">0</span><span class="label">Total</span></div>
-            <div class="metric-tile info"><span id="metric_running" class="value">0</span><span class="label">Running</span></div>
-            <div class="metric-tile warning"><span id="metric_queued" class="value">0</span><span class="label">Queued</span></div>
-            <div class="metric-tile success"><span id="metric_success" class="value">0</span><span class="label">Success</span></div>
-          </div>
-          <div class="inline-action-group">
-            <button onclick="startAllTasks()">Start All</button>
-            <button class="btn-danger" onclick="stopAllTasks()">Stop All</button>
-            <button class="btn-primary" onclick="setTab('monitors')">Create Task</button>
-          </div>
-        </div>
+            <input id="task_group_search" placeholder="Search tasks / SKU / profile" oninput="applyTaskSearchFilter()" />
+            <div id="task_group_list" class="task-group-list"></div>
+            <div class="small">Tip: groups are local UI folders to organize site-specific tasks.</div>
+          </aside>
 
-        <div class="card legacy-path">
-          <h2>Create Automation Task</h2>
-          <div class="image-strip">
-            <figure>
-              <img alt="Task queue redesign visual" src="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 900 280'%3E%3Cdefs%3E%3ClinearGradient id='a' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop stop-color='%230f1a33'/%3E%3Cstop offset='1' stop-color='%23214574'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='900' height='280' fill='url(%23a)'/%3E%3Cg fill='%23b6c7ff' opacity='.28'%3E%3Crect x='40' y='40' width='820' height='42' rx='10'/%3E%3Crect x='40' y='95' width='820' height='42' rx='10'/%3E%3Crect x='40' y='150' width='540' height='42' rx='10'/%3E%3C/g%3E%3Cg fill='%2378a0ff'%3E%3Ccircle cx='66' cy='62' r='7'/%3E%3Ccircle cx='66' cy='117' r='7'/%3E%3Ccircle cx='66' cy='172' r='7'/%3E%3C/g%3E%3C/svg%3E" />
-              <figcaption>Card-based task rows with compact status signals.</figcaption>
-            </figure>
-            <figure>
-              <img alt="Task editor redesign visual" src="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 900 280'%3E%3Cdefs%3E%3ClinearGradient id='b' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop stop-color='%23201844'/%3E%3Cstop offset='1' stop-color='%230e1020'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='900' height='280' fill='url(%23b)'/%3E%3Cg fill='%23e5d8ff' opacity='.22'%3E%3Crect x='36' y='36' width='400' height='56' rx='11'/%3E%3Crect x='454' y='36' width='410' height='56' rx='11'/%3E%3Crect x='36' y='112' width='260' height='46' rx='9'/%3E%3Crect x='312' y='112' width='260' height='46' rx='9'/%3E%3Crect x='588' y='112' width='276' height='46' rx='9'/%3E%3C/g%3E%3Crect x='36' y='182' width='160' height='58' rx='10' fill='%23684aff' opacity='.7'/%3E%3C/svg%3E" />
-              <figcaption>Modal-style task editor layout inspired by your mockup.</figcaption>
-            </figure>
-          </div>
-          <div class="dense-grid">
-            <div class="dense-form-row">
-              <label>Monitor</label>
-              <select id="task_monitor_id"></select>
-              <div class="helper">Choose a monitor source for this automation task.</div>
-              <p class="small">Create a monitor first in “Add Product Monitor”.</p>
-            </div>
-            <div class="dense-form-row">
-              <label>Task Name (Optional)</label>
-              <input id="task_name" placeholder="Walmart checkout task" />
-              <div class="helper">Readable label shown in task cards and log entries.</div>
-            </div>
-            <div class="dense-form-row">
-              <label>Task Count</label>
-              <div class="stepper">
-                <button type="button" onclick="adjustTaskCount(-1)">-</button>
-                <input id="task_count" type="number" min="1" max="100" value="1" />
-                <button type="button" onclick="adjustTaskCount(1)">+</button>
-              </div>
-              <div class="helper">Creates multiple tasks in one click.</div>
-            </div>
-            <div class="dense-form-row">
-              <label>Mode</label>
-              <select id="task_mode">
-                <option value="default">default</option>
-                <option value="safe">safe</option>
-                <option value="fast">fast</option>
-              </select>
-              <div class="helper">Select pacing profile for this run.</div>
-            </div>
-            <div class="dense-form-row">
-              <label>Profile Group</label>
-              <input id="task_profile_group" placeholder="main-profiles" />
-              <div class="helper">Matches account/profile pools used by the worker.</div>
-            </div>
-            <div class="dense-form-row">
-              <label>Proxy Group</label>
-              <input id="task_proxy_group" placeholder="resi-us-east" />
-              <div class="helper">Optional proxy pool label for queue + checkout.</div>
-            </div>
-            <div class="dense-form-row">
-              <label>Product URLs or PIDs</label>
-              <input id="task_products" placeholder="12-34567-890:1,98-76543-210:2" />
-            </div>
-            <div class="dense-form-row">
-              <label>Queue Delay (ms)</label>
-              <input id="task_queue_entry_delay_ms" type="number" min="0" placeholder="2500" />
-            </div>
-            <div class="dense-form-row">
-              <label>Promo Code</label>
-              <input id="task_promo_code" placeholder="SPRING24" />
-              <div id="task_promo_warning" class="inline-warn"></div>
-            </div>
-          </div>
-          <div id="create_task_error" class="inline-error"></div>
-          <div class="summary-panel">
-            <div class="summary-grid">
-              <div class="summary-item"><strong>Tasks</strong><span id="summary_task_count">1</span></div>
-              <div class="summary-item"><strong>Mode</strong><span id="summary_mode">default</span></div>
-              <div class="summary-item"><strong>Products</strong><span id="summary_products">monitor default</span></div>
-              <div class="summary-item"><strong>Profile Group</strong><span id="summary_profile_group">-</span></div>
-              <div class="summary-item"><strong>Proxy Group</strong><span id="summary_proxy_group">-</span></div>
-            </div>
-          </div>
-          <div class="modal-footer">
-            <button id="create_task_btn" onclick="createTask()" disabled>Create (1)</button>
-          </div>
-        </div>
-
-        <div class="card detail-section">
-          <h2 class="section-title">Live Task Table</h2>
-          <div class="actions" style="margin-bottom:10px;">
-            <button onclick="bulkStopRunningGroup()">Bulk Stop Running Group</button>
-            <button onclick="deleteAllMonitors()">Delete All Monitors</button>
-          </div>
-          <table>
-            <thead><tr><th>ID</th><th>Monitor</th><th>Retailer</th><th>Status</th><th>Last Transition</th><th>Last Error</th><th>Actions</th></tr></thead>
-            <tbody id="tasks"></tbody>
-          </table>
-        </div>
-
-        <div class="card detail-section">
-          <h2 class="section-title">Per-Task Log Panel</h2>
-          <div class="small" id="task_log_title">Select a task to inspect attempts.</div>
-          <div id="task_logs" class="logs task-log-panel"></div>
-        </div>
-
-        <div class="card detail-section">
-        <div class="card task-card">
-          <div class="task-card-header">
-            <div>
-              <h3 class="task-card-title">Task Card Pattern</h3>
-              <div class="task-card-tags">
-                <span class="status-badge info">Queue Race</span>
-                <span class="status-badge success">Monitoring</span>
+          <div class="tasks-clone-main card">
+            <div class="tasks-clone-header">
+              <h1>Tasks</h1>
+              <div class="task-toolbar-actions">
+                <button class="btn-primary" onclick="openTaskModal()">Create Task</button>
+                <button onclick="startAllTasks()">Start All</button>
+                <button class="btn-danger" onclick="stopAllTasks()">End All</button>
+                <button onclick="editAllTasks()">Edit All</button>
+                <button onclick="clearAllTasks()">Clear All</button>
+                <button onclick="openMonitorPulse()">Monitor</button>
+                <button onclick="importTasksPrompt()">Import</button>
+                <button onclick="exportTasksPrompt()">Export</button>
+                <button onclick="startSelectedTasksNow()">Start Now</button>
               </div>
             </div>
-            <div class="inline-action-group">
-              <button>Start</button>
-              <button class="btn-danger">Stop</button>
-            </div>
-          </div>
-          <div class="task-card-body">
-            <div class="small">Reusable shell for header + tags + mode + metrics + logs.</div>
-          </div>
-        </div>
 
-        <div class="card legacy-path" style="margin-top:14px;">
-          <h2>Add Product Monitor</h2>
-          <div class="row">
-            <div>
-              <label>Retailer</label>
-              <select id="retailer">
-                <option>walmart</option>
-                <option>target</option>
-                <option>bestbuy</option>
+            <div class="task-table-toolbar clone-toolbar">
+              <input id="task_search" placeholder="Search tasks" oninput="applyTaskSearchFilter()" />
+              <select id="task_status_filter" onchange="applyTaskSearchFilter()">
+                <option value="">All Statuses</option>
+                <option value="queued">Queued</option>
+                <option value="monitoring">Monitoring</option>
+                <option value="running">Running</option>
+                <option value="success">Success</option>
+                <option value="failed">Failed</option>
+                <option value="stopped">Stopped</option>
               </select>
             </div>
-            <label class="small">Product URL</label>
-            <input id="product_url" placeholder="https://www.walmart.com/ip/..." />
-            <p class="helper-text">Monitor input examples: URL, PID <code>12-34567-890</code>, or <code>placeholder</code>.</p>
-            <div class="row" style="margin-top: 10px;">
-              <div>
-                <label class="small">Keyword Filter</label>
-                <input id="keyword" placeholder="pokemon" />
-              </div>
-              <div>
-                <label class="small">Max Price Cents</label>
-                <input id="max_price_cents" type="number" placeholder="4000" />
-              </div>
-            </div>
-            <div style="margin-top:10px;">
-              <label class="small">Original MSRP Cents (Pokemon only)</label>
-              <input id="msrp_cents" type="number" placeholder="499" />
-            </div>
-            <div style="margin-top:10px;">
-              <label class="small">Poll Interval (seconds)</label>
-              <input id="poll_interval" type="number" value="20" />
-            </div>
-            <input id="captcha_token" type="hidden" value="" />
-            {% if captcha_site_key %}
-            <div style="margin-top:10px;">
-              <label class="small">CAPTCHA Verification</label>
-              <div id="captcha_widget" class="cf-turnstile" data-sitekey="{{ captcha_site_key }}" data-theme="dark" data-callback="onCaptchaSuccess" data-expired-callback="onCaptchaExpired" data-error-callback="onCaptchaError"></div>
-            </div>
-            {% endif %}
-            <div id="monitor_input_error" class="inline-error"></div>
-            <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
 
-            <div class="card" style="margin-top:14px;">
-              <h2 class="section-title">Manage Products • Paste Monitor Payload</h2>
-              <p class="small">Optional local-only parser for Discord/webhook snippets. No webhook API integration required.</p>
-              <label class="small">Paste webhook text</label>
-              <textarea id="monitor_payload_input" rows="4" style="width:100%;padding:9px 10px;border-radius:8px;border:1px solid #233049;background:var(--surface-soft);color:var(--text);" placeholder="SKU 1234567890 | PID 12-34567-890"></textarea>
-              <div class="actions" style="margin-top:10px;">
-                <button onclick="parseMonitorPayloadCandidates()">Parse PID Candidates</button>
-              </div>
-              <div id="monitor_payload_status" class="small"></div>
-              <div id="monitor_payload_candidates" class="assist-candidate-list"></div>
+            <div class="status-chip-row">
+              <button class="status-chip active" data-status="all" onclick="setTaskStatusChip('all')">All</button>
+              <button class="status-chip" data-status="running" onclick="setTaskStatusChip('running')">Running</button>
+              <button class="status-chip" data-status="queued" onclick="setTaskStatusChip('queued')">Queued</button>
+              <button class="status-chip" data-status="failed" onclick="setTaskStatusChip('failed')">Failed</button>
+              <button class="status-chip" data-status="success" onclick="setTaskStatusChip('success')">Success</button>
             </div>
-          </div>
 
-          <div class="card">
-            <h2 class="section-title">Bulk Schedules</h2>
-            <div class="row">
-              <div>
-                <label class="small">Run At (UTC ISO)</label>
-                <input id="schedule_run_at" placeholder="2026-04-18T15:00:00+00:00" />
-              </div>
-              <div>
-                <label class="small">New Poll Interval</label>
-                <input id="schedule_poll" type="number" value="20" />
-              </div>
-            </div>
-            <button style="margin-top:10px;" onclick="createSchedule()">Create Schedule For Selected</button>
-
-            <div style="margin-top: 12px;">
+            <div class="task-table-scroller clone-table-scroller">
               <table>
                 <thead>
-                  <tr><th>ID</th><th>Monitor</th><th>Run At</th><th>Applied</th><th>Actions</th></tr>
+                  <tr>
+                    <th class="task-checkbox-col"></th>
+                    <th>ID</th>
+                    <th>Mode</th>
+                    <th>Product</th>
+                    <th>Checkout Set</th>
+                    <th>Region</th>
+                    <th>Delay</th>
+                    <th>Qty</th>
+                    <th>Captcha Provider</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                  </tr>
                 </thead>
-                <tbody id="schedules"></tbody>
+                <tbody id="tasks"></tbody>
               </table>
             </div>
+
+            <div class="kpi-grid task-summary-grid">
+              <div class="card"><div class="kpi-label">Total Tasks</div><div id="task_kpi_total" class="kpi-value">0</div></div>
+              <div class="card"><div class="kpi-label">Active</div><div id="task_kpi_active" class="kpi-value">0</div></div>
+              <div class="card"><div class="kpi-label">Queued</div><div id="task_kpi_queued" class="kpi-value">0</div></div>
+              <div class="card"><div class="kpi-label">Failed</div><div id="task_kpi_failed" class="kpi-value">0</div></div>
+            </div>
+
+            <div class="card detail-section">
+              <h2 class="section-title">Task Creation Guide</h2>
+              <p class="small">Create a site-specific task group (green +), choose the group, click Create Task, then fill mode/profile/proxies and site fields.</p>
+            </div>
+
+            <div class="card detail-section">
+              <h2 class="section-title">Per-Task Log Panel</h2>
+              <div class="small" id="task_log_title">Select a task to inspect attempts.</div>
+              <div id="task_logs" class="logs task-log-panel"></div>
+            </div>
           </div>
         </div>
 
-        <div class="card detail-section">
-          <h2 class="section-title">Monitor List</h2>
-          <table>
-            <thead><tr><th>ID</th><th>Select</th><th>Retailer</th><th>URL</th><th>Last Checked</th><th>Last Alert State</th><th>Actions</th></tr></thead>
-            <tbody id="monitors"></tbody>
-          </table>
+        <div id="task_modal_overlay" class="task-modal-overlay" onclick="dismissTaskModal(event)">
+          <div class="task-modal" role="dialog" aria-modal="true" aria-label="Create task">
+            <div class="task-modal-header">
+              <h2 class="section-title">New Task</h2>
+              <button onclick="closeTaskModal()">Close</button>
+            </div>
+            <div class="dense-grid">
+              <div class="dense-form-row"><label>Name</label><input id="task_name" placeholder="Enter Task Name" /></div>
+              <div class="dense-form-row"><label>Monitor</label><select id="task_monitor_id"></select></div>
+              <div class="dense-form-row"><label>Mode</label><select id="task_mode"><option value="default">default</option><option value="safe">safe</option><option value="fast">fast</option><option value="instore">instore</option></select></div>
+              <div class="dense-form-row"><label>Profile / Group</label><input id="task_profile_group" placeholder="Select Profile" /></div>
+              <div class="dense-form-row"><label>Monitor Proxy</label><input id="task_proxy_group" placeholder="Select Monitor Proxy" /></div>
+              <div class="dense-form-row"><label>Checkout Proxy</label><input id="task_checkout_proxy_group" placeholder="Select Checkout Proxy" /></div>
+              <div class="dense-form-row"><label>URL / SKU / PID</label><input id="task_products" placeholder="Enter URL or PID" /></div>
+              <div class="dense-form-row"><label>Region</label><input id="task_region" value="US" /></div>
+              <div class="dense-form-row"><label>Quantity</label><input id="task_quantity_override" type="number" min="1" value="1" /></div>
+              <div class="dense-form-row"><label>Giftcard(s)</label><input id="task_giftcards" placeholder="Enter Giftcard(s)" /></div>
+              <div class="dense-form-row"><label>Instore Distance</label><input id="task_instore_distance" placeholder="10" /></div>
+              <div class="dense-form-row"><label>Instore Pickup Name</label><input id="task_instore_pickup_name" placeholder="Enter Instore Pickup Name" /></div>
+              <div class="dense-form-row"><label>Zipcode</label><input id="task_zipcode" placeholder="95050" /></div>
+              <div class="dense-form-row"><label>Business Name</label><input id="task_business_name" placeholder="Enter Business Name" /></div>
+              <div class="dense-form-row"><label>Delay (ms)</label><input id="task_queue_entry_delay_ms" type="number" min="0" placeholder="3500" /></div>
+              <div class="dense-form-row"><label>Restart On Decline?</label><input id="task_restart_on_decline" type="checkbox" style="width:auto;" /></div>
+              <div class="dense-form-row"><label>Random Pickup Time?</label><input id="task_random_pickup_time" type="checkbox" style="width:auto;" /></div>
+              <div class="dense-form-row"><label>Promo Code</label><input id="task_promo_code" placeholder="SPRING24" /><div id="task_promo_warning" class="inline-warn"></div></div>
+              <div class="dense-form-row"><label>Qty</label><div class="stepper"><button type="button" onclick="adjustTaskCount(-1)">-</button><input id="task_count" type="number" min="1" max="100" value="1" /><button type="button" onclick="adjustTaskCount(1)">+</button></div></div>
+            </div>
+            <div id="create_task_error" class="inline-error"></div>
+            <div class="summary-panel">
+              <div class="summary-grid">
+                <div class="summary-item"><strong>Tasks</strong><span id="summary_task_count">1</span></div>
+                <div class="summary-item"><strong>Mode</strong><span id="summary_mode">default</span></div>
+                <div class="summary-item"><strong>Products</strong><span id="summary_products">monitor default</span></div>
+                <div class="summary-item"><strong>Profile Group</strong><span id="summary_profile_group">-</span></div>
+                <div class="summary-item"><strong>Proxy Group</strong><span id="summary_proxy_group">-</span></div>
+              </div>
+            </div>
+            <div class="modal-footer">
+              <button onclick="closeTaskModal()">Close</button>
+              <button id="create_task_btn" class="btn-primary" onclick="createTask()" disabled>Create (1)</button>
+            </div>
+          </div>
         </div>
 
-        <div class="card" style="margin-top:14px;">
-          <h2 class="section-title">Manage Products</h2>
-          <p class="small">Uses selected monitors as the task group and updates running tasks without restart.</p>
-          <div class="row">
-            <div>
-              <label>Tab</label>
-              <select id="manage_products_mode">
-                <option value="edit">Edit</option>
-                <option value="add">Add</option>
-                <option value="remove">Remove</option>
-              </select>
+        <div id="task_group_modal_overlay" class="task-modal-overlay" onclick="dismissTaskGroupModal(event)">
+          <div class="task-modal" role="dialog" aria-modal="true" aria-label="Create task group" style="max-width:520px;">
+            <div class="task-modal-header">
+              <h2 class="section-title">New Task Group</h2>
+              <button onclick="closeTaskGroupModal()">Close</button>
             </div>
-            <div>
-              <label>PID Input (Edit/Add)</label>
-              <input id="manage_products_input" placeholder="12-34567-890:2,98-76543-210:1" />
+            <label>Group Name</label>
+            <input id="task_group_name_input" placeholder="iPhone 15 Pro" />
+            <label style="margin-top:10px;">Site</label>
+            <select id="task_group_site_select">
+              <option value="amazon">Amazon</option>
+              <option value="apple">Apple</option>
+              <option value="bestbuy">BestBuy</option>
+              <option value="costco">Costco</option>
+              <option value="target">Target</option>
+              <option value="walmart">Walmart</option>
+            </select>
+            <div class="modal-footer">
+              <button onclick="closeTaskGroupModal()">Cancel</button>
+              <button class="btn-primary" onclick="createTaskGroupFromModal()">Create Group</button>
             </div>
           </div>
-          <div style="margin-top: 10px;">
-            <button onclick="previewManageProducts()">Refresh Product List</button>
-            <button onclick="applyManageProducts()">Apply To Selected Group</button>
-          </div>
-          <table style="margin-top: 12px;">
-            <thead><tr><th>Remove</th><th>#</th><th>PID</th><th>Qty</th><th>skip_if_oos</th></tr></thead>
-            <tbody id="manage_products_rows"></tbody>
-          </table>
-          <div id="manage_products_meta" class="small" style="margin-top: 8px;">No product preview loaded yet.</div>
+        </div>
+
+        <div style="display:none;">
+          <input id="quick_retailer" value="walmart" />
+          <input id="quick_poll_interval" value="20" />
+          <input id="quick_product_url" value="" />
+          <select id="quick_webhook_target"></select>
+          <select id="quick_monitor_selection"></select>
+          <input id="quick_keyword" value="" />
+          <input id="quick_max_price_cents" value="" />
+          <input id="quick_msrp_cents" value="" />
+          <input id="retailer" value="walmart" />
+          <input id="product_url" value="" />
+          <input id="keyword" value="" />
+          <input id="max_price_cents" value="" />
+          <input id="msrp_cents" value="" />
+          <input id="poll_interval" value="20" />
+          <textarea id="monitor_payload_input"></textarea>
+          <div id="monitor_payload_status"></div>
+          <div id="monitor_payload_candidates"></div>
+          <table><tbody id="monitors"></tbody></table>
+          <select id="manage_products_mode"></select>
+          <input id="manage_products_input" />
+          <table><tbody id="manage_products_rows"></tbody></table>
+          <div id="manage_products_meta"></div>
         </div>
       </section>
 
@@ -1208,13 +1155,15 @@
     let selectedTaskId = null;
     let taskMap = new Map();
     let selectedTaskIds = new Set();
-    let taskStatusFilter = new Set();
+    let taskStatusFilter = new Set(['all']);
     let taskSortMode = 'id_desc';
     const TASK_VIRTUALIZATION_THRESHOLD = 120;
     const TASK_VIRTUAL_ROW_HEIGHT = 52;
     const TASK_VIRTUAL_BUFFER = 8;
     const QUICK_SETUP_POLICY_ENDPOINT = '/api/automation-policies';
     let taskMonitorsById = new Map();
+    let taskGroups = [];
+    let selectedTaskGroupId = null;
     const toArray = (value, key) => Array.isArray(value) ? value : (value && Array.isArray(value[key]) ? value[key] : []);
     function toggleTaskSelected(taskId, isSelected) {
       if (isSelected) {
@@ -1224,8 +1173,227 @@
       }
     }
 
-    function renderStatusChips() {}
+    function renderStatusChips() {
+      document.querySelectorAll('.status-chip[data-status]').forEach((chip) => {
+        const value = chip.dataset.status;
+        chip.classList.toggle('active', taskStatusFilter.has(value));
+      });
+    }
     function updateTaskSelectionSummary() {}
+    function setTaskStatusChip(status) {
+      taskStatusFilter = new Set([status || 'all']);
+      renderStatusChips();
+      renderTaskTable();
+    }
+
+    function createTaskGroupPrompt() {
+      const modal = document.getElementById('task_group_modal_overlay');
+      if (!modal) return;
+      document.getElementById('task_group_name_input').value = '';
+      modal.classList.add('open');
+    }
+
+    function closeTaskGroupModal() {
+      document.getElementById('task_group_modal_overlay')?.classList.remove('open');
+    }
+
+    function dismissTaskGroupModal(event) {
+      if (event.target?.id === 'task_group_modal_overlay') closeTaskGroupModal();
+    }
+
+    function createTaskGroupFromModal() {
+      const name = (document.getElementById('task_group_name_input')?.value || '').trim();
+      const site = (document.getElementById('task_group_site_select')?.value || '').trim();
+      if (!name || !site) {
+        showToast('Task group requires a name and site.', true);
+        return;
+      }
+      const group = {id: Date.now(), name, site};
+      taskGroups.push(group);
+      selectedTaskGroupId = group.id;
+      persistTaskGroups();
+      renderTaskGroups();
+      closeTaskGroupModal();
+      showToast(`Created ${name} (${site.toUpperCase()}) group.`);
+    }
+
+    function ensureDefaultTaskGroups() {
+      if (taskGroups.length) return;
+      taskGroups = [
+        {id: 1, name: 'Amazon', site: 'amazon'},
+        {id: 2, name: 'BestBuy', site: 'bestbuy'},
+        {id: 3, name: 'Target', site: 'target'},
+        {id: 4, name: 'Walmart', site: 'walmart'},
+      ];
+      selectedTaskGroupId = taskGroups[0].id;
+      persistTaskGroups();
+      renderTaskGroups();
+    }
+
+    function persistTaskGroups() {
+      localStorage.setItem('task_groups_v1', JSON.stringify(taskGroups));
+      localStorage.setItem('task_groups_selected_v1', String(selectedTaskGroupId || ''));
+    }
+
+    function hydrateTaskGroups() {
+      try {
+        const rawGroups = JSON.parse(localStorage.getItem('task_groups_v1') || '[]');
+        if (Array.isArray(rawGroups)) taskGroups = rawGroups;
+        const selected = Number(localStorage.getItem('task_groups_selected_v1') || '');
+        if (Number.isFinite(selected) && selected > 0) selectedTaskGroupId = selected;
+      } catch (_) {}
+    }
+
+    function taskGroupMatchesSearch(group, term) {
+      if (!term) return true;
+      return `${group.name} ${group.site}`.toLowerCase().includes(term);
+    }
+
+    function selectTaskGroup(id) {
+      selectedTaskGroupId = id;
+      persistTaskGroups();
+      renderTaskGroups();
+      renderTaskTable();
+    }
+
+    function deleteTaskGroup(id) {
+      const group = taskGroups.find((g) => g.id === id);
+      if (!group) return;
+      if (!confirm(`Delete task group "${group.name}"?`)) return;
+      taskGroups = taskGroups.filter((g) => g.id !== id);
+      if (selectedTaskGroupId === id) selectedTaskGroupId = taskGroups[0]?.id || null;
+      persistTaskGroups();
+      renderTaskGroups();
+      renderTaskTable();
+    }
+
+    function toggleTaskGroupMenu(id) {
+      document.querySelectorAll('.task-group-menu').forEach((menu) => menu.classList.remove('open'));
+      const menu = document.getElementById(`task-group-menu-${id}`);
+      if (menu) menu.classList.toggle('open');
+    }
+
+    function renderTaskGroups() {
+      const list = document.getElementById('task_group_list');
+      if (!list) return;
+      const term = (document.getElementById('task_group_search')?.value || '').trim().toLowerCase();
+      list.innerHTML = '';
+      taskGroups.filter((group) => taskGroupMatchesSearch(group, term)).forEach((group) => {
+        const item = document.createElement('div');
+        item.className = `task-group-item ${selectedTaskGroupId === group.id ? 'active' : ''}`;
+        item.innerHTML = `
+          <div class="task-group-meta" onclick="selectTaskGroup(${group.id})">
+            <span class="task-group-name">${group.name}</span>
+            <span class="task-group-site">${group.site}</span>
+          </div>
+          <div class="task-group-menu-wrap">
+            <button class="task-group-menu-btn" onclick="toggleTaskGroupMenu(${group.id})">⋯</button>
+            <div id="task-group-menu-${group.id}" class="task-group-menu">
+              <button onclick="deleteTaskGroup(${group.id})">Delete</button>
+            </div>
+          </div>`;
+        list.appendChild(item);
+      });
+    }
+
+    function editAllTasks() {
+      showToast('Edit All opened in task modal.');
+      openTaskModal();
+    }
+
+    function clearAllTasks() {
+      if (!confirm('Delete all tasks currently loaded?')) return;
+      stopAllTasks().then(async () => {
+        for (const id of Array.from(taskMap.keys())) {
+          await apiFetch(`/api/checkout/tasks/${id}`, {method: 'DELETE'}).catch(() => null);
+        }
+        await loadTasks();
+        showToast('All tasks cleared.');
+      });
+    }
+
+    function openMonitorPulse() {
+      showToast('Monitor popup is not wired to backend yet; connect restock stream endpoint to enable.');
+    }
+
+    function importTasksPrompt() {
+      showToast('Import tool placeholder: connect to task import file endpoint.');
+    }
+
+    function exportTasksPrompt() {
+      const payload = JSON.stringify(Array.from(taskMap.values()), null, 2);
+      const blob = new Blob([payload], {type: 'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'tasks-export.json';
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast('Exported current task group.');
+    }
+
+    function applyTaskSearchFilter() {
+      renderTaskGroups();
+      renderTaskTable();
+    }
+
+    function openTaskModal() {
+      const modal = document.getElementById('task_modal_overlay');
+      if (!modal) return;
+      modal.classList.add('open');
+      updateTaskCreateSummary();
+    }
+
+    function closeTaskModal() {
+      document.getElementById('task_modal_overlay')?.classList.remove('open');
+    }
+
+    function dismissTaskModal(event) {
+      if (event.target?.id === 'task_modal_overlay') closeTaskModal();
+    }
+
+    async function editTask(taskId) {
+      const task = taskMap.get(taskId);
+      if (!task) return;
+      const config = task.task_config || {};
+      document.getElementById('task_name').value = task.task_name || '';
+      document.getElementById('task_mode').value = config.mode || 'default';
+      document.getElementById('task_profile_group').value = config.profile_group || '';
+      document.getElementById('task_proxy_group').value = config.proxy_group || '';
+      document.getElementById('task_queue_entry_delay_ms').value = config.queue_entry_delay_ms || '';
+      document.getElementById('task_products').value = config.products?.[0]?.pid || config.products?.[0]?.url || '';
+      document.getElementById('task_count').value = '1';
+      openTaskModal();
+      showToast(`Loaded task #${taskId} into editor.`);
+    }
+
+    async function duplicateTask(taskId) {
+      const task = taskMap.get(taskId);
+      if (!task) return;
+      const payload = {
+        monitor_id: task.monitor_id,
+        initial_state: 'queued',
+        task_name: `${task.task_name || 'task'} copy`,
+        task_config: structuredClone(task.task_config || {}),
+      };
+      const res = await apiFetch('/api/checkout/tasks', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        showToast('Failed to duplicate task.', true);
+        return;
+      }
+      await loadTasks();
+      showToast(`Duplicated task #${taskId}.`);
+    }
+
+    async function deleteTask(taskId) {
+      if (!confirm(`Delete task #${taskId}?`)) return;
+      await apiFetch(`/api/checkout/tasks/${taskId}`, {method: 'DELETE'});
+      await loadTasks();
+    }
 
     function getSelectedTaskMonitorRetailer() {
       const monitorId = Number(document.getElementById('task_monitor_id')?.value || '');
@@ -1602,6 +1770,7 @@
       const mode = (document.getElementById('task_mode')?.value || 'default').trim();
       const profileGroup = (document.getElementById('task_profile_group')?.value || '').trim();
       const proxyGroup = (document.getElementById('task_proxy_group')?.value || '').trim();
+      const checkoutProxyGroup = (document.getElementById('task_checkout_proxy_group')?.value || '').trim();
       const queueDelayRaw = (document.getElementById('task_queue_entry_delay_ms')?.value || '').trim();
       const promoCode = (document.getElementById('task_promo_code')?.value || '').trim();
       const payloadBase = {
@@ -1611,6 +1780,7 @@
           mode,
           profile_group: profileGroup || null,
           proxy_group: proxyGroup || null,
+          checkout_proxy_group: checkoutProxyGroup || null,
           queue_entry_delay_ms: queueDelayRaw === '' ? null : Number(queueDelayRaw),
           promo_code: promoCode || null,
         }
@@ -1642,6 +1812,7 @@
         }
         await loadTasks();
         updateTaskCreateSummary();
+        closeTaskModal();
       } catch (error) {
         alert(`Failed to create task due to a network or fetch error: ${error?.message || error}`);
       }
@@ -1849,20 +2020,38 @@
         if (state === 'queued') counts.queued += 1;
         if (state === 'success') counts.success += 1;
       }
-      document.getElementById('metric_total').textContent = counts.total;
-      document.getElementById('metric_running').textContent = counts.running;
-      document.getElementById('metric_queued').textContent = counts.queued;
-      document.getElementById('metric_success').textContent = counts.success;
+      const metricTotal = document.getElementById('metric_total');
+      const metricRunning = document.getElementById('metric_running');
+      const metricQueued = document.getElementById('metric_queued');
+      const metricSuccess = document.getElementById('metric_success');
+      if (metricTotal) metricTotal.textContent = counts.total;
+      if (metricRunning) metricRunning.textContent = counts.running;
+      if (metricQueued) metricQueued.textContent = counts.queued;
+      if (metricSuccess) metricSuccess.textContent = counts.success;
     }
 
     function renderTaskTable() {
       const tbody = document.getElementById('tasks');
       tbody.innerHTML = '';
       const rows = Array.from(taskMap.values()).sort((a, b) => b.id - a.id);
-      const total = rows.length;
-      const active = rows.filter((task) => !['stopped', 'success', 'failed'].includes(String(task.state || '').toLowerCase())).length;
-      const queued = rows.filter((task) => String(task.state || '').toLowerCase() === 'queued').length;
-      const failed = rows.filter((task) => String(task.state || '').toLowerCase() === 'failed').length;
+      const search = (document.getElementById('task_search')?.value || document.getElementById('task_group_search')?.value || '').trim().toLowerCase();
+      const statusDropdown = (document.getElementById('task_status_filter')?.value || '').trim().toLowerCase();
+      const chipStatus = Array.from(taskStatusFilter)[0] || 'all';
+      const filtered = rows.filter((task) => {
+        const state = String(task.state || '').toLowerCase();
+        const retailer = String(task.retailer || taskMonitorsById.get(Number(task.monitor_id))?.retailer || '').toLowerCase();
+        const productText = String(task?.task_config?.products?.[0]?.pid || task?.task_config?.products?.[0]?.url || '-');
+        const haystack = `${task.id} ${task.task_name || ''} ${task.retailer || ''} ${task.monitor_id || ''} ${productText}`.toLowerCase();
+        const selectedGroup = taskGroups.find((g) => g.id === selectedTaskGroupId);
+        const siteMatch = !selectedGroup || !selectedGroup.site || retailer === selectedGroup.site.toLowerCase();
+        const statusMatch = (!statusDropdown || state === statusDropdown) && (chipStatus === 'all' || state === chipStatus || (chipStatus === 'running' && ['running', 'monitoring'].includes(state)));
+        const searchMatch = !search || haystack.includes(search);
+        return statusMatch && searchMatch && siteMatch;
+      });
+      const total = filtered.length;
+      const active = filtered.filter((task) => !['stopped', 'success', 'failed'].includes(String(task.state || '').toLowerCase())).length;
+      const queued = filtered.filter((task) => String(task.state || '').toLowerCase() === 'queued').length;
+      const failed = filtered.filter((task) => String(task.state || '').toLowerCase() === 'failed').length;
       const kpiTotal = document.getElementById('task_kpi_total');
       const kpiActive = document.getElementById('task_kpi_active');
       const kpiQueued = document.getElementById('task_kpi_queued');
@@ -1871,26 +2060,34 @@
       if (kpiActive) kpiActive.textContent = String(active);
       if (kpiQueued) kpiQueued.textContent = String(queued);
       if (kpiFailed) kpiFailed.textContent = String(failed);
-      renderTaskMetrics(rows);
-      for (const task of rows) {
+      renderTaskMetrics(filtered);
+      for (const task of filtered) {
+        const config = task.task_config || {};
+        const firstProduct = (config.products && config.products[0]) || {};
+        const productLabel = firstProduct.pid || firstProduct.url || '-';
+        const mode = config.mode || 'default';
+        const delay = config.queue_entry_delay_ms ?? '-';
+        const quantity = firstProduct.quantity ?? 1;
+        const checkoutSet = config.profile_group || 'Stella Alpha';
+        const region = config.region || 'US';
         const tr = document.createElement('tr');
         tr.innerHTML = `
-          <td><input type="checkbox" ${selectedTaskIds.has(task.id) ? 'checked' : ''} onchange="toggleTaskSelected(${task.id}, this.checked)" /></td>
+          <td><input type="checkbox" class="task-select" value="${task.id}" ${selectedTaskIds.has(task.id) ? 'checked' : ''} onchange="toggleTaskSelected(${task.id}, this.checked)" /></td>
           <td>${task.id}</td>
-          <td><input type="checkbox" class="task-select" value="${task.id}" /></td>
-          <td>${task.monitor_id || '-'}</td>
-          <td>${task.retailer}</td>
-          <td>${statePill(task.state)}</td>
+          <td>${mode}</td>
+          <td>${productLabel}</td>
+          <td>${checkoutSet}</td>
+          <td>${region}</td>
+          <td>${delay}</td>
+          <td>${quantity}</td>
+          <td>Bot</td>
           <td>${renderStatusBadge(task.state)}</td>
-          <td>${task.last_transition_at || '-'}</td>
-          <td>${taskErrorLabel(task.last_error)}</td>
           <td class="actions">
-            <button onclick="startTask(${task.id})">Start</button>
-            <button onclick="startTaskNow(${task.id})" title="Override waiting_for_queue when monitor misses queue.">Start Now</button>
-            <button onclick="runTask(${task.id})">Run</button>
-            <button onclick="pauseTask(${task.id})">Pause</button>
-            <button onclick="stopTask(${task.id})">Stop</button>
-            <button onclick="selectTask(${task.id})">Logs</button>
+            <button class="task-icon-btn" title="Pause/Start" onclick="startTask(${task.id})">⏯</button>
+            <button class="task-icon-btn" title="Edit" onclick="editTask(${task.id})">✎</button>
+            <button class="task-icon-btn" title="Duplicate" onclick="duplicateTask(${task.id})">⧉</button>
+            <button class="task-icon-btn" title="Logs" onclick="selectTask(${task.id})">☰</button>
+            <button class="task-icon-btn" title="Delete" onclick="deleteTask(${task.id})">🗑</button>
           </td>
         `;
         tbody.appendChild(tr);
@@ -2557,7 +2754,10 @@
     }
 
     renderApiAuthWarning();
-    ['task_monitor_id', 'task_name', 'task_count', 'task_mode', 'task_products', 'task_profile_group', 'task_proxy_group', 'task_queue_entry_delay_ms', 'task_promo_code']
+    hydrateTaskGroups();
+    ensureDefaultTaskGroups();
+    renderTaskGroups();
+    ['task_monitor_id', 'task_name', 'task_count', 'task_mode', 'task_products', 'task_profile_group', 'task_proxy_group', 'task_checkout_proxy_group', 'task_queue_entry_delay_ms', 'task_promo_code']
       .forEach((id) => {
         const el = document.getElementById(id);
         if (!el) return;
