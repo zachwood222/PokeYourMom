@@ -4944,41 +4944,285 @@ def api_dashboard_commerce():
         (workspace_id,),
     ).fetchall()
 
-    successful = [row for row in rows if str(row["current_state"] or "").strip().lower() == "success"]
-    declines = [row for row in rows if str(row["current_state"] or "").strip().lower() == "decline"]
-    checkout_count = len(successful)
-    decline_count = len(declines)
-    site_totals: dict[str, int] = {}
-    daily_spend_cents: dict[str, int] = {}
-    product_orders: list[dict[str, Any]] = []
-    spent_total_cents = 0
+    spent_total_cents = sum(int(r["price_cents"] or 0) for r in rows if str(r["current_state"] or "") == "success")
+    checkout_count = sum(1 for r in rows if str(r["current_state"] or "") == "success")
+    success_rate = 0.0 if not rows else checkout_count / len(rows)
 
-    for row in successful:
-        site = str(row["retailer"] or "unknown").strip().lower() or "unknown"
+    daily_spend: dict[str, int] = {}
+    site_totals: dict[str, int] = {}
+    for row in rows:
+        state = str(row["current_state"] or "")
+        if state != "success":
+            continue
+        day = str(row["day_bucket"] or "")
+        if day:
+            daily_spend[day] = daily_spend.get(day, 0) + int(row["price_cents"] or 0)
+        site = str(row["retailer"] or "unknown")
         site_totals[site] = site_totals.get(site, 0) + 1
 
-        updated_at = str(row["updated_at"] or "").strip()
-        day_key = updated_at[:10] if len(updated_at) >= 10 else updated_at
+    average_order_value_cents = 0 if checkout_count == 0 else int(round(spent_total_cents / checkout_count))
 
-        task_config = parse_json_field(row["task_config"], {})
-        quantity = int(task_config.get("quantity", 1) or 1)
-        price_cents = int(row["last_price_cents"] or 0)
-        spent_cents = max(0, quantity) * max(0, price_cents)
-        spent_total_cents += spent_cents
-        if day_key:
-            daily_spend_cents[day_key] = daily_spend_cents.get(day_key, 0) + spent_cents
+    autopilot_rows = conn.execute(
+        """
+        select
+            ct.id as task_id,
+            ap.id as profile_id,
+            ap.name as profile_name,
+            ap.budget_daily_cap_cents,
+            ap.budget_session_cap_cents,
+            ct.current_state,
+            ct.last_error,
+            coalesce(m.last_price_cents, 0) as estimated_price_cents
+        from checkout_tasks ct
+        left join autopilot_profiles ap on ap.id = ct.autopilot_profile_id
+        left join monitors m on m.id = ct.monitor_id
+        where ct.workspace_id = ?
+          and ct.autopilot_profile_id is not null
+        order by ct.id desc
+        limit 25
+        """,
+        (workspace_id,),
+    ).fetchall()
+    conn.close()
 
-        product_orders.append(
+    autopilot = []
+    for row in autopilot_rows:
+        estimated = int(row["estimated_price_cents"] or 0)
+        daily_cap = row["budget_daily_cap_cents"]
+        session_cap = row["budget_session_cap_cents"]
+        cap = session_cap if session_cap is not None else daily_cap
+        consumed_ratio = 0.0 if not cap else min(1.0, estimated / max(1, int(cap)))
+        autopilot.append(
             {
-                "site": site,
-                "product_name": row["task_name"] or "Product",
-                "product_url": row["product_url"],
-                "quantity": quantity,
-                "price_cents": price_cents,
-                "spent_cents": spent_cents,
-                "purchased_at": row["updated_at"],
+                "task_id": row["task_id"],
+                "profile_id": row["profile_id"],
+                "profile_name": row["profile_name"],
+                "state": row["current_state"],
+                "spend_consumed_cents": estimated,
+                "spend_cap_cents": cap,
+                "spend_consumed_ratio": round(consumed_ratio, 4),
+                "pause_reason": row["last_error"],
             }
         )
+
+    daily_points = [{"date": date, "spent_cents": amount} for date, amount in sorted(daily_spend.items())][-14:]
+    sites = [{"site": site, "checkouts": count} for site, count in sorted(site_totals.items(), key=lambda item: (-item[1], item[0]))]
+
+    return jsonify(
+        {
+            "success_rate": round(success_rate, 4),
+            "average_order_value_cents": average_order_value_cents,
+            "spent_total_cents": spent_total_cents,
+            "daily_spend": daily_points,
+            "sites": sites,
+            "autopilot": autopilot,
+        }
+    )
+
+
+def _handle_stripe_webhook_request():
+    payload = request.get_data(cache=False, as_text=False)
+    signature_header = request.headers.get("Stripe-Signature")
+    try:
+        verify_stripe_webhook_signature(payload, signature_header)
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+
+    try:
+        event = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return jsonify({"error": "Invalid JSON payload"}), 400
+    ok, status_code, payload = _ingest_stripe_event(event)
+    return jsonify(payload), status_code
+
+
+@app.get("/api/workspace")
+@require_auth
+def api_workspace():
+    row = get_workspace(current_workspace_id())
+    return jsonify({"workspace": dict(row), "user": current_user_context()})
+
+
+@app.post("/api/workspace/plan")
+@require_auth
+def api_update_plan():
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
+    plan = (request.json or {}).get("plan", "basic")
+    if plan not in PLAN_LIMITS:
+        return jsonify({"error": "Invalid plan"}), 400
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    conn.execute("update workspaces set plan = ? where id = ?", (plan, workspace_id))
+    conn.execute("update workspaces set plan = ? where id = ?", (plan, current_workspace_id()))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "plan": plan})
+
+
+@app.post("/api/billing/subscription-events")
+@require_auth
+def api_sync_billing_subscription_event():
+    role_error = ensure_workspace_role("owner", "admin")
+    if role_error:
+        return role_error
+    body = request.json or {}
+    subscription = body.get("subscription") if isinstance(body.get("subscription"), dict) else {}
+    payload = {
+        "provider": body.get("provider", "stripe"),
+        "provider_subscription_id": body.get("provider_subscription_id") or subscription.get("id"),
+        "provider_customer_id": body.get("provider_customer_id") or subscription.get("customer_id"),
+        "status": body.get("status") or subscription.get("status"),
+        "plan_code": body.get("plan_code") or subscription.get("plan_code"),
+        "plan_lookup_key": body.get("plan_lookup_key") or subscription.get("plan_lookup_key"),
+        "cancel_at_period_end": body.get("cancel_at_period_end", subscription.get("cancel_at_period_end")),
+        "current_period_end": body.get("current_period_end") or subscription.get("current_period_end"),
+        "source": body.get("source") or "billing_subscriptions",
+    }
+    try:
+        result = sync_billing_subscription_payload(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
+
+
+@app.get("/api/monitors")
+@require_auth
+def api_list_monitors():
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    rows = conn.execute(
+        "select * from monitors where workspace_id = ? order by id desc",
+        (workspace_id,),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+def get_monitor_for_workspace(
+    conn: sqlite3.Connection, monitor_id: int, workspace_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (monitor_id, workspace_id),
+    ).fetchone()
+
+
+@app.get("/api/monitors/<int:monitor_id>")
+@require_auth
+def api_get_monitor(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    conn.close()
+    if not row:
+        return jsonify({"error": "Monitor not found"}), 404
+    return jsonify(dict(row))
+
+
+@app.get("/api/dashboard/summary")
+@require_auth
+def api_dashboard_summary():
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    total_monitors = conn.execute(
+        "select count(*) as c from monitors where workspace_id = ?", (workspace_id,)
+    ).fetchone()["c"]
+    enabled_monitors = conn.execute(
+        "select count(*) as c from monitors where workspace_id = ? and enabled = 1", (workspace_id,)
+    ).fetchone()["c"]
+    checks_last_24h = conn.execute(
+        """
+        select count(*) as c from monitors
+        where workspace_id = ?
+          and last_checked_at is not null
+          and datetime(last_checked_at) >= datetime('now', '-1 day')
+        """,
+        (workspace_id,),
+    ).fetchone()["c"]
+    latest_check = conn.execute(
+        "select max(last_checked_at) as latest_check from monitors where workspace_id = ?",
+        (workspace_id,),
+    ).fetchone()["latest_check"]
+    events_24h = conn.execute(
+        """
+        select count(*) as c from events e
+        join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ?
+          and datetime(e.event_time) >= datetime('now', '-1 day')
+        """,
+        (workspace_id,),
+    ).fetchone()["c"]
+    events_7d = conn.execute(
+        """
+        select count(*) as c from events e
+        join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ?
+          and datetime(e.event_time) >= datetime('now', '-7 day')
+        """,
+        (workspace_id,),
+    ).fetchone()["c"]
+    deliveries_total = conn.execute(
+        """
+        select count(*) as c from deliveries d
+        join events e on e.id = d.event_id
+        join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ?
+        """,
+        (workspace_id,),
+    ).fetchone()["c"]
+    deliveries_sent = conn.execute(
+        """
+        select count(*) as c from deliveries d
+        join events e on e.id = d.event_id
+        join monitors m on m.id = e.monitor_id
+        where m.workspace_id = ? and d.status = 'sent'
+        """,
+        (workspace_id,),
+    ).fetchone()["c"]
+    conn.close()
+
+    success_rate = 0.0 if deliveries_total == 0 else (deliveries_sent / deliveries_total)
+    return jsonify(
+        {
+            "total_monitors": total_monitors,
+            "enabled_monitors": enabled_monitors,
+            "checks_last_24h": checks_last_24h,
+            "latest_check_at": latest_check,
+            "events_last_24h": events_24h,
+            "events_last_7d": events_7d,
+            "delivery_success_rate": round(success_rate, 4),
+            "worker_running": worker_running,
+            "app_role": APP_ROLE,
+        }
+    )
+
+
+def _handle_stripe_webhook_request():
+    payload = request.get_data(cache=False, as_text=False)
+    signature_header = request.headers.get("Stripe-Signature")
+    try:
+        verify_stripe_webhook_signature(payload, signature_header)
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+
+    try:
+        event = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return jsonify({"error": "Invalid JSON payload"}), 400
+    ok, status_code, payload = _ingest_stripe_event(event)
+    return jsonify(payload), status_code
+
+
+@app.post("/api/billing/stripe/webhook")
+def api_billing_stripe_webhook():
+    return _handle_stripe_webhook_request()
+
+
+@app.post("/api/stripe/webhook")
+def api_stripe_webhook():
+    return _handle_stripe_webhook_request()
 
     average_order_value_cents = 0 if checkout_count == 0 else int(round(spent_total_cents / checkout_count))
     success_rate = 0.0 if (checkout_count + decline_count) == 0 else checkout_count / (checkout_count + decline_count)
