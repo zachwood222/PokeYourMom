@@ -465,6 +465,52 @@
     .detail-section { margin-top: 12px; }
     .config-warn.show { display: block; }
 
+
+    .topbar {
+      background: #131734;
+      border-bottom: 1px solid #273167;
+      padding: 0 22px;
+    }
+    .layout {
+      grid-template-columns: 280px 1fr;
+      gap: 18px;
+      padding: 18px;
+    }
+    .sidebar-themed {
+      background: linear-gradient(180deg, #1a1f42 0%, #151934 100%);
+      border: 1px solid #2b356a;
+      border-radius: 16px;
+      padding: 14px;
+    }
+    .sidebar-brand {
+      padding: 14px;
+      border-radius: 12px;
+      background: linear-gradient(120deg, #4b4fd3, #b14ca4);
+      margin-bottom: 12px;
+    }
+    .dashboard-shell h1 { font-size: 30px; }
+    .dashboard-headline { display:flex; align-items:baseline; gap:10px; margin-bottom:12px; }
+    .dashboard-top-row { display:grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap:12px; }
+    .dash-stat { border-radius: 12px; padding: 14px; color:#131734; font-weight:600; }
+    .dash-stat.mint { background:#7cd9bc; }
+    .dash-stat.rose { background:#d98995; }
+    .dash-stat.blue { background:#7090f2; }
+    .dash-stat-value { font-size: 36px; font-weight: 800; margin: 8px 0 4px; }
+    .dash-stat-label { font-size:13px; opacity:.9; }
+    .dash-stat-sub { font-size:12px; opacity:.75; }
+    .dash-welcome { background:#252949; border-color:#343c6f; }
+    .dashboard-chart-row { display:grid; grid-template-columns: 1.3fr 1fr; gap:12px; margin-top:12px; }
+    .chart-card, .donut-card { min-height:220px; }
+    .line-graph { height:170px; border-radius: 10px; background: linear-gradient(180deg, rgba(109,224,185,0.28), rgba(20,27,47,0.2)); position: relative; overflow:hidden; }
+    .line-graph span { position:absolute; inset: 18px; border-left:1px solid rgba(132,149,200,.3); border-bottom:1px solid rgba(132,149,200,.3); clip-path: polygon(0% 85%, 10% 45%, 20% 62%, 33% 30%, 45% 54%, 58% 38%, 68% 58%, 80% 42%, 100% 66%, 100% 100%, 0 100%); background: rgba(119,234,198,.45); }
+    .donut-wrap { display:flex; align-items:center; gap:18px; margin-top:20px; }
+    .donut { width:120px; height:120px; border-radius:50%; background: conic-gradient(#f2c84b 0 35%, #6d93ff 35% 55%, #55d7a6 55% 73%, #d76ae6 73% 85%, #9aa6c5 85% 100%); position:relative; }
+    .donut::after { content:""; position:absolute; inset:28px; background:#161a35; border-radius:50%; }
+    .donut-legend { list-style:none; margin:0; padding:0; color:#c9d4ef; font-size:12px; }
+    .donut-legend li { margin-bottom:8px; display:flex; align-items:center; gap:8px; }
+    .dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+    .dot.w { background:#f2c84b; } .dot.t { background:#6d93ff; } .dot.b { background:#55d7a6; } .dot.o { background:#d76ae6; }
+
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
       .sidebar { order: 2; }
@@ -486,12 +532,12 @@
     <div class="topbar-left">
       <div class="app-mark"></div>
       <nav class="top-nav">
-        <button class="active" data-tab="home" onclick="setTab('home')">Analytics</button>
+        <button class="active" data-tab="home" onclick="setTab('home')">Dashboard</button>
         <button data-tab="monitors" onclick="setTab('monitors')">Tasks</button>
         <button data-tab="profiles" onclick="setTab('profiles')">Profiles</button>
         <button data-tab="webhooks" onclick="setTab('webhooks')">Proxies</button>
+        <button data-tab="logs" onclick="setTab('logs')">Captcha</button>
         <button data-tab="settings" onclick="setTab('settings')">Settings</button>
-        <button data-tab="logs" onclick="setTab('logs')">Automation</button>
       </nav>
     </div>
     <div class="topbar-right" id="clock">--:--:--</div>
@@ -502,23 +548,14 @@
   </div>
 
   <div class="layout">
-    <aside class="sidebar">
-      <div class="card header-card">
-        <h2 class="hero-title">Stock Sentinel</h2>
-        <p class="subtitle">Operator Console</p>
-      </div>
-      <div class="card">
-        <h3 class="section-title">Up To Date</h3>
-        <div id="meta" class="small">Checking version info…</div>
-        <div class="actions" style="margin-top:10px;">
-          <button onclick="checkUpdates()">Check for Updates</button>
-        </div>
+    <aside class="sidebar sidebar-themed">
+      <div class="sidebar-brand">
+        <h2 class="hero-title">Stellar AIO</h2>
+        <p class="subtitle">Version 1.0.1</p>
       </div>
       <div class="card">
         <h3 class="section-title">System Status</h3>
-        <div class="kpi-label">Task Engine</div>
         <div id="runtime_running_badge" class="status-value">READY</div>
-        <div class="kpi-label" style="margin-top:10px;">Latest Check</div>
         <div id="runtime_latest_check_badge" class="small">N/A</div>
       </div>
       <div class="card">
@@ -530,64 +567,85 @@
           <div><div class="kpi-label">Success</div><div id="kpi_success_rate_side" class="kpi-value">0%</div></div>
         </div>
       </div>
+      <div class="card">
+        <h3 class="section-title">Up To Date</h3>
+        <div id="meta" class="small">Checking version info…</div>
+        <div class="actions" style="margin-top:10px;"><button onclick="checkUpdates()">Check for Updates</button></div>
+      </div>
     </aside>
 
     <main class="content">
-      <section id="tab-home" class="tab active">
-        <h1>Analytics</h1>
-        <p class="small">Live workspace health and throughput metrics.</p>
-        <div class="kpi-grid">
-          <div class="card"><div class="kpi-label">Monitors</div><div id="kpi_total_monitors" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Enabled</div><div id="kpi_enabled_monitors" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Events (24h)</div><div id="kpi_events_24h" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Delivery Success</div><div id="kpi_success_rate" class="kpi-value">0%</div></div>
+      <section id="tab-home" class="tab active dashboard-shell">
+        <div class="dashboard-headline">
+          <h1>Dashboard</h1>
+          <p class="small">Tuesday, <span id="dashboard_now">--:--:--</span></p>
         </div>
-        <div class="kpi-grid" style="margin-top:12px;">
-          <div class="card"><div class="kpi-label">Checks Total</div><div id="ops_checks_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Checks Failed</div><div id="ops_checks_failed_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Alerts Created</div><div id="ops_alerts_created_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Webhook Sent</div><div id="ops_webhook_sent_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Webhook Failed</div><div id="ops_webhook_failed_total" class="kpi-value">0</div></div>
+        <div class="dashboard-top-row">
+          <div class="dash-stat mint">
+            <div class="dash-stat-label">Checkouts</div>
+            <div id="kpi_total_monitors" class="dash-stat-value">0</div>
+            <div class="dash-stat-sub">Total Checkouts</div>
+          </div>
+          <div class="dash-stat rose">
+            <div class="dash-stat-label">Declines</div>
+            <div id="ops_checks_failed_total" class="dash-stat-value">0</div>
+            <div class="dash-stat-sub">Total Declines</div>
+          </div>
+          <div class="dash-stat blue">
+            <div class="dash-stat-label">Spent</div>
+            <div id="ops_webhook_sent_total" class="dash-stat-value">0</div>
+            <div class="dash-stat-sub">Total Spent</div>
+          </div>
+          <div class="dash-welcome card">
+            <h3>Welcome back, Operator!</h3>
+            <p class="small">Your daily overview is ready. Track checkouts, decline trends, and monitor health from one dashboard.</p>
+          </div>
         </div>
 
-        <div class="workspace">
-          <div class="card">
-            <h3 class="section-title">Runtime Controls</h3>
-            <div class="row">
-              <div>
-                <label class="small">Loop State</label>
-                <input id="runtime_running" disabled />
-              </div>
-              <div>
-                <label class="small">Latest Check</label>
-                <input id="runtime_latest_check" disabled />
-              </div>
-            </div>
-            <div class="actions" style="margin-top:10px;">
-              <button onclick="loadDashboardSummary()">Refresh Metrics</button>
-              <button onclick="toggleLoop()" id="loopBtn">Start Monitor Loop</button>
-            </div>
+        <div class="dashboard-chart-row">
+          <div class="card chart-card">
+            <h3>Amount Spent Monthly</h3>
+            <div class="line-graph"><span></span></div>
           </div>
-          <div class="card">
-            <h3 class="section-title">Policy</h3>
-            <p class="warn">Stock monitoring + Discord alerts with an experimental checkout workflow.</p>
+          <div class="card donut-card">
+            <h3>Most Sites Checkouts</h3>
+            <div class="donut-wrap">
+              <div class="donut"></div>
+              <ul class="donut-legend">
+                <li><span class="dot w"></span>Walmart</li>
+                <li><span class="dot t"></span>Target</li>
+                <li><span class="dot b"></span>BestBuy</li>
+                <li><span class="dot o"></span>Other Sites</li>
+              </ul>
+            </div>
           </div>
         </div>
-        <div class="grid" style="margin-top:16px;">
-          <div class="card">
-            <h3>Monitor Failure Trends</h3>
-            <table>
-              <thead><tr><th>Monitor</th><th>Failures (24h)</th><th>Failures (7d)</th></tr></thead>
-              <tbody id="ops_monitor_failure_trends"></tbody>
-            </table>
-          </div>
-          <div class="card">
-            <h3>Webhook Health Trends</h3>
-            <table>
-              <thead><tr><th>Webhook</th><th>Fail Streak</th><th>Last Code</th><th>Failures (24h)</th></tr></thead>
-              <tbody id="ops_webhook_health_trends"></tbody>
-            </table>
-          </div>
+
+        <div class="card" style="margin-top:14px;">
+          <h3>Previous Checkouts</h3>
+          <table>
+            <thead><tr><th>Site</th><th>Product</th><th>Profile</th><th>Price</th><th>Order #</th><th>Order Date & Time</th></tr></thead>
+            <tbody id="ops_monitor_failure_trends"></tbody>
+          </table>
+        </div>
+
+        <div class="card" style="margin-top:14px;">
+          <h3>Webhook Health Trends</h3>
+          <table>
+            <thead><tr><th>Webhook</th><th>Fail Streak</th><th>Last Code</th><th>Failures (24h)</th></tr></thead>
+            <tbody id="ops_webhook_health_trends"></tbody>
+          </table>
+        </div>
+
+        <div style="display:none;">
+          <input id="runtime_running" disabled />
+          <input id="runtime_latest_check" disabled />
+          <div id="kpi_enabled_monitors">0</div>
+          <div id="kpi_events_24h">0</div>
+          <div id="kpi_success_rate">0%</div>
+          <div id="ops_checks_total">0</div>
+          <div id="ops_alerts_created_total">0</div>
+          <div id="ops_webhook_failed_total">0</div>
         </div>
       </section>
 
@@ -1035,7 +1093,7 @@
       </section>
 
       <section id="tab-logs" class="tab">
-        <h1>Automation Logs</h1>
+        <h1>Captcha</h1>
         <div id="logs" class="logs"></div>
       </section>
     </main>
@@ -2262,10 +2320,13 @@
 
     function startClock() {
       const el = document.getElementById('clock');
-      if (!el) return;
+      const dashNow = document.getElementById('dashboard_now');
+      if (!el && !dashNow) return;
       const paint = () => {
         const now = new Date();
-        el.textContent = now.toLocaleTimeString();
+        const timeText = now.toLocaleTimeString();
+        if (el) el.textContent = timeText;
+        if (dashNow) dashNow.textContent = timeText;
       };
       paint();
       setInterval(paint, 1000);
