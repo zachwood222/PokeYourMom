@@ -2393,29 +2393,32 @@ def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
         "Accept-Language": "en-US,en;q=0.9",
     }
     conn = db()
-    workspace = conn.execute(
-        "select proxy_url, behavior_metadata from workspaces where id = ?",
-        (monitor["workspace_id"],),
-    ).fetchone()
-    conn.close()
-    proxy_url = monitor["proxy_url"] or (workspace["proxy_url"] if workspace else None)
-    lease: ProxyLease | None = None
-    if not proxy_url:
-        policy = {
-            "residential_only": bool(monitor["proxy_residential_only"]),
-            "region": monitor["proxy_region"],
-            "type": monitor["proxy_type"],
-            "sticky_session_seconds": monitor["proxy_sticky_session_seconds"],
-        }
-        lease = allocator.acquire_lease(
-            owner_type="monitor",
-            owner_id=monitor["id"],
-            lease_key=monitor["session_task_key"] or f"monitor-{monitor['id']}",
-            policy=policy,
-            lease_seconds=int(monitor["proxy_sticky_session_seconds"] or 60),
-        )
-        if lease:
-            proxy_url = lease.endpoint
+    allocator = ProxyAllocator(conn)
+    try:
+        workspace = conn.execute(
+            "select proxy_url, behavior_metadata from workspaces where id = ?",
+            (monitor["workspace_id"],),
+        ).fetchone()
+        proxy_url = monitor["proxy_url"] or (workspace["proxy_url"] if workspace else None)
+        lease: ProxyLease | None = None
+        if not proxy_url:
+            policy = {
+                "residential_only": bool(monitor["proxy_residential_only"]),
+                "region": monitor["proxy_region"],
+                "type": monitor["proxy_type"],
+                "sticky_session_seconds": monitor["proxy_sticky_session_seconds"],
+            }
+            lease = allocator.acquire_lease(
+                owner_type="monitor",
+                owner_id=monitor["id"],
+                lease_key=monitor["session_task_key"] or f"monitor-{monitor['id']}",
+                policy=policy,
+                lease_seconds=int(monitor["proxy_sticky_session_seconds"] or 60),
+            )
+            if lease:
+                proxy_url = lease.endpoint
+    finally:
+        conn.close()
     task_key = monitor["session_task_key"] or f"monitor-{monitor['id']}"
     behavior_policy = _build_request_behavior_policy(monitor, workspace)
     req = perform_request(
@@ -2429,6 +2432,7 @@ def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
         timeout=15,
         retry_total=2,
         backoff_factor=0.35,
+        proxy_lease=lease,
         headers=headers,
     )
     if req.error:
