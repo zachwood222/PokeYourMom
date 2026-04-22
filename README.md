@@ -71,6 +71,11 @@ Stripe webhook configuration:
 - `STRIPE_WEBHOOK_SECRET` (required): signing secret used to verify `Stripe-Signature`.
 - `STRIPE_WEBHOOK_TOLERANCE_SECONDS` (optional, default `300`): max allowed timestamp drift for webhook signatures.
 
+Billing state transitions (workspace plan sync):
+
+- `customer.subscription.created` / `customer.subscription.updated`: workspace `subscription_status` is updated and plan is mapped from Stripe plan metadata (`pro`/`team` lookup keys map to higher tiers, otherwise `basic`).
+- `customer.subscription.deleted`: workspace is forced to `basic` with `subscription_status=canceled` (preserves existing plan enforcement behavior for monitor count/poll minimums).
+
 Monitor check response compatibility notes:
 
 - `POST /api/monitors/:id/check` now includes `availability_reason` and `parser_confidence`.

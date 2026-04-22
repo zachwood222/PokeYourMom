@@ -625,6 +625,21 @@ def sync_billing_subscription_event(conn: sqlite3.Connection, event: dict[str, A
             now_iso,
         ),
     )
+    apply_workspace_subscription_state(
+        conn,
+        workspace_id=workspace_id,
+        status=status,
+        plan_code=plan_obj.get("id"),
+        plan_lookup_key=(
+            (subscription.get("items") or {}).get("data", [{}])[0].get("price", {}).get("lookup_key")
+            if isinstance((subscription.get("items") or {}).get("data"), list)
+            and (subscription.get("items") or {}).get("data")
+            else None
+        ),
+        cancel_at_period_end=bool(cancel_at_period_end),
+        source="stripe_webhook",
+        now_iso=now_iso,
+    )
 
 
 def format_log_entry(
@@ -2283,6 +2298,35 @@ def map_subscription_to_internal_plan(
     return "basic"
 
 
+def apply_workspace_subscription_state(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: int,
+    status: str,
+    plan_code: str | None,
+    plan_lookup_key: str | None,
+    cancel_at_period_end: bool,
+    source: str,
+    now_iso: str | None = None,
+) -> dict[str, Any]:
+    now = now_iso or utc_now()
+    internal_plan = map_subscription_to_internal_plan(
+        status=status,
+        plan_code=plan_code,
+        plan_lookup_key=plan_lookup_key,
+        cancel_at_period_end=cancel_at_period_end,
+    )
+    conn.execute(
+        """
+        update workspaces
+        set plan = ?, subscription_status = ?, subscription_source = ?, subscription_updated_at = ?
+        where id = ?
+        """,
+        (internal_plan, status, source, now, workspace_id),
+    )
+    return {"workspace_id": workspace_id, "plan": internal_plan, "status": status, "source": source}
+
+
 def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return sync_manual_billing_subscription_event(payload)
 
@@ -2376,19 +2420,15 @@ def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str,
             ),
         )
 
-        internal_plan = map_subscription_to_internal_plan(
+        result = apply_workspace_subscription_state(
+            conn,
+            workspace_id=workspace_id,
             status=status,
             plan_code=plan_code,
             plan_lookup_key=plan_lookup_key,
             cancel_at_period_end=cancel_at_period_end,
-        )
-        conn.execute(
-            """
-            update workspaces
-            set plan = ?, subscription_status = ?, subscription_source = ?, subscription_updated_at = ?
-            where id = ?
-            """,
-            (internal_plan, status, source, now, workspace_id),
+            source=source,
+            now_iso=now,
         )
         conn.commit()
     except Exception:
@@ -2396,7 +2436,7 @@ def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str,
         raise
     finally:
         conn.close()
-    return {"workspace_id": workspace_id, "plan": internal_plan, "status": status}
+    return result
 
 
 def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3208,6 +3248,57 @@ def transition_checkout_task(
 
 class CheckoutRetryableError(RuntimeError):
     pass
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
+def normalize_parser_confidence(value: Any) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    confidence = float(value)
+    if math.isnan(confidence) or math.isinf(confidence):
+        return None
+    return min(1.0, max(0.0, confidence))
+
+
+def parser_metadata_payload(result: MonitorResult) -> dict[str, Any]:
+    return {
+        "availability_reason": result.availability_reason,
+        "parser_confidence": normalize_parser_confidence(result.parser_confidence),
+    }
 
 
 def create_secret(
@@ -5857,35 +5948,17 @@ def api_meta_check_update():
     return jsonify(payload)
 
 
-@app.post("/api/billing/stripe/webhook")
-def api_billing_stripe_webhook():
-    payload = request.get_data(cache=False, as_text=False)
-    signature_header = request.headers.get("Stripe-Signature")
-    try:
-        verify_stripe_webhook_signature(payload, signature_header)
-    except PermissionError as exc:
-        return jsonify({"error": str(exc)}), 401
-
-    try:
-        event = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return jsonify({"error": "Invalid JSON payload"}), 400
-
+def _ingest_stripe_event(event: dict[str, Any]) -> tuple[bool, int, dict[str, Any]]:
     event_id = event.get("id")
     event_type = event.get("type", "")
     if not event_id:
-        return jsonify({"error": "Missing Stripe event id"}), 400
+        return False, 400, {"error": "Missing Stripe event id"}
 
     subscription = ((event.get("data") or {}).get("object") or {})
     workspace_id = None
     if isinstance(subscription, dict):
         workspace_id = _workspace_id_from_subscription_object(subscription)
 
-    supported_types = {
-        "customer.subscription.created",
-        "customer.subscription.updated",
-        "customer.subscription.deleted",
-    }
     conn = db()
     try:
         conn.execute("begin")
@@ -5899,16 +5972,42 @@ def api_billing_stripe_webhook():
         if insert_result.rowcount == 0:
             conn.rollback()
             conn.close()
-            return jsonify({"ok": True, "noop": True}), 200
-        if event_type in supported_types:
+            return True, 200, {"ok": True, "noop": True}
+        if event_type in STRIPE_SUBSCRIPTION_EVENT_TYPES:
             sync_billing_subscription_event(conn, event)
         conn.commit()
     except sqlite3.DatabaseError as exc:
         conn.rollback()
         conn.close()
-        return jsonify({"error": f"Database error: {exc}"}), 400
+        return False, 400, {"error": f"Database error: {exc}"}
     conn.close()
-    return jsonify({"ok": True, "noop": False}), 200
+    return True, 200, {"ok": True, "noop": False}
+
+
+def _handle_stripe_webhook_request():
+    payload = request.get_data(cache=False, as_text=False)
+    signature_header = request.headers.get("Stripe-Signature")
+    try:
+        verify_stripe_webhook_signature(payload, signature_header)
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+
+    try:
+        event = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return jsonify({"error": "Invalid JSON payload"}), 400
+    ok, status_code, payload = _ingest_stripe_event(event)
+    return jsonify(payload), status_code
+
+
+@app.post("/api/billing/stripe/webhook")
+def api_billing_stripe_webhook():
+    return _handle_stripe_webhook_request()
+
+
+@app.post("/api/stripe/webhook")
+def api_stripe_webhook():
+    return _handle_stripe_webhook_request()
 
 
 @app.get("/api/workspace")
@@ -5916,37 +6015,6 @@ def api_billing_stripe_webhook():
 def api_workspace():
     row = get_workspace(current_workspace_id())
     return jsonify({"workspace": dict(row), "user": current_user_context()})
-
-
-@app.patch("/api/workspace")
-@require_auth
-def api_update_workspace():
-    role_error = ensure_workspace_role("owner", "admin")
-    if role_error:
-        return role_error
-    body = request.json or {}
-    updates: dict[str, Any] = {}
-    try:
-        if "proxy_url" in body:
-            updates["proxy_url"] = (body.get("proxy_url") or "").strip() or None
-        if "session_metadata" in body:
-            session_metadata = _validate_json_object(body.get("session_metadata"), field_name="session_metadata")
-            updates["session_metadata"] = json.dumps(session_metadata) if session_metadata is not None else None
-        if "behavior_metadata" in body:
-            behavior_metadata = _validate_behavior_policy(body.get("behavior_metadata"))
-            updates["behavior_metadata"] = json.dumps(behavior_metadata) if behavior_metadata is not None else None
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    if not updates:
-        return jsonify({"error": "No updatable fields provided"}), 400
-    workspace_id = current_workspace_id()
-    conn = db()
-    set_clause = ", ".join(f"{column} = ?" for column in updates)
-    conn.execute(f"update workspaces set {set_clause} where id = ?", (*updates.values(), workspace_id))
-    conn.commit()
-    row = conn.execute("select * from workspaces where id = ?", (workspace_id,)).fetchone()
-    conn.close()
-    return jsonify({"workspace": dict(row)})
 
 
 @app.post("/api/workspace/plan")
@@ -6006,247 +6074,6 @@ def api_list_monitors():
     return jsonify([dict(r) for r in rows])
 
 
-@app.post("/api/monitor-automation-policies")
-@require_auth
-def api_create_monitor_automation_policy():
-    body = request.json or {}
-    monitor_id = body.get("monitor_id")
-    if monitor_id is None:
-        return jsonify({"error": "monitor_id is required"}), 400
-    workspace_id = get_workspace_id_for_request()
-    conn = db()
-    monitor = get_monitor_for_workspace(conn, int(monitor_id), workspace_id)
-    if not monitor:
-        conn.close()
-        return jsonify({"error": "Monitor not found"}), 404
-    updates: dict[str, Any] = {}
-    try:
-        updates["alerts_enabled"] = _normalize_policy_bool(body.get("alerts_enabled", True), field_name="alerts_enabled")
-        updates["autobuy_enabled"] = _normalize_policy_bool(body.get("autobuy_enabled", False), field_name="autobuy_enabled")
-        updates["alert_throttle_seconds"] = _normalize_policy_optional_int(
-            body.get("alert_throttle_seconds"), field_name="alert_throttle_seconds"
-        )
-        updates["autobuy_cooldown_seconds"] = _normalize_policy_optional_int(
-            body.get("autobuy_cooldown_seconds"), field_name="autobuy_cooldown_seconds"
-        )
-        updates["dedupe_window_seconds"] = _normalize_policy_optional_int(
-            body.get("dedupe_window_seconds"), field_name="dedupe_window_seconds"
-        )
-    except ValueError as exc:
-        conn.close()
-        return jsonify({"error": str(exc)}), 400
-    dedupe_scope = body.get("dedupe_scope")
-    updates["dedupe_scope"] = str(dedupe_scope).strip() if dedupe_scope not in (None, "") else None
-    now_iso = utc_now()
-    cur = conn.execute(
-        """
-        insert into monitor_automation_policies(
-            workspace_id, monitor_id, alerts_enabled, autobuy_enabled, alert_throttle_seconds,
-            autobuy_cooldown_seconds, dedupe_window_seconds, dedupe_scope, created_at, updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        on conflict(workspace_id, monitor_id) do update set
-            alerts_enabled = excluded.alerts_enabled,
-            autobuy_enabled = excluded.autobuy_enabled,
-            alert_throttle_seconds = excluded.alert_throttle_seconds,
-            autobuy_cooldown_seconds = excluded.autobuy_cooldown_seconds,
-            dedupe_window_seconds = excluded.dedupe_window_seconds,
-            dedupe_scope = excluded.dedupe_scope,
-            updated_at = excluded.updated_at
-        """,
-        (
-            workspace_id,
-            int(monitor_id),
-            updates["alerts_enabled"],
-            updates["autobuy_enabled"],
-            updates["alert_throttle_seconds"],
-            updates["autobuy_cooldown_seconds"],
-            updates["dedupe_window_seconds"],
-            updates["dedupe_scope"],
-            now_iso,
-            now_iso,
-        ),
-    )
-    policy = conn.execute(
-        "select * from monitor_automation_policies where workspace_id = ? and monitor_id = ?",
-        (workspace_id, int(monitor_id)),
-    ).fetchone()
-    conn.commit()
-    conn.close()
-    status_code = 201 if cur.lastrowid else 200
-    return jsonify({"policy": serialize_monitor_automation_policy(policy)}), status_code
-
-
-@app.get("/api/monitor-automation-policies")
-@require_auth
-def api_list_monitor_automation_policies():
-    monitor_id = request.args.get("monitor_id", type=int)
-    if monitor_id is None:
-        return jsonify({"error": "monitor_id query parameter is required"}), 400
-    workspace_id = get_workspace_id_for_request()
-    conn = db()
-    monitor = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    if not monitor:
-        conn.close()
-        return jsonify({"error": "Monitor not found"}), 404
-    policy = get_or_create_monitor_automation_policy(conn, workspace_id=workspace_id, monitor_id=monitor_id)
-    conn.commit()
-    conn.close()
-    return jsonify({"policies": [serialize_monitor_automation_policy(policy)]})
-
-
-@app.patch("/api/monitor-automation-policies/<int:policy_id>")
-@require_auth
-def api_update_monitor_automation_policy(policy_id: int):
-    workspace_id = get_workspace_id_for_request()
-    body = request.json or {}
-    updates: dict[str, Any] = {}
-    try:
-        if "alerts_enabled" in body:
-            updates["alerts_enabled"] = _normalize_policy_bool(body.get("alerts_enabled"), field_name="alerts_enabled")
-        if "autobuy_enabled" in body:
-            updates["autobuy_enabled"] = _normalize_policy_bool(body.get("autobuy_enabled"), field_name="autobuy_enabled")
-        if "alert_throttle_seconds" in body:
-            updates["alert_throttle_seconds"] = _normalize_policy_optional_int(
-                body.get("alert_throttle_seconds"), field_name="alert_throttle_seconds"
-            )
-        if "autobuy_cooldown_seconds" in body:
-            updates["autobuy_cooldown_seconds"] = _normalize_policy_optional_int(
-                body.get("autobuy_cooldown_seconds"), field_name="autobuy_cooldown_seconds"
-            )
-        if "dedupe_window_seconds" in body:
-            updates["dedupe_window_seconds"] = _normalize_policy_optional_int(
-                body.get("dedupe_window_seconds"), field_name="dedupe_window_seconds"
-            )
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    if "dedupe_scope" in body:
-        updates["dedupe_scope"] = str(body.get("dedupe_scope") or "").strip() or None
-    if not updates:
-        return jsonify({"error": "No updatable fields provided"}), 400
-    updates["updated_at"] = utc_now()
-    conn = db()
-    policy = conn.execute(
-        "select * from monitor_automation_policies where id = ? and workspace_id = ?",
-        (policy_id, workspace_id),
-    ).fetchone()
-    if not policy:
-        conn.close()
-        return jsonify({"error": "Policy not found"}), 404
-    set_clause = ", ".join(f"{column} = ?" for column in updates)
-    conn.execute(
-        f"update monitor_automation_policies set {set_clause} where id = ? and workspace_id = ?",
-        (*updates.values(), policy_id, workspace_id),
-    )
-    updated = conn.execute(
-        "select * from monitor_automation_policies where id = ? and workspace_id = ?",
-        (policy_id, workspace_id),
-    ).fetchone()
-    conn.commit()
-    conn.close()
-    return jsonify({"policy": serialize_monitor_automation_policy(updated)})
-
-
-@app.post("/api/monitors/monitor-assist/apply")
-@require_auth
-def api_apply_monitor_assist_pid():
-    body = request.json or {}
-    raw_monitor_ids = body.get("monitor_ids")
-    if not isinstance(raw_monitor_ids, list) or not raw_monitor_ids:
-        return jsonify({"error": "monitor_ids must be a non-empty list"}), 400
-    try:
-        monitor_ids = sorted({int(value) for value in raw_monitor_ids})
-    except (TypeError, ValueError):
-        return jsonify({"error": "monitor_ids must contain valid integers"}), 400
-
-    try:
-        pid = normalize_monitor_assist_pid(str(body.get("pid") or ""))
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-
-    product_url = f"https://www.pokemoncenter.com/product/{pid}"
-    workspace_id = get_workspace_id_for_request()
-    conn = db()
-    placeholders = ",".join(["?"] * len(monitor_ids))
-    monitor_rows = conn.execute(
-        f"""
-        select id, retailer, product_url
-        from monitors
-        where workspace_id = ?
-          and id in ({placeholders})
-        """,
-        (workspace_id, *monitor_ids),
-    ).fetchall()
-    if not monitor_rows:
-        conn.close()
-        return jsonify({"error": "No matching monitors found"}), 404
-
-    eligible_monitor_ids = [row["id"] for row in monitor_rows if (row["retailer"] or "").strip().lower() == "pokemoncenter"]
-    if not eligible_monitor_ids:
-        conn.close()
-        return jsonify({"error": "Monitor assist currently supports pokemoncenter monitors only"}), 400
-
-    eligible_placeholders = ",".join(["?"] * len(eligible_monitor_ids))
-    conn.execute(
-        f"""
-        update monitors
-        set product_url = ?
-        where workspace_id = ?
-          and id in ({eligible_placeholders})
-        """,
-        (product_url, workspace_id, *eligible_monitor_ids),
-    )
-
-    task_rows = conn.execute(
-        f"""
-        select id, monitor_id, current_state
-        from checkout_tasks
-        where workspace_id = ?
-          and monitor_id in ({eligible_placeholders})
-        """,
-        (workspace_id, *eligible_monitor_ids),
-    ).fetchall()
-    for task in task_rows:
-        details = {
-            "event": "monitor_assist_pid_apply",
-            "pid": pid,
-            "product_url": product_url,
-            "source": "monitor_assist",
-        }
-        record_checkout_attempt(
-            conn,
-            task_id=int(task["id"]),
-            workspace_id=workspace_id,
-            monitor_id=int(task["monitor_id"]),
-            state=str(task["current_state"] or "queued"),
-            status="PID updated from monitor assist",
-            details=details,
-            error_text="PID updated from monitor assist",
-        )
-        record_task_log(
-            conn,
-            task_id=int(task["id"]),
-            workspace_id=workspace_id,
-            monitor_id=int(task["monitor_id"]),
-            level="info",
-            event_type="monitor_assist",
-            message="PID updated from monitor assist",
-            payload=details,
-        )
-
-    conn.commit()
-    conn.close()
-    return jsonify(
-        {
-            "ok": True,
-            "pid": pid,
-            "product_url": product_url,
-            "updated_monitors": len(eligible_monitor_ids),
-            "updated_tasks": len(task_rows),
-            "monitor_ids": eligible_monitor_ids,
-        }
-    )
-
-
 def get_monitor_for_workspace(
     conn: sqlite3.Connection, monitor_id: int, workspace_id: int
 ) -> sqlite3.Row | None:
@@ -6266,207 +6093,6 @@ def api_get_monitor(monitor_id: int):
     if not row:
         return jsonify({"error": "Monitor not found"}), 404
     return jsonify(dict(row))
-
-
-@app.post("/api/tasks")
-@require_auth
-def api_create_task():
-    body = request.json or {}
-    try:
-        retailer = canonical_retailer((body.get("retailer") or "").strip())
-        category = (body.get("category") or "pokemon").strip().lower()
-        product_url = (body.get("url") or body.get("product_url") or "").strip()
-        normalized_products: list[dict[str, Any]] | None = None
-        profile = (body.get("profile") or "").strip()
-        account = (body.get("account") or "").strip()
-        payment = (body.get("payment") or "").strip()
-        if retailer not in SUPPORTED_RETAILERS:
-            raise ValueError(f"Unsupported retailer '{retailer}'")
-        if category not in SUPPORTED_MONITOR_CATEGORIES:
-            raise ValueError(f"Unsupported category '{category}'")
-        if category not in RETAILER_CATEGORY_SUPPORT.get(retailer, set()):
-            raise ValueError(f"Retailer '{retailer}' does not support category '{category}'")
-        if retailer == "pokemoncenter":
-            product_url, normalized_products = _resolve_monitor_input(product_url)
-            if product_url == "placeholder":
-                raise ValueError("placeholder is not allowed when creating monitors")
-        elif not (product_url.startswith("http://") or product_url.startswith("https://")):
-            raise ValueError("url must be http(s)")
-        if not profile:
-            raise ValueError("profile is required")
-        if not account:
-            raise ValueError("account is required")
-        if not payment:
-            raise ValueError("payment is required")
-    except (ValueError, MonitorInputValidationError) as exc:
-        return jsonify({"error": str(exc)}), 400
-
-    workspace_id = current_workspace_id()
-    conn = db()
-    enforce_plan_limits(workspace_id, 20)
-    monitor_cur = conn.execute(
-        """
-        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, enabled, created_at)
-        values (?, ?, ?, 20, 0, ?)
-        """,
-        (workspace_id, retailer, product_url, utc_now()),
-        """,
-        (workspace_id, retailer, product_url, utc_now()),
-        insert into monitors(workspace_id, retailer, category, product_url, poll_interval_seconds, enabled, created_at)
-        values (?, ?, ?, ?, 20, 0, ?)
-        """,
-        (workspace_id, retailer, category, product_url, utc_now()),
-    )
-    monitor_id = int(monitor_cur.lastrowid)
-    task = create_checkout_task(
-        conn,
-        workspace_id=workspace_id,
-        monitor_id=monitor_id,
-        task_name=f"{retailer} task",
-        task_config={
-            "retailer": retailer,
-            "category": category,
-            "product_url": product_url,
-            "products": normalized_products or [],
-            "profile": profile,
-            "account": account,
-            "payment": payment,
-        },
-        initial_state="queued",
-    )
-    conn.commit()
-    conn.close()
-
-    payload = {
-        "id": task["id"],
-        "workspace_id": workspace_id,
-        "retailer": retailer,
-        "category": category,
-        "product_url": product_url,
-        "profile": profile,
-        "account": account,
-        "payment": payment,
-        "state": "idle",
-        "retries": 0,
-        "last_step": None,
-        "last_error": None,
-    }
-    socketio.emit("task_update", payload)
-    return jsonify(payload), 201
-
-
-@app.get("/api/tasks")
-@require_auth
-def api_list_tasks():
-    conn = db()
-    rows = conn.execute(
-        "select * from checkout_tasks where workspace_id = ? order by id desc",
-        (current_workspace_id(),),
-    ).fetchall()
-    payloads = []
-    for row in rows:
-        config = {}
-        raw = row["task_config"]
-        if raw:
-            try:
-                config = json.loads(raw)
-            except (TypeError, json.JSONDecodeError):
-                config = {}
-        state = normalize_checkout_state(row["current_state"])
-        compat_state = "running" if state in CHECKOUT_ACTIVE_STATES else ("idle" if state == "idle" else state)
-        payloads.append(
-            {
-                "id": row["id"],
-                "workspace_id": row["workspace_id"],
-                "retailer": config.get("retailer"),
-                "product_url": config.get("product_url"),
-                "profile": config.get("profile"),
-                "account": config.get("account"),
-                "payment": config.get("payment"),
-                "state": compat_state,
-                "retries": 0,
-                "last_step": row["current_state"],
-                "last_error": row["last_error"],
-            }
-        )
-    conn.close()
-    return jsonify(payloads)
-
-
-@app.post("/api/tasks/<int:task_id>/start")
-@require_auth
-def api_start_task(task_id: int):
-    workspace_id = current_workspace_id()
-    conn = db()
-    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
-    if not task:
-        conn.close()
-        return jsonify({"error": "Task not found"}), 404
-    transitioned = transition_checkout_task(
-        conn,
-        task_id=task_id,
-        workspace_id=workspace_id,
-        requested_state="monitoring",
-        reason="compat_api_start_task",
-    )
-    conn.commit()
-    conn.close()
-    assert transitioned is not None
-    config = json.loads(transitioned["task_config"] or "{}")
-    payload = {
-        "id": transitioned["id"],
-        "workspace_id": workspace_id,
-        "retailer": config.get("retailer"),
-        "category": config.get("category"),
-        "product_url": config.get("product_url"),
-        "profile": config.get("profile"),
-        "account": config.get("account"),
-        "payment": config.get("payment"),
-        "state": "running",
-        "retries": 0,
-        "last_step": transitioned["current_state"],
-        "last_error": transitioned["last_error"],
-    }
-    socketio.emit("task_update", payload)
-    return jsonify({"ok": True, "task": payload, "already_running": False})
-
-
-@app.post("/api/tasks/<int:task_id>/stop")
-@require_auth
-def api_stop_task(task_id: int):
-    workspace_id = current_workspace_id()
-    conn = db()
-    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
-    if not task:
-        conn.close()
-        return jsonify({"error": "Task not found"}), 404
-    transitioned = transition_checkout_task(
-        conn,
-        task_id=task_id,
-        workspace_id=workspace_id,
-        requested_state="stopped",
-        reason="compat_api_stop_task",
-    )
-    conn.commit()
-    conn.close()
-    assert transitioned is not None
-    config = json.loads(transitioned["task_config"] or "{}")
-    payload = {
-        "id": transitioned["id"],
-        "workspace_id": workspace_id,
-        "retailer": config.get("retailer"),
-        "category": config.get("category"),
-        "product_url": config.get("product_url"),
-        "profile": config.get("profile"),
-        "account": config.get("account"),
-        "payment": config.get("payment"),
-        "state": "stopped",
-        "retries": 0,
-        "last_step": transitioned["current_state"],
-        "last_error": transitioned["last_error"],
-    }
-    socketio.emit("task_update", payload)
-    return jsonify({"ok": True, "task": payload})
 
 
 @app.get("/api/dashboard/summary")
@@ -6836,10 +6462,7 @@ def api_delete_monitor(monitor_id: int):
     if not row:
         conn.close()
         return jsonify({"error": "Monitor not found"}), 404
-    conn.execute(
-        "delete from monitors where id = ? and workspace_id = ?",
-        (monitor_id, workspace_id),
-    )
+    conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
