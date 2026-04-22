@@ -32,14 +32,20 @@ Run the same commands used in CI:
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 pip install pytest ruff
-ruff check tests
-python -m compileall -q app.py tests
-pytest -q tests
-pytest -q tests/test_billing_schema.py::test_init_db_creates_billing_tables_and_columns
-pytest -q tests/test_app.py::test_init_db_migrates_existing_monitors_table_with_msrp_column
+./scripts/ci_quality_gates.sh
 ```
 
-The last two commands are explicit migration-safety checks for:
+Equivalent expanded commands:
+
+```bash
+ruff check tests/test_billing_schema.py tests/test_parser_fixtures.py tests/parser_fixture_harness.py retailers network
+python -m compileall -q app.py retailers network tests/test_billing_schema.py tests/test_parser_fixtures.py tests/parser_fixture_harness.py
+pytest -q -ra tests
+pytest -q -ra tests/test_billing_schema.py::test_init_db_creates_billing_tables_and_columns
+pytest -q -ra tests/test_app.py::test_init_db_migrates_existing_monitors_table_with_msrp_column
+```
+
+The migration-safety checks are explicit guards for:
 
 - fresh database creation via `init_db()`,
 - legacy `monitors` schema upgrade behavior (including `msrp_cents` migration).
@@ -48,9 +54,14 @@ The last two commands are explicit migration-safety checks for:
 ## API quick start
 
 - API authentication is required for all `/api/*` routes.
-- Set `API_AUTH_TOKEN` (defaults to `dev-token`) and send either:
+- In production/non-dev environments, set `API_AUTH_TOKEN` and `SECRET_ENCRYPTION_KEY` explicitly before startup.
+- In local development mode (`APP_ENV=development`), safe local defaults are used (`API_AUTH_TOKEN=dev-token`, `SECRET_ENCRYPTION_KEY=local-dev-secret-key`).
+- Send either:
   - `Authorization: Bearer <token>`, or
   - `X-API-Token: <token>`
+- CORS behavior:
+  - Development mode allows `*`.
+  - Production mode requires explicit origins via `ALLOWED_ORIGINS` (comma-separated, for example `https://app.example.com,https://admin.example.com`).
 - `POST /api/webhooks` to add Discord webhook.
 - `POST /api/monitors` to add product monitor.
 - `POST /api/checkout/tasks` to create a checkout task for an existing monitor.
@@ -76,6 +87,13 @@ Billing state transitions (workspace plan sync):
 - `customer.subscription.created` / `customer.subscription.updated`: workspace `subscription_status` is updated and plan is mapped from Stripe plan metadata (`pro`/`team` lookup keys map to higher tiers, otherwise `basic`).
 - `customer.subscription.deleted`: workspace is forced to `basic` with `subscription_status=canceled` (preserves existing plan enforcement behavior for monitor count/poll minimums).
 
+Update-check configuration (`GET /api/meta/check-update`):
+
+- `UPDATE_CHECK_URL`: upstream URL for latest-version metadata (JSON `latest_version`/`version`/`tag_name`, or plain text version).
+- `UPDATE_CHECK_TIMEOUT_SECONDS` (optional, default `2.0`): upstream timeout.
+- `UPDATE_CHECK_AUTH_HEADER` (optional, default `Authorization`): header name used when auth token is configured.
+- `UPDATE_CHECK_AUTH_TOKEN` (optional): auth value sent to the upstream update-check source.
+
 Monitor check response compatibility notes:
 
 - `POST /api/monitors/:id/check` now includes `availability_reason` and `parser_confidence`.
@@ -86,13 +104,34 @@ Monitor check response compatibility notes:
 Example:
 
 ```bash
-curl -H "Authorization: Bearer dev-token" http://localhost:5000/api/workspace
+curl -H "Authorization: Bearer ${API_AUTH_TOKEN}" http://localhost:5000/api/workspace
 ```
 
 Usage limits snapshot example:
 
 ```bash
-curl -H "Authorization: Bearer dev-token" http://localhost:5000/api/workspace/usage-limits
+curl -H "Authorization: Bearer ${API_AUTH_TOKEN}" http://localhost:5000/api/workspace/usage-limits
+```
+
+### Environment variables (security-sensitive)
+
+Required in non-dev (`APP_ENV` not set to `development`/`test`):
+
+- `API_AUTH_TOKEN`: bearer token required by `/api/*` routes.
+- `SECRET_ENCRYPTION_KEY`: secret key used for encrypt/decrypt of stored sensitive values.
+
+Recommended in non-dev:
+
+- `ALLOWED_ORIGINS`: comma-separated CORS allowlist for Socket.IO/browser clients.
+
+Safe production example:
+
+```bash
+export APP_ENV=production
+export API_AUTH_TOKEN='replace-with-strong-random-token'
+export SECRET_ENCRYPTION_KEY='replace-with-32+-char-random-secret'
+export ALLOWED_ORIGINS='https://app.example.com,https://admin.example.com'
+python app.py
 ```
 
 ```json

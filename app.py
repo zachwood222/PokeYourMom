@@ -13,6 +13,8 @@ import time
 import traceback
 import hashlib
 import hmac
+
+from cryptography.fernet import Fernet, InvalidToken
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from functools import wraps
@@ -41,8 +43,35 @@ from tasks.parsers import MonitorInputValidationError, parse_monitor_input
 from network.session_manager import RequestResult, SessionManager
 from network.session_manager import RequestBehaviorPolicy
 
+def _current_app_mode() -> str:
+    return (
+        os.getenv("FLASK_ENV")
+        or os.getenv("APP_ENV")
+        or os.getenv("ENV")
+        or os.getenv("PYTHON_ENV")
+        or ""
+    ).strip().lower()
+
+
+def is_dev_environment() -> bool:
+    mode = _current_app_mode()
+    if mode in {"dev", "development", "local", "test", "testing"}:
+        return True
+    return (os.getenv("FLASK_DEBUG", "0") or "").strip() == "1"
+
+
+def _parse_allowed_origins(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+IS_DEV_ENVIRONMENT = is_dev_environment()
+RAW_ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = "*" if IS_DEV_ENVIRONMENT else _parse_allowed_origins(RAW_ALLOWED_ORIGINS)
+
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS, async_mode="threading")
 session_manager = SessionManager()
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
@@ -64,10 +93,15 @@ CORRELATION_ID_HEADER = "X-Correlation-ID"
 _api_auth_token_raw = os.getenv("API_AUTH_TOKEN")
 API_AUTH_TOKEN = _api_auth_token_raw.strip() if _api_auth_token_raw is not None else "dev-token"
 SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY", "local-dev-secret-key")
+SECRET_ENCRYPTION_KEY_VERSION = os.getenv("SECRET_ENCRYPTION_KEY_VERSION", "v1")
+SECRET_ENCRYPTION_KEYS_RAW = os.getenv("SECRET_ENCRYPTION_KEYS", "")
+LEGACY_SECRET_KEY_VERSION = "legacy-v0"
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_WEBHOOK_TOLERANCE_SECONDS = int(os.getenv("STRIPE_WEBHOOK_TOLERANCE_SECONDS", "300"))
 UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
 UPDATE_CHECK_TIMEOUT_SECONDS = float(os.getenv("UPDATE_CHECK_TIMEOUT_SECONDS", "2.0"))
+UPDATE_CHECK_AUTH_HEADER = os.getenv("UPDATE_CHECK_AUTH_HEADER", "").strip() or "Authorization"
+UPDATE_CHECK_AUTH_TOKEN = os.getenv("UPDATE_CHECK_AUTH_TOKEN", "").strip()
 CAPTCHA_PROVIDER = os.getenv("CAPTCHA_PROVIDER", "turnstile")
 CAPTCHA_SITE_KEY = os.getenv("CAPTCHA_SITE_KEY", "")
 CAPTCHA_SCRIPT_URL = os.getenv("CAPTCHA_SCRIPT_URL", "https://challenges.cloudflare.com/turnstile/v0/api.js")
@@ -270,31 +304,24 @@ def parse_json_object(raw: str | None) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def is_dev_environment() -> bool:
-    mode = (
-        os.getenv("FLASK_ENV")
-        or os.getenv("APP_ENV")
-        or os.getenv("ENV")
-        or os.getenv("PYTHON_ENV")
-        or ""
-    ).strip().lower()
-    if mode in {"dev", "development", "local", "test", "testing"}:
-        return True
-    return (os.getenv("FLASK_DEBUG", "0") or "").strip() == "1"
-
-
 def validate_startup_configuration() -> None:
-    if API_AUTH_TOKEN:
-        return
-    warning_message = (
-        "API_AUTH_TOKEN is empty after normalization. /api/* endpoints will return 401 "
-        "unless requests include a valid bearer token."
-    )
-    log(warning_message, level="error")
-    if STRICT_API_AUTH_TOKEN and not is_dev_environment():
-        raise RuntimeError(
-            f"{warning_message} Set API_AUTH_TOKEN to a non-empty value before startup."
-        )
+    missing_env_vars: list[str] = []
+    if not API_AUTH_TOKEN:
+        missing_env_vars.append("API_AUTH_TOKEN")
+    if not SECRET_ENCRYPTION_KEY:
+        missing_env_vars.append("SECRET_ENCRYPTION_KEY")
+
+    if missing_env_vars:
+        missing_env_text = ", ".join(missing_env_vars)
+        message = f"Missing required environment variables: {missing_env_text}."
+        log(message, level="error")
+        if not is_dev_environment():
+            raise RuntimeError(
+                f"{message} Set explicit values before starting in non-development environments."
+            )
+
+    if not IS_DEV_ENVIRONMENT and (ALLOWED_ORIGINS == "*" or "*" in ALLOWED_ORIGINS):
+        raise RuntimeError("Wildcard CORS is disabled outside development mode.")
 
 
 def verify_stripe_webhook_signature(payload: bytes, signature_header: str | None) -> None:
@@ -337,16 +364,7 @@ def _encryption_keystream(secret_key: str, nonce: bytes, length: int) -> bytes:
     return bytes(stream[:length])
 
 
-def encrypt_secret_value(plaintext: str) -> str:
-    nonce = secrets.token_bytes(16)
-    payload = plaintext.encode("utf-8")
-    keystream = _encryption_keystream(SECRET_ENCRYPTION_KEY, nonce, len(payload))
-    cipher = bytes(a ^ b for a, b in zip(payload, keystream))
-    mac = hmac.new(SECRET_ENCRYPTION_KEY.encode("utf-8"), nonce + cipher, hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(nonce + cipher + mac).decode("ascii")
-
-
-def decrypt_secret_value(ciphertext: str) -> str:
+def _decrypt_legacy_secret_value(ciphertext: str) -> str:
     raw = base64.urlsafe_b64decode(ciphertext.encode("ascii"))
     if len(raw) < 48:
         raise ValueError("Invalid secret payload")
@@ -359,6 +377,94 @@ def decrypt_secret_value(ciphertext: str) -> str:
     keystream = _encryption_keystream(SECRET_ENCRYPTION_KEY, nonce, len(cipher))
     payload = bytes(a ^ b for a, b in zip(cipher, keystream))
     return payload.decode("utf-8")
+
+
+def _normalize_fernet_key(raw_key: str) -> bytes:
+    candidate = (raw_key or "").strip().encode("ascii")
+    try:
+        decoded = base64.urlsafe_b64decode(candidate)
+    except Exception:
+        decoded = b""
+    if len(decoded) == 32:
+        return candidate
+    digest = hashlib.sha256((raw_key or "").encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest)
+
+
+def _load_secret_encryption_keys() -> tuple[str, dict[str, Fernet]]:
+    keys: dict[str, bytes] = {}
+    for entry in (SECRET_ENCRYPTION_KEYS_RAW or "").split(","):
+        item = entry.strip()
+        if not item:
+            continue
+        if ":" in item:
+            version, key_value = item.split(":", 1)
+        elif "=" in item:
+            version, key_value = item.split("=", 1)
+        else:
+            continue
+        version = version.strip()
+        key_value = key_value.strip()
+        if version and key_value:
+            keys[version] = _normalize_fernet_key(key_value)
+
+    active_version = (SECRET_ENCRYPTION_KEY_VERSION or "v1").strip() or "v1"
+    if active_version not in keys:
+        keys[active_version] = _normalize_fernet_key(SECRET_ENCRYPTION_KEY)
+
+    return active_version, {version: Fernet(key) for version, key in keys.items()}
+
+
+ACTIVE_SECRET_KEY_VERSION, SECRET_FERNETS = _load_secret_encryption_keys()
+
+
+def encrypt_secret_value(plaintext: str) -> str:
+    return SECRET_FERNETS[ACTIVE_SECRET_KEY_VERSION].encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+
+def encrypt_secret_value_with_version(plaintext: str) -> tuple[str, str]:
+    return encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION
+
+
+def decrypt_secret_value(ciphertext: str, key_version: str | None = None) -> str:
+    if key_version == LEGACY_SECRET_KEY_VERSION:
+        return _decrypt_legacy_secret_value(ciphertext)
+
+    candidate_versions: list[str]
+    if key_version:
+        candidate_versions = [key_version]
+    else:
+        candidate_versions = list(SECRET_FERNETS.keys())
+
+    for version in candidate_versions:
+        fernet = SECRET_FERNETS.get(version)
+        if not fernet:
+            continue
+        try:
+            return fernet.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+        except (InvalidToken, ValueError):
+            continue
+
+    if key_version is None:
+        return _decrypt_legacy_secret_value(ciphertext)
+    raise ValueError("Secret decryption failed for configured key version")
+
+
+def decrypt_secret_value_with_details(ciphertext: str, key_version: str | None = None) -> tuple[str, str, bool]:
+    if key_version == LEGACY_SECRET_KEY_VERSION:
+        return decrypt_secret_value(ciphertext, key_version=key_version), LEGACY_SECRET_KEY_VERSION, True
+
+    if key_version:
+        return decrypt_secret_value(ciphertext, key_version=key_version), key_version, False
+
+    for version, fernet in SECRET_FERNETS.items():
+        try:
+            value = fernet.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+            return value, version, False
+        except (InvalidToken, ValueError):
+            continue
+
+    return _decrypt_legacy_secret_value(ciphertext), LEGACY_SECRET_KEY_VERSION, True
 
 
 SENSITIVE_FIELD_MARKERS = ("token", "secret", "password", "authorization", "webhook_url")
@@ -389,14 +495,14 @@ def create_secret(
     normalized_type = (secret_type or "").strip().lower()
     if not normalized_type:
         raise ValueError("secret_type is required")
-    ciphertext = encrypt_secret_value(plaintext)
+    ciphertext, key_version = encrypt_secret_value_with_version(plaintext)
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, normalized_type, ciphertext, now_iso, now_iso),
+        (workspace_id, user_id, normalized_type, ciphertext, key_version, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -416,7 +522,17 @@ def get_secret_plaintext(
         raise ValueError("Secret not found")
     if allowed_types and row["secret_type"] not in allowed_types:
         raise ValueError("Secret type not allowed")
-    return decrypt_secret_value(row["ciphertext"])
+    plaintext, resolved_version, should_migrate = decrypt_secret_value_with_details(
+        row["ciphertext"],
+        key_version=row["key_version"],
+    )
+    if should_migrate or resolved_version != ACTIVE_SECRET_KEY_VERSION:
+        migrated_ciphertext, migrated_version = encrypt_secret_value_with_version(plaintext)
+        conn.execute(
+            "update account_secrets set ciphertext = ?, key_version = ?, updated_at = ? where id = ?",
+            (migrated_ciphertext, migrated_version, utc_now(), row["id"]),
+        )
+    return plaintext
 
 
 def redact_webhook_url(url: str) -> str:
@@ -1285,6 +1401,7 @@ def init_db() -> None:
             user_id integer,
             secret_type text not null,
             ciphertext text not null,
+            key_version text,
             created_at text not null,
             updated_at text not null,
             foreign key(workspace_id) references workspaces(id),
@@ -1759,6 +1876,7 @@ def init_db() -> None:
     ensure_column(conn, "checkout_tasks", "autopilot_profile_id", "integer")
     ensure_column(conn, "captcha_harvesters", "notes", "text")
     ensure_column(conn, "captcha_harvesters", "last_tested_at", "text")
+    ensure_column(conn, "account_secrets", "key_version", "text")
     run_legacy_tasks_migration(conn)
     run_pokemon_center_task_group_config_migration(conn)
     conn.commit()
@@ -3295,10 +3413,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3372,6 +3490,75 @@ def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
 def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
+    payload = dict(row)
+    config_raw = payload.get("task_config")
+    try:
+        payload["task_config"] = json.loads(config_raw) if config_raw else {}
+    except (TypeError, json.JSONDecodeError):
+        payload["task_config"] = {}
+    return payload
+
+
+def redact_webhook_url(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 12:
+        return "***"
+    return f"{value[:8]}...{value[-4:]}"
+
+
+def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    confidence = float(value)
+    if math.isnan(confidence) or math.isinf(confidence):
+        return None
+    return min(1.0, max(0.0, confidence))
+
+
+def parser_metadata_payload(result: MonitorResult) -> dict[str, Any]:
+    return {
+        "availability_reason": result.availability_reason,
+        "parser_confidence": normalize_parser_confidence(result.parser_confidence),
+    }
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
+def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
     if not isinstance(value, (int, float)):
         return None
     confidence = float(value)
@@ -3397,10 +3584,61 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
+def normalize_parser_confidence(value: Any) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    confidence = float(value)
+    if math.isnan(confidence) or math.isinf(confidence):
+        return None
+    return min(1.0, max(0.0, confidence))
+
+
+def parser_metadata_payload(result: MonitorResult) -> dict[str, Any]:
+    return {
+        "availability_reason": result.availability_reason,
+        "parser_confidence": normalize_parser_confidence(result.parser_confidence),
+    }
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3510,10 +3748,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3543,10 +3781,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3576,10 +3814,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3609,10 +3847,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3660,10 +3898,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -4368,12 +4606,16 @@ def resolve_latest_version() -> tuple[str, str | None]:
         return fallback_version, "update_check_url_not_configured"
 
     try:
+        headers = {"User-Agent": "StockSentinel-UpdateCheck/1.0"}
+        if UPDATE_CHECK_AUTH_TOKEN:
+            headers[UPDATE_CHECK_AUTH_HEADER] = UPDATE_CHECK_AUTH_TOKEN
         req = perform_request(
             task_key="meta-update-check",
             method="GET",
             url=UPDATE_CHECK_URL,
             workspace_id=None,
             proxy_url=None,
+            headers=headers,
             timeout=UPDATE_CHECK_TIMEOUT_SECONDS,
             retry_total=1,
             backoff_factor=0.1,
@@ -4457,11 +4699,66 @@ def _handle_stripe_webhook_request():
     return jsonify(payload), status_code
 
 
+@app.post("/api/billing/stripe/webhook")
+def api_billing_stripe_webhook():
+    return _handle_stripe_webhook_request()
+
+
+@app.post("/api/stripe/webhook")
+def api_stripe_webhook():
+    return _handle_stripe_webhook_request()
+
+
 @app.get("/api/workspace")
 @require_auth
 def api_workspace():
     row = get_workspace(current_workspace_id())
     return jsonify({"workspace": dict(row), "user": current_user_context()})
+
+
+@app.get("/api/workspace/usage-limits")
+@require_auth
+def api_workspace_usage_limits():
+    workspace_id = get_workspace_id_for_request()
+    workspace = get_workspace(workspace_id)
+    limits = PLAN_LIMITS[workspace["plan"]]
+    conn = db()
+    usage = conn.execute(
+        """
+        select count(*) as monitor_count, min(poll_interval_seconds) as min_poll_interval_seconds
+        from monitors
+        where workspace_id = ?
+        """,
+        (workspace_id,),
+    ).fetchone()
+    conn.close()
+
+    monitor_count = int(usage["monitor_count"] or 0)
+    min_poll_interval_seconds = usage["min_poll_interval_seconds"]
+    monitor_slots_remaining = max(0, limits["max_monitors"] - monitor_count)
+
+    return jsonify(
+        {
+            "plan": workspace["plan"],
+            "usage": {
+                "monitor_count": monitor_count,
+                "min_poll_interval_seconds": min_poll_interval_seconds,
+            },
+            "limits": {
+                "max_monitors": limits["max_monitors"],
+                "min_poll_seconds": limits["min_poll_seconds"],
+            },
+            "derived": {
+                "monitor_slots_remaining": monitor_slots_remaining,
+                "monitor_limit_reached": monitor_count >= limits["max_monitors"],
+                "poll_minimum_satisfied": (
+                    True
+                    if min_poll_interval_seconds is None
+                    else min_poll_interval_seconds >= limits["min_poll_seconds"]
+                ),
+            },
+        }
+    )
 
 
 @app.post("/api/workspace/plan")
@@ -4528,6 +4825,13 @@ def get_monitor_for_workspace(
         "select * from monitors where id = ? and workspace_id = ?",
         (monitor_id, workspace_id),
     ).fetchone()
+
+
+def validate_monitor_retailer_and_url(retailer: str, url: str) -> None:
+    if retailer not in SUPPORTED_RETAILERS:
+        raise ValueError(f"Unsupported retailer '{retailer}'")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise ValueError("product_url must be http(s)")
 
 
 @app.get("/api/monitors/<int:monitor_id>")
@@ -4920,12 +5224,21 @@ def api_billing_stripe_webhook():
 def api_stripe_webhook():
     return _handle_stripe_webhook_request()
 
+    average_order_value_cents = 0 if checkout_count == 0 else int(round(spent_total_cents / checkout_count))
+    success_rate = 0.0 if (checkout_count + decline_count) == 0 else checkout_count / (checkout_count + decline_count)
 
-@app.get("/api/workspace")
-@require_auth
-def api_workspace():
-    row = get_workspace(current_workspace_id())
-    return jsonify({"workspace": dict(row), "user": current_user_context()})
+    return jsonify(
+        {
+            "checkouts_total": checkout_count,
+            "declines_total": decline_count,
+            "spent_total_cents": spent_total_cents,
+            "average_order_value_cents": average_order_value_cents,
+            "success_rate": round(success_rate, 4),
+            "product_orders": sorted(product_orders, key=lambda item: str(item.get("purchased_at") or ""), reverse=True)[:25],
+            "sites_checkouts": sites,
+            "amount_spent_daily": daily_points,
+        }
+    )
 
 
 @app.get("/api/workspace/usage-limits")
@@ -5044,24 +5357,7 @@ def api_create_monitor():
         msrp_cents = body.get("msrp_cents")
         if msrp_cents is not None:
             msrp_cents = int(msrp_cents)
-        proxy_url = (body.get("proxy_url") or "").strip() or None
-        session_task_key = (body.get("session_task_key") or "").strip() or None
-        session_metadata = _validate_json_object(body.get("session_metadata"), field_name="session_metadata")
-        behavior_metadata = _validate_behavior_policy(body.get("behavior_metadata"))
-        if retailer not in SUPPORTED_RETAILERS:
-            raise ValueError(f"Unsupported retailer '{retailer}'")
-        if category not in SUPPORTED_MONITOR_CATEGORIES:
-            raise ValueError(f"Unsupported category '{category}'")
-        if category not in RETAILER_CATEGORY_SUPPORT.get(retailer, set()):
-            raise ValueError(f"Retailer '{retailer}' does not support category '{category}'")
-        if retailer == "pokemoncenter":
-            url, normalized_products = _resolve_monitor_input(url)
-            if url == "placeholder":
-                raise ValueError("placeholder is not allowed when creating monitors")
-        elif not (url.startswith("http://") or url.startswith("https://")):
-            raise ValueError("product_url must be http(s)")
-        if session_task_key and len(session_task_key) > 80:
-            raise ValueError("session_task_key must be <= 80 chars")
+        validate_monitor_retailer_and_url(retailer, url)
 
         enforce_plan_limits(current_workspace_id(), poll_interval)
     except (KeyError, ValueError, MonitorInputValidationError) as exc:
@@ -5121,7 +5417,7 @@ def api_update_monitor(monitor_id: int):
 
 @app.delete("/api/monitors/<int:monitor_id>")
 @require_auth
-def api_delete_monitor(monitor_id: int):
+def api_delete_monitor_dup2(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
     row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
@@ -5131,253 +5427,11 @@ def api_delete_monitor(monitor_id: int):
     conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
     conn.commit()
     conn.close()
-    return jsonify({"ok": True})
+    assert challenge is not None
+    emit_captcha_challenge_update(challenge)
+    return jsonify(serialize_challenge(challenge)), 201
 
 
-@app.post("/api/monitors/<int:monitor_id>/check")
-@require_auth
-def api_check_monitor(monitor_id: int):
-    workspace_id = get_workspace_id_for_request()
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    if not row:
-        return jsonify({"error": "Monitor not found"}), 404
-    return jsonify(check_monitor_once(row))
-
-
-def get_monitor_for_workspace(
-    conn: sqlite3.Connection, monitor_id: int, workspace_id: int
-) -> sqlite3.Row | None:
-    return conn.execute(
-        "select * from monitors where id = ? and workspace_id = ?",
-        (monitor_id, workspace_id),
-    ).fetchone()
-
-
-@app.get("/api/monitors/<int:monitor_id>")
-@require_auth
-def api_get_monitor(monitor_id: int):
-    workspace_id = get_workspace_id_for_request()
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    if not row:
-        return jsonify({"error": "Monitor not found"}), 404
-    return jsonify(dict(row))
-
-
-@app.get("/api/checkout/tasks")
-@require_auth
-def api_list_checkout_tasks_dup2():
-    conn = db()
-    rows = conn.execute(
-        "select * from checkout_tasks where workspace_id = ? order by id desc",
-        (current_workspace_id(),),
-    ).fetchall()
-    conn.close()
-    return jsonify([serialize_task_ui(row) for row in rows])
-
-
-@app.get("/api/checkout/tasks")
-@require_auth
-def api_list_checkout_tasks_dup3():
-    conn = db()
-    rows = conn.execute(
-        "select * from checkout_tasks where workspace_id = ? order by id desc",
-        (current_workspace_id(),),
-    ).fetchall()
-    conn.close()
-    return jsonify([serialize_task_ui(row) for row in rows])
-
-
-def get_monitor_for_workspace(
-    conn: sqlite3.Connection, monitor_id: int, workspace_id: int
-) -> sqlite3.Row | None:
-    return conn.execute(
-        "select * from monitors where id = ? and workspace_id = ?",
-        (monitor_id, workspace_id),
-    ).fetchone()
-
-
-@app.get("/api/monitors/<int:monitor_id>")
-@require_auth
-def api_get_monitor(monitor_id: int):
-    workspace_id = get_workspace_id_for_request()
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    if not row:
-        return jsonify({"error": "Monitor not found"}), 404
-    return jsonify(dict(row))
-
-
-@app.get("/api/checkout/tasks/<int:task_id>/attempts")
-@require_auth
-def api_checkout_task_attempts_dup2(task_id: int):
-    conn = db()
-    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
-    if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    attempts = conn.execute(
-        """
-        select id, task_id, state, status, details, error_text, created_at
-        from checkout_attempts
-        where task_id = ?
-        order by id desc
-        """,
-        (task_id,),
-    ).fetchall()
-    conn.close()
-    return jsonify(
-        [
-            {
-                "id": a["id"],
-                "task_id": a["task_id"],
-                "state": a["state"],
-                "step": a["status"],
-                "details": parse_json_object(a["details"]),
-                "error": a["error_text"],
-                "created_at": a["created_at"],
-            }
-            for a in attempts
-        ]
-    )
-
-
-@app.get("/api/checkout/tasks/<int:task_id>/attempts")
-@require_auth
-def api_checkout_task_attempts_dup3(task_id: int):
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    if not row:
-        conn.close()
-        return jsonify({"error": "Monitor not found"}), 404
-    conn.execute(
-        "update monitors set enabled = ? where id = ? and workspace_id = ?",
-        (int(bool(enabled)), monitor_id, workspace_id),
-    )
-    conn.commit()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    return jsonify(dict(row))
-
-
-    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
-    if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    attempts = conn.execute(
-        """
-        select id, task_id, state, status, error_text, created_at
-        from checkout_attempts
-        where task_id = ?
-        order by id desc
-        """,
-        (task_id,),
-    ).fetchall()
-    conn.close()
-    return jsonify(
-        [
-            {
-                "id": a["id"],
-                "task_id": a["task_id"],
-                "state": a["state"],
-                "step": a["status"],
-                "error": a["error_text"],
-                "created_at": a["created_at"],
-            }
-            for a in attempts
-        ]
-    )
-
-
-@app.get("/api/checkout/tasks/<int:task_id>/state")
-@require_auth
-def api_checkout_task_state(task_id: int):
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    if not row:
-        conn.close()
-        return jsonify({"error": "Monitor not found"}), 404
-    conn.execute(
-        "update monitors set enabled = ? where id = ? and workspace_id = ?",
-        (int(bool(enabled)), monitor_id, workspace_id),
-    )
-    conn.commit()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    return jsonify(
-        {
-            "task_id": task_id,
-            "current_state": row["current_state"],
-            "last_error": row["last_error"],
-            "last_transition_at": row["last_transition_at"],
-            "last_attempt": dict(last_attempt) if last_attempt else None,
-        }
-    )
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/captcha-challenges")
-@require_auth
-def api_create_checkout_captcha_challenge(task_id: int):
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    if not row:
-        conn.close()
-        return jsonify({"error": "Monitor not found"}), 404
-    conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
-    conn.commit()
-    conn.close()
-    assert updated is not None
-    emit_captcha_challenge_update(updated)
-    return jsonify(serialize_challenge(updated)), 201
-
-
-@app.get("/api/checkout/tasks")
-@require_auth
-def api_list_checkout_tasks_dup5():
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    return jsonify([serialize_task_ui(row) for row in rows])
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/start")
-@app.get("/api/checkout/tasks/<int:task_id>/captcha-challenges")
-@require_auth
-def api_list_checkout_captcha_challenges(task_id: int):
-    conn = db()
-    workspace_id = current_workspace_id()
-    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
-    if not task:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    checkout_captcha_service.expire_stale_challenges(conn)
-    rows = conn.execute(
-        """
-        select * from captcha_challenges
-        where workspace_id = ? and task_id = ?
-        order by id desc
-        """,
-        (workspace_id, task_id),
-    ).fetchall()
-    conn.commit()
-    conn.close()
-    return jsonify([serialize_challenge(row) for row in rows])
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/run")
-@require_auth
-def api_run_checkout_task_dup3(task_id: int):
-    row = execute_checkout_task_state_machine(task_id, current_workspace_id())
-    if not row:
-        return jsonify({"error": "Checkout task not found"}), 404
-    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/pause")
 @app.post("/api/checkout/captcha-challenges/<int:challenge_id>/manual-solve")
 @require_auth
 def api_submit_manual_captcha_solution(challenge_id: int):
@@ -5386,14 +5440,13 @@ def api_submit_manual_captcha_solution(challenge_id: int):
     if not solved_token:
         return jsonify({"error": "solved_token is required"}), 400
 
+@app.get("/api/monitors/<int:monitor_id>")
+@require_auth
+def api_get_monitor_dup3(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
     conn = db()
-    row = conn.execute(
-        """
-        select cc.* from captcha_challenges cc
-        where cc.id = ? and cc.workspace_id = ?
-        """,
-        (challenge_id, current_workspace_id()),
-    ).fetchone()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    conn.close()
     if not row:
         conn.close()
         return jsonify({"error": "Captcha challenge not found"}), 404
@@ -5414,31 +5467,29 @@ def api_submit_manual_captcha_solution(challenge_id: int):
 @app.post("/api/checkout/captcha-challenges/<int:challenge_id>/handoff-token")
 @require_auth
 def api_issue_captcha_handoff_token(challenge_id: int):
+    body = request.json or {}
+    ttl_seconds = body.get("ttl_seconds", 90)
+    try:
+        ttl_seconds = int(ttl_seconds)
+    except (TypeError, ValueError):
+        return jsonify({"error": "ttl_seconds must be an integer"}), 400
+    if ttl_seconds <= 0:
+        return jsonify({"error": "ttl_seconds must be greater than 0"}), 400
+
     conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    row = conn.execute(
+        "select * from captcha_challenges where id = ? and workspace_id = ?",
+        (challenge_id, current_workspace_id()),
+    ).fetchone()
     if not row:
         conn.close()
-        return jsonify({"error": "Monitor not found"}), 404
-    conn.execute(
-        "update monitors set enabled = ? where id = ? and workspace_id = ?",
-        (int(bool(enabled)), monitor_id, workspace_id),
-    )
-    conn.commit()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    return jsonify(dict(row))
-
-
-@app.delete("/api/monitors/<int:monitor_id>")
-@require_auth
-def api_delete_monitor(monitor_id: int):
-    workspace_id = get_workspace_id_for_request()
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    if not row:
+        return jsonify({"error": "Captcha challenge not found"}), 404
+    try:
+        token = checkout_captcha_service.issue_worker_handoff_token(conn, challenge_id=challenge_id)
+    except ValueError as exc:
         conn.close()
-        return jsonify({"error": "Monitor not found"}), 404
-    conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
+        return jsonify({"error": str(exc)}), 400
+    updated = conn.execute("select * from captcha_challenges where id = ?", (challenge_id,)).fetchone()
     conn.commit()
     conn.close()
     if updated:
@@ -5446,55 +5497,6 @@ def api_delete_monitor(monitor_id: int):
     return jsonify({"ok": True, "challenge_id": challenge_id, "handoff_token": token})
 
 
-@app.get("/api/checkout/tasks/<int:task_id>/attempts")
-@require_auth
-def api_checkout_task_attempts_dup4(task_id: int):
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    include_created = request.args.get("include_created", "").strip().lower() in {"1", "true", "yes"}
-    if include_created:
-        attempts = conn.execute(
-            """
-            select id, task_id, state, status, details, error_text, created_at
-            from checkout_attempts
-            where task_id = ?
-            order by id desc
-            """,
-            (task_id,),
-        ).fetchall()
-    else:
-        attempts = conn.execute(
-            """
-            select id, task_id, state, status, details, error_text, created_at
-            from checkout_attempts
-            where task_id = ?
-              and status != 'created'
-            order by id desc
-            """,
-            (task_id,),
-        ).fetchall()
-    conn.close()
-    return jsonify(
-        [
-            {
-                "id": a["id"],
-                "task_id": a["task_id"],
-                "state": a["state"],
-                "step": a["status"],
-                "details": parse_json_object(a["details"]),
-                "error": a["error_text"],
-                "created_at": a["created_at"],
-            }
-            for a in attempts
-        ]
-    )
-
-
-@app.get("/api/checkout/tasks/<int:task_id>/state")
 @app.post("/api/internal/checkout/captcha-handoffs/consume")
 @require_auth
 def api_consume_captcha_handoff_token():

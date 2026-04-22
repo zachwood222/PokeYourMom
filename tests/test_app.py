@@ -1802,6 +1802,1177 @@ def test_check_update_reports_update_available_when_upstream_is_newer(tmp_path, 
     monkeypatch.setenv("APP_VERSION", "1.2.3")
     monkeypatch.setenv("UPDATE_CHECK_URL", "https://updates.example.com/latest")
     monkeypatch.setenv("UPDATE_CHECK_TIMEOUT_SECONDS", "1.5")
+    monkeypatch.setenv("UPDATE_CHECK_AUTH_TOKEN", "Bearer test-update-token")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_resp = client.post(
+        "/api/webhooks",
+        json={"name": "Main", "webhook_url": "https://discord.com/api/webhooks/abc123"},
+        headers=_auth_headers(),
+    )
+    created = create_resp.get_json()
+    webhook_id = created["id"]
+
+    list_resp = client.get("/api/webhooks", headers=_auth_headers())
+
+    class DummyResponse:
+        status_code = 204
+        text = ""
+
+    class FakeReqResult:
+        def __init__(self, response):
+            self.response = response
+            self.error = None
+            self.telemetry = None
+
+    def fake_request(**kwargs):
+        captured["url"] = kwargs["url"]
+        captured["timeout"] = kwargs["timeout"]
+        captured["headers"] = kwargs["headers"]
+        return FakeReqResult(DummyResponse())
+
+    test_resp = client.post(f"/api/webhooks/{webhook_id}/test", headers=_auth_headers())
+    patch_resp = client.patch(
+        f"/api/webhooks/{webhook_id}",
+        json={"notify_failures": True},
+        headers=_auth_headers(),
+    )
+    delete_resp = client.delete(f"/api/webhooks/{webhook_id}", headers=_auth_headers())
+
+    assert create_resp.status_code == 201
+    assert list_resp.status_code == 200
+    assert any(row["id"] == webhook_id for row in list_resp.get_json())
+    assert test_resp.status_code == 200
+    assert patch_resp.status_code == 200
+    assert patch_resp.get_json()["notify_failures"] == 1
+    assert delete_resp.status_code == 200
+
+    assert resp.status_code == 200
+    assert payload["ok"] is True
+    assert payload["current_version"] == "1.2.3"
+    assert payload["latest_version"] == "1.2.4"
+    assert payload["update_available"] is True
+    assert "source_error" not in payload
+    assert captured == {
+        "url": "https://updates.example.com/latest",
+        "timeout": 1.5,
+        "headers": {
+            "User-Agent": "StockSentinel-UpdateCheck/1.0",
+            "Authorization": "Bearer test-update-token",
+        },
+    }
+
+def test_webhook_routes_block_cross_tenant_access(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    webhook_id = conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, created_at)
+        values (?, 'OtherHook', 'https://discord.com/api/webhooks/other', ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+    conn.commit()
+    conn.close()
+
+    assert resp.status_code == 403
+    assert resp.get_json()["error"] == "CAPTCHA verification failed"
+    assert resp.get_json()["reason"] == "provider_request_failed"
+def test_create_checkout_task_and_read_state_endpoint(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_monitor_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://www.walmart.com/ip/sku",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    assert create_monitor_resp.status_code == 201
+    monitor_id = create_monitor_resp.get_json()["id"]
+
+    create_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor_id,
+            "task_name": "Smoke task",
+            "task_config": {"profile": "profile-main", "account": "acc-primary", "payment": "visa-4242"},
+        },
+        headers=_auth_headers(),
+    )
+    assert create_resp.status_code == 201
+    created = create_resp.get_json()
+    task_id = created["id"]
+    assert created["monitor_id"] == monitor_id
+    assert created["current_state"] == "queued"
+
+    state_resp = client.get(f"/api/checkout/tasks/{task_id}/state", headers=_auth_headers())
+    assert state_resp.status_code == 200
+    state_payload = state_resp.get_json()
+    assert state_payload["task_id"] == task_id
+    assert state_payload["current_state"] == "queued"
+    assert state_payload["last_attempt"] is not None
+
+
+def test_checkout_task_lifecycle_start_pause_stop(tmp_path, monkeypatch):
+    monkeypatch.setenv("TASK_STEP_DELAY_SECONDS", "0.01")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_monitor_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://www.target.com/p/abc",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    assert create_monitor_resp.status_code == 201
+    monitor_id = create_monitor_resp.get_json()["id"]
+
+    create_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor_id,
+            "task_name": "Lifecycle task",
+            "task_config": {"profile": "default", "account": "acct-1", "payment": "amex"},
+        },
+        headers=_auth_headers(),
+    )
+    task_id = create_resp.get_json()["id"]
+
+    start_resp = client.post(f"/api/checkout/tasks/{task_id}/start", headers=_auth_headers())
+    assert start_resp.status_code == 200
+    assert start_resp.get_json()["task"]["current_state"] == "monitoring"
+
+    pause_resp = client.post(f"/api/checkout/tasks/{task_id}/pause", headers=_auth_headers())
+    assert pause_resp.status_code == 200
+    assert pause_resp.get_json()["task"]["current_state"] == "paused"
+
+    stop_resp = client.post(f"/api/checkout/tasks/{task_id}/stop", headers=_auth_headers())
+    assert stop_resp.status_code == 200
+    assert stop_resp.get_json()["task"]["current_state"] == "stopped"
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
+def test_api_routes_require_auth(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    monitor_id = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'target', 'https://example.com/other-monitor', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+    conn.commit()
+    conn.close()
+
+    read_resp = client.get(f"/api/monitors/{monitor_id}", headers=_auth_headers())
+    update_resp = client.patch(
+        f"/api/monitors/{monitor_id}",
+        json={"enabled": False},
+        headers=_auth_headers(),
+    )
+    check_resp = client.post(f"/api/monitors/{monitor_id}/check", headers=_auth_headers())
+    delete_resp = client.delete(f"/api/monitors/{monitor_id}", headers=_auth_headers())
+
+    assert read_resp.status_code == 404
+    assert update_resp.status_code == 404
+    assert check_resp.status_code == 404
+    assert delete_resp.status_code == 404
+
+    conn = app_module.db()
+    still_exists = conn.execute("select 1 from monitors where id = ?", (monitor_id,)).fetchone()
+    conn.close()
+    assert still_exists is not None
+
+
+def test_events_endpoint_scopes_results_to_authenticated_workspace(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+
+    own_monitor = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/own', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    ).lastrowid
+    other_monitor = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'target', 'https://example.com/other', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+        values
+        (?, 'in_stock', 'Own Event', 'https://example.com/own', 'walmart', 1999, ?, 'own-event'),
+        (?, 'in_stock', 'Other Event', 'https://example.com/other', 'target', 2999, ?, 'other-event')
+        """,
+        (own_monitor, app_module.utc_now(), other_monitor, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/events", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert len(payload) == 1
+    assert payload[0]["title"] == "Own Event"
+
+
+def test_events_endpoint_keeps_desc_limit_and_excludes_cross_tenant_rows(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    own_monitor_id = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/own-seed', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    ).lastrowid
+    other_monitor_id = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'target', 'https://example.com/other-seed', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+
+    for idx in range(1, 121):
+        conn.execute(
+            """
+            insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+            values (?, 'in_stock', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                own_monitor_id,
+                f"Own Event {idx}",
+                "https://example.com/own-seed",
+                "walmart",
+                1000 + idx,
+                app_module.utc_now(),
+                f"own-seq-{idx}",
+            ),
+        )
+        if idx <= 20:
+            conn.execute(
+                """
+                insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+                values (?, 'in_stock', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    other_monitor_id,
+                    f"Other Event {idx}",
+                    "https://example.com/other-seed",
+                    "target",
+                    2000 + idx,
+                    app_module.utc_now(),
+                    f"other-seq-{idx}",
+                ),
+            )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/events", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert len(payload) == 100
+    assert all(row["title"].startswith("Own Event ") for row in payload)
+    ids = [row["id"] for row in payload]
+    assert ids == sorted(ids, reverse=True)
+
+def test_stripe_webhook_alias_endpoint_accepts_signed_event(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    event = {
+        "id": "evt_alias_1",
+        "type": "customer.subscription.created",
+        "data": {
+            "object": {
+                "id": "sub_alias_1",
+                "customer": "cus_alias_1",
+                "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_end": int(time.time()) + 3600,
+                "metadata": {"workspace_id": "1"},
+                "plan": {"id": "pro_monthly", "interval": "month"},
+                "items": {"data": [{"price": {"lookup_key": "pro-monthly"}}]},
+            }
+        },
+    }
+    payload = json.dumps(event)
+    signature = _stripe_signature(payload, "whsec_test")
+
+    resp = client.post(
+        "/api/stripe/webhook",
+        data=payload,
+        headers={"Stripe-Signature": signature, "Content-Type": "application/json"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "noop": False}
+
+
+def test_stripe_webhook_syncs_workspace_plan_and_enforces_limits(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    now_ts = int(time.time())
+    created_event = {
+        "id": "evt_plan_created_1",
+        "type": "customer.subscription.created",
+        "data": {
+            "object": {
+                "id": "sub_plan_1",
+                "customer": "cus_plan_1",
+                "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_end": now_ts + 86400,
+                "metadata": {"workspace_id": "1"},
+                "plan": {"id": "price_pro_monthly", "interval": "month"},
+                "items": {"data": [{"price": {"lookup_key": "pro"}}]},
+            }
+        },
+    }
+    created_payload = json.dumps(created_event)
+    created_signature = _stripe_signature(created_payload, "whsec_test")
+    created_resp = client.post(
+        "/api/billing/stripe/webhook",
+        data=created_payload,
+        headers={"Stripe-Signature": created_signature, "Content-Type": "application/json"},
+    )
+    assert created_resp.status_code == 200
+
+    fast_poll_allowed = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://example.com/stripe-plan-pro",
+            "poll_interval_seconds": 10,
+        },
+        headers=_auth_headers(),
+    )
+    assert fast_poll_allowed.status_code == 201
+
+    deleted_event = {
+        "id": "evt_plan_deleted_1",
+        "type": "customer.subscription.deleted",
+        "data": {
+            "object": {
+                "id": "sub_plan_1",
+                "customer": "cus_plan_1",
+                "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_end": now_ts + 3600,
+                "metadata": {"workspace_id": "1"},
+                "plan": {"id": "price_pro_monthly", "interval": "month"},
+                "items": {"data": [{"price": {"lookup_key": "pro"}}]},
+            }
+        },
+    }
+    deleted_payload = json.dumps(deleted_event)
+    deleted_signature = _stripe_signature(deleted_payload, "whsec_test")
+    deleted_resp = client.post(
+        "/api/billing/stripe/webhook",
+        data=deleted_payload,
+        headers={"Stripe-Signature": deleted_signature, "Content-Type": "application/json"},
+    )
+    assert deleted_resp.status_code == 200
+
+    conn = app_module.db()
+    workspace = conn.execute("select plan, subscription_status, subscription_source from workspaces where id = 1").fetchone()
+    conn.close()
+    assert workspace["plan"] == "basic"
+    assert workspace["subscription_status"] == "canceled"
+    assert workspace["subscription_source"] == "stripe_webhook"
+
+    fast_poll_blocked = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://example.com/stripe-plan-basic",
+            "poll_interval_seconds": 10,
+        },
+        headers=_auth_headers(),
+    )
+    assert fast_poll_blocked.status_code == 400
+    assert "minimum poll interval is 20 seconds" in fast_poll_blocked.get_json()["error"]
+
+
+@pytest.mark.parametrize(
+    "event_type,input_status,expected_status",
+    [
+        ("customer.subscription.created", "active", "active"),
+        ("customer.subscription.updated", "past_due", "past_due"),
+        ("customer.subscription.deleted", "active", "canceled"),
+    ],
+)
+def test_stripe_webhook_handles_subscription_lifecycle_event_types(
+    tmp_path, monkeypatch, event_type, input_status, expected_status
+):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    event = {
+        "id": f"evt_lifecycle_{event_type.split('.')[-1]}",
+        "type": event_type,
+        "data": {
+            "object": {
+                "id": f"sub_{event_type.split('.')[-1]}",
+                "customer": "cus_lifecycle",
+                "status": input_status,
+                "cancel_at_period_end": False,
+                "current_period_end": int(time.time()) + 7200,
+                "metadata": {"workspace_id": "1"},
+                "plan": {"id": "pro_monthly", "interval": "month"},
+                "items": {"data": [{"price": {"lookup_key": "pro-monthly"}}]},
+            }
+        },
+    }
+    payload = json.dumps(event)
+    signature = _stripe_signature(payload, "whsec_test")
+
+    resp = client.post(
+        "/api/billing/stripe/webhook",
+        data=payload,
+        headers={"Stripe-Signature": signature, "Content-Type": "application/json"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "noop": False}
+    conn = app_module.db()
+    row = conn.execute(
+        "select status, cancel_at_period_end from billing_subscriptions where provider_subscription_id = ?",
+        (f"sub_{event_type.split('.')[-1]}",),
+    ).fetchone()
+    conn.close()
+
+    assert row["status"] == expected_status
+    assert row["cancel_at_period_end"] == (1 if event_type == "customer.subscription.deleted" else 0)
+
+
+def test_api_routes_allow_authenticated_requests_and_include_context(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, created_at)
+        values
+        (1, 'Own Hook', 'https://discord.com/api/webhooks/own', ?),
+        (?, 'Other Hook', 'https://discord.com/api/webhooks/other', ?)
+        """,
+        (app_module.utc_now(), other_workspace, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/webhooks", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert len(payload) == 1
+    assert payload[0]["name"] == "Own Hook"
+
+
+def test_workspace_usage_limits_returns_empty_usage_snapshot(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/workspace/usage-limits", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["plan"] == "basic"
+    assert payload["usage"]["monitor_count"] == 0
+    assert payload["usage"]["min_poll_interval_seconds"] is None
+    assert payload["limits"] == {"max_monitors": 20, "min_poll_seconds": 20}
+    assert payload["derived"]["monitor_slots_remaining"] == 20
+    assert payload["derived"]["monitor_limit_reached"] is False
+    assert payload["derived"]["poll_minimum_satisfied"] is True
+
+
+@pytest.mark.parametrize(
+    "plan,polls,expected_min_poll,expected_slots,expected_limit_reached,expected_poll_ok",
+    [
+        ("basic", [20, 30], 20, 18, False, True),
+        ("pro", [10, 25, 40], 10, 97, False, True),
+        ("team", [4, 8], 4, 498, False, False),
+    ],
+)
+def test_workspace_usage_limits_by_plan_and_usage_state(
+    tmp_path,
+    monkeypatch,
+    plan,
+    polls,
+    expected_min_poll,
+    expected_slots,
+    expected_limit_reached,
+    expected_poll_ok,
+):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    conn = app_module.db()
+    conn.execute("update workspaces set plan = ? where id = 1", (plan,))
+    for idx, poll in enumerate(polls):
+        conn.execute(
+            """
+            insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+            values (1, 'target', ?, ?, ?)
+            """,
+            (f"https://example.com/usage-{plan}-{idx}", poll, app_module.utc_now()),
+        )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/workspace/usage-limits", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["plan"] == plan
+    assert payload["usage"]["monitor_count"] == len(polls)
+    assert payload["usage"]["min_poll_interval_seconds"] == expected_min_poll
+    assert payload["limits"] == app_module.PLAN_LIMITS[plan]
+    assert payload["derived"]["monitor_slots_remaining"] == expected_slots
+    assert payload["derived"]["monitor_limit_reached"] is expected_limit_reached
+    assert payload["derived"]["poll_minimum_satisfied"] is expected_poll_ok
+
+
+def test_check_update_reports_update_available_when_upstream_is_newer(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_VERSION", "1.2.3")
+    monkeypatch.setenv("UPDATE_CHECK_URL", "https://updates.example.com/latest")
+    monkeypatch.setenv("UPDATE_CHECK_TIMEOUT_SECONDS", "1.5")
+    monkeypatch.setenv("UPDATE_CHECK_AUTH_TOKEN", "Bearer test-update-token")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_resp = client.post(
+        "/api/webhooks",
+        json={"name": "Main", "webhook_url": "https://discord.com/api/webhooks/abc123"},
+        headers=_auth_headers(),
+    )
+    created = create_resp.get_json()
+    webhook_id = created["id"]
+
+    list_resp = client.get("/api/webhooks", headers=_auth_headers())
+
+    class DummyResponse:
+        status_code = 204
+        text = ""
+
+    class FakeReqResult:
+        def __init__(self, response):
+            self.response = response
+            self.error = None
+            self.telemetry = None
+
+    def fake_request(**kwargs):
+        captured["url"] = kwargs["url"]
+        captured["timeout"] = kwargs["timeout"]
+        captured["headers"] = kwargs["headers"]
+        return FakeReqResult(DummyResponse())
+
+    test_resp = client.post(f"/api/webhooks/{webhook_id}/test", headers=_auth_headers())
+    patch_resp = client.patch(
+        f"/api/webhooks/{webhook_id}",
+        json={"notify_failures": True},
+        headers=_auth_headers(),
+    )
+    delete_resp = client.delete(f"/api/webhooks/{webhook_id}", headers=_auth_headers())
+
+    assert create_resp.status_code == 201
+    assert list_resp.status_code == 200
+    assert any(row["id"] == webhook_id for row in list_resp.get_json())
+    assert test_resp.status_code == 200
+    assert patch_resp.status_code == 200
+    assert patch_resp.get_json()["notify_failures"] == 1
+    assert delete_resp.status_code == 200
+
+
+def test_webhook_routes_block_cross_tenant_access(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    webhook_id = conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, created_at)
+        values (?, 'OtherHook', 'https://discord.com/api/webhooks/other', ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+    conn.commit()
+    conn.close()
+
+    assert resp.status_code == 403
+    assert resp.get_json()["error"] == "CAPTCHA verification failed"
+    assert resp.get_json()["reason"] == "provider_request_failed"
+def test_create_checkout_task_and_read_state_endpoint(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_monitor_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "walmart",
+            "product_url": "https://www.walmart.com/ip/sku",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    assert create_monitor_resp.status_code == 201
+    monitor_id = create_monitor_resp.get_json()["id"]
+
+    create_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor_id,
+            "task_name": "Smoke task",
+            "task_config": {"profile": "profile-main", "account": "acc-primary", "payment": "visa-4242"},
+        },
+        headers=_auth_headers(),
+    )
+    assert create_resp.status_code == 201
+    created = create_resp.get_json()
+    task_id = created["id"]
+    assert created["monitor_id"] == monitor_id
+    assert created["current_state"] == "queued"
+
+    state_resp = client.get(f"/api/checkout/tasks/{task_id}/state", headers=_auth_headers())
+    assert state_resp.status_code == 200
+    state_payload = state_resp.get_json()
+    assert state_payload["task_id"] == task_id
+    assert state_payload["current_state"] == "queued"
+    assert state_payload["last_attempt"] is not None
+
+
+def test_checkout_task_lifecycle_start_pause_stop(tmp_path, monkeypatch):
+    monkeypatch.setenv("TASK_STEP_DELAY_SECONDS", "0.01")
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    create_monitor_resp = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://www.target.com/p/abc",
+            "poll_interval_seconds": 20,
+        },
+        headers=_auth_headers(),
+    )
+    assert create_monitor_resp.status_code == 201
+    monitor_id = create_monitor_resp.get_json()["id"]
+
+    create_resp = client.post(
+        "/api/checkout/tasks",
+        json={
+            "monitor_id": monitor_id,
+            "task_name": "Lifecycle task",
+            "task_config": {"profile": "default", "account": "acct-1", "payment": "amex"},
+        },
+        headers=_auth_headers(),
+    )
+    task_id = create_resp.get_json()["id"]
+
+    start_resp = client.post(f"/api/checkout/tasks/{task_id}/start", headers=_auth_headers())
+    assert start_resp.status_code == 200
+    assert start_resp.get_json()["task"]["current_state"] == "monitoring"
+
+    pause_resp = client.post(f"/api/checkout/tasks/{task_id}/pause", headers=_auth_headers())
+    assert pause_resp.status_code == 200
+    assert pause_resp.get_json()["task"]["current_state"] == "paused"
+
+    stop_resp = client.post(f"/api/checkout/tasks/{task_id}/stop", headers=_auth_headers())
+    assert stop_resp.status_code == 200
+    assert stop_resp.get_json()["task"]["current_state"] == "stopped"
+
+    assert tables == {"users", "workspace_members"}
+    assert users_count == 1
+    assert members_count == 1
+
+
+def test_api_routes_require_auth(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    monitor_id = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'target', 'https://example.com/other-monitor', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+    conn.commit()
+    conn.close()
+
+    read_resp = client.get(f"/api/monitors/{monitor_id}", headers=_auth_headers())
+    update_resp = client.patch(
+        f"/api/monitors/{monitor_id}",
+        json={"enabled": False},
+        headers=_auth_headers(),
+    )
+    check_resp = client.post(f"/api/monitors/{monitor_id}/check", headers=_auth_headers())
+    delete_resp = client.delete(f"/api/monitors/{monitor_id}", headers=_auth_headers())
+
+    assert read_resp.status_code == 404
+    assert update_resp.status_code == 404
+    assert check_resp.status_code == 404
+    assert delete_resp.status_code == 404
+
+    conn = app_module.db()
+    still_exists = conn.execute("select 1 from monitors where id = ?", (monitor_id,)).fetchone()
+    conn.close()
+    assert still_exists is not None
+
+
+def test_events_endpoint_scopes_results_to_authenticated_workspace(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+
+    own_monitor = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/own', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    ).lastrowid
+    other_monitor = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'target', 'https://example.com/other', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+        values
+        (?, 'in_stock', 'Own Event', 'https://example.com/own', 'walmart', 1999, ?, 'own-event'),
+        (?, 'in_stock', 'Other Event', 'https://example.com/other', 'target', 2999, ?, 'other-event')
+        """,
+        (own_monitor, app_module.utc_now(), other_monitor, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/events", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["ok"] is True
+    assert payload["current_version"] == "1.2.3"
+    assert payload["latest_version"] == "1.2.4"
+    assert payload["update_available"] is True
+    assert "source_error" not in payload
+    assert captured == {
+        "url": "https://updates.example.com/latest",
+        "timeout": 1.5,
+        "headers": {
+            "User-Agent": "StockSentinel-UpdateCheck/1.0",
+            "Authorization": "Bearer test-update-token",
+        },
+    }
+
+
+def test_events_endpoint_keeps_desc_limit_and_excludes_cross_tenant_rows(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    own_monitor_id = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/own-seed', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    ).lastrowid
+    other_monitor_id = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'target', 'https://example.com/other-seed', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+
+    for idx in range(1, 121):
+        conn.execute(
+            """
+            insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+            values (?, 'in_stock', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                own_monitor_id,
+                f"Own Event {idx}",
+                "https://example.com/own-seed",
+                "walmart",
+                1000 + idx,
+                app_module.utc_now(),
+                f"own-seq-{idx}",
+            ),
+        )
+        if idx <= 20:
+            conn.execute(
+                """
+                insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+                values (?, 'in_stock', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    other_monitor_id,
+                    f"Other Event {idx}",
+                    "https://example.com/other-seed",
+                    "target",
+                    2000 + idx,
+                    app_module.utc_now(),
+                    f"other-seq-{idx}",
+                ),
+            )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/events", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert len(payload) == 100
+    assert all(row["title"].startswith("Own Event ") for row in payload)
+    ids = [row["id"] for row in payload]
+    assert ids == sorted(ids, reverse=True)
+
+def test_stripe_webhook_alias_endpoint_accepts_signed_event(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    event = {
+        "id": "evt_alias_1",
+        "type": "customer.subscription.created",
+        "data": {
+            "object": {
+                "id": "sub_alias_1",
+                "customer": "cus_alias_1",
+                "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_end": int(time.time()) + 3600,
+                "metadata": {"workspace_id": "1"},
+                "plan": {"id": "pro_monthly", "interval": "month"},
+                "items": {"data": [{"price": {"lookup_key": "pro-monthly"}}]},
+            }
+        },
+    }
+    payload = json.dumps(event)
+    signature = _stripe_signature(payload, "whsec_test")
+
+    resp = client.post(
+        "/api/stripe/webhook",
+        data=payload,
+        headers={"Stripe-Signature": signature, "Content-Type": "application/json"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "noop": False}
+
+
+def test_stripe_webhook_syncs_workspace_plan_and_enforces_limits(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    now_ts = int(time.time())
+    created_event = {
+        "id": "evt_plan_created_1",
+        "type": "customer.subscription.created",
+        "data": {
+            "object": {
+                "id": "sub_plan_1",
+                "customer": "cus_plan_1",
+                "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_end": now_ts + 86400,
+                "metadata": {"workspace_id": "1"},
+                "plan": {"id": "price_pro_monthly", "interval": "month"},
+                "items": {"data": [{"price": {"lookup_key": "pro"}}]},
+            }
+        },
+    }
+    created_payload = json.dumps(created_event)
+    created_signature = _stripe_signature(created_payload, "whsec_test")
+    created_resp = client.post(
+        "/api/billing/stripe/webhook",
+        data=created_payload,
+        headers={"Stripe-Signature": created_signature, "Content-Type": "application/json"},
+    )
+    assert created_resp.status_code == 200
+
+    fast_poll_allowed = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://example.com/stripe-plan-pro",
+            "poll_interval_seconds": 10,
+        },
+        headers=_auth_headers(),
+    )
+    assert fast_poll_allowed.status_code == 201
+
+    deleted_event = {
+        "id": "evt_plan_deleted_1",
+        "type": "customer.subscription.deleted",
+        "data": {
+            "object": {
+                "id": "sub_plan_1",
+                "customer": "cus_plan_1",
+                "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_end": now_ts + 3600,
+                "metadata": {"workspace_id": "1"},
+                "plan": {"id": "price_pro_monthly", "interval": "month"},
+                "items": {"data": [{"price": {"lookup_key": "pro"}}]},
+            }
+        },
+    }
+    deleted_payload = json.dumps(deleted_event)
+    deleted_signature = _stripe_signature(deleted_payload, "whsec_test")
+    deleted_resp = client.post(
+        "/api/billing/stripe/webhook",
+        data=deleted_payload,
+        headers={"Stripe-Signature": deleted_signature, "Content-Type": "application/json"},
+    )
+    assert deleted_resp.status_code == 200
+
+    conn = app_module.db()
+    workspace = conn.execute("select plan, subscription_status, subscription_source from workspaces where id = 1").fetchone()
+    conn.close()
+    assert workspace["plan"] == "basic"
+    assert workspace["subscription_status"] == "canceled"
+    assert workspace["subscription_source"] == "stripe_webhook"
+
+    fast_poll_blocked = client.post(
+        "/api/monitors",
+        json={
+            "retailer": "target",
+            "product_url": "https://example.com/stripe-plan-basic",
+            "poll_interval_seconds": 10,
+        },
+        headers=_auth_headers(),
+    )
+    assert fast_poll_blocked.status_code == 400
+    assert "minimum poll interval is 20 seconds" in fast_poll_blocked.get_json()["error"]
+
+
+@pytest.mark.parametrize(
+    "event_type,input_status,expected_status",
+    [
+        ("customer.subscription.created", "active", "active"),
+        ("customer.subscription.updated", "past_due", "past_due"),
+        ("customer.subscription.deleted", "active", "canceled"),
+    ],
+)
+def test_stripe_webhook_handles_subscription_lifecycle_event_types(
+    tmp_path, monkeypatch, event_type, input_status, expected_status
+):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    event = {
+        "id": f"evt_lifecycle_{event_type.split('.')[-1]}",
+        "type": event_type,
+        "data": {
+            "object": {
+                "id": f"sub_{event_type.split('.')[-1]}",
+                "customer": "cus_lifecycle",
+                "status": input_status,
+                "cancel_at_period_end": False,
+                "current_period_end": int(time.time()) + 7200,
+                "metadata": {"workspace_id": "1"},
+                "plan": {"id": "pro_monthly", "interval": "month"},
+                "items": {"data": [{"price": {"lookup_key": "pro-monthly"}}]},
+            }
+        },
+    }
+    payload = json.dumps(event)
+    signature = _stripe_signature(payload, "whsec_test")
+
+    resp = client.post(
+        "/api/billing/stripe/webhook",
+        data=payload,
+        headers={"Stripe-Signature": signature, "Content-Type": "application/json"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "noop": False}
+    conn = app_module.db()
+    row = conn.execute(
+        "select status, cancel_at_period_end from billing_subscriptions where provider_subscription_id = ?",
+        (f"sub_{event_type.split('.')[-1]}",),
+    ).fetchone()
+    conn.close()
+
+    assert row["status"] == expected_status
+    assert row["cancel_at_period_end"] == (1 if event_type == "customer.subscription.deleted" else 0)
+
+
+def test_api_routes_allow_authenticated_requests_and_include_context(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, created_at)
+        values
+        (1, 'Own Hook', 'https://discord.com/api/webhooks/own', ?),
+        (?, 'Other Hook', 'https://discord.com/api/webhooks/other', ?)
+        """,
+        (app_module.utc_now(), other_workspace, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/webhooks", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert len(payload) == 1
+    assert payload[0]["name"] == "Own Hook"
+
+
+def test_workspace_usage_limits_returns_empty_usage_snapshot(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/workspace/usage-limits", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["plan"] == "basic"
+    assert payload["usage"]["monitor_count"] == 0
+    assert payload["usage"]["min_poll_interval_seconds"] is None
+    assert payload["limits"] == {"max_monitors": 20, "min_poll_seconds": 20}
+    assert payload["derived"]["monitor_slots_remaining"] == 20
+    assert payload["derived"]["monitor_limit_reached"] is False
+    assert payload["derived"]["poll_minimum_satisfied"] is True
+
+
+@pytest.mark.parametrize(
+    "plan,polls,expected_min_poll,expected_slots,expected_limit_reached,expected_poll_ok",
+    [
+        ("basic", [20, 30], 20, 18, False, True),
+        ("pro", [10, 25, 40], 10, 97, False, True),
+        ("team", [4, 8], 4, 498, False, False),
+    ],
+)
+def test_workspace_usage_limits_by_plan_and_usage_state(
+    tmp_path,
+    monkeypatch,
+    plan,
+    polls,
+    expected_min_poll,
+    expected_slots,
+    expected_limit_reached,
+    expected_poll_ok,
+):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    conn = app_module.db()
+    conn.execute("update workspaces set plan = ? where id = 1", (plan,))
+    for idx, poll in enumerate(polls):
+        conn.execute(
+            """
+            insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+            values (1, 'target', ?, ?, ?)
+            """,
+            (f"https://example.com/usage-{plan}-{idx}", poll, app_module.utc_now()),
+        )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/workspace/usage-limits", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["plan"] == plan
+    assert payload["usage"]["monitor_count"] == len(polls)
+    assert payload["usage"]["min_poll_interval_seconds"] == expected_min_poll
+    assert payload["limits"] == app_module.PLAN_LIMITS[plan]
+    assert payload["derived"]["monitor_slots_remaining"] == expected_slots
+    assert payload["derived"]["monitor_limit_reached"] is expected_limit_reached
+    assert payload["derived"]["poll_minimum_satisfied"] is expected_poll_ok
+
+
+def test_check_update_reports_update_available_when_upstream_is_newer(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_VERSION", "1.2.3")
+    monkeypatch.setenv("UPDATE_CHECK_URL", "https://updates.example.com/latest")
+    monkeypatch.setenv("UPDATE_CHECK_TIMEOUT_SECONDS", "1.5")
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
 
@@ -2741,7 +3912,6 @@ def test_init_db_creates_auth_tables_and_is_idempotent(tmp_path, monkeypatch):
     assert members_count == 1
 
 
-def test_api_routes_require_auth(tmp_path, monkeypatch):
 def test_webhook_routes_allow_authorized_workspace_access(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -7230,6 +8400,262 @@ def test_ops_metrics_returns_expected_schema_and_non_negative_counts(tmp_path, m
     assert payload["webhook_failed_total"] == 1
 
 
+def test_ops_metrics_returns_expected_schema_and_non_negative_counts(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    checked_monitor_id = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, enabled, last_checked_at, failure_streak, created_at
+        ) values (1, 'walmart', 'https://example.com/checked', 20, 1, ?, 1, ?)
+        """,
+        (app_module.utc_now(), app_module.utc_now()),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, created_at)
+        values (1, 'Main', 'https://discord.com/api/webhooks/main', ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    webhook_id = conn.execute("select id from webhooks where name = 'Main'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+        values (?, 'in_stock', 'seed', 'https://example.com/checked', 'walmart', 1200, ?, 'metrics-event-1')
+        """,
+        (checked_monitor_id, app_module.utc_now()),
+    )
+    event_id = conn.execute("select id from events where dedupe_key = 'metrics-event-1'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into deliveries(event_id, webhook_id, status, response_code, response_body, delivered_at)
+        values
+        (?, ?, 'sent', 204, '', ?),
+        (?, ?, 'failed', 500, 'oops', ?)
+        """,
+        (event_id, webhook_id, app_module.utc_now(), event_id, webhook_id, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ops/metrics", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert set(payload.keys()) == {
+        "checks_total",
+        "checks_failed_total",
+        "alerts_created_total",
+        "webhook_sent_total",
+        "webhook_failed_total",
+    }
+    assert all(isinstance(payload[key], int) for key in payload)
+    assert all(payload[key] >= 0 for key in payload)
+    assert payload["checks_total"] == 1
+    assert payload["checks_failed_total"] == 1
+    assert payload["alerts_created_total"] == 1
+    assert payload["webhook_sent_total"] == 1
+    assert payload["webhook_failed_total"] == 1
+
+
+def test_monitor_failure_trends_returns_seeded_counts(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    now = datetime.now(timezone.utc)
+
+    conn = app_module.db()
+    own_monitor_with_failures = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/with-failures', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    ).lastrowid
+    own_monitor_without_failures = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'target', 'https://example.com/no-failures', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into monitor_failures(monitor_id, workspace_id, error_text, failed_at)
+        values (?, 1, 'err-1', ?), (?, 1, 'err-2', ?)
+        """,
+        (
+            own_monitor_with_failures,
+            (now - timedelta(hours=3)).isoformat(),
+            own_monitor_with_failures,
+            (now - timedelta(days=2)).isoformat(),
+        ),
+    )
+
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    other_monitor_id = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'bestbuy', 'https://example.com/other', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into monitor_failures(monitor_id, workspace_id, error_text, failed_at)
+        values (?, ?, 'other-err', ?)
+        """,
+        (other_monitor_id, other_workspace, (now - timedelta(hours=1)).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ops/monitor-failure-trends", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert set(payload.keys()) == {"trends"}
+    trends = sorted(payload["trends"], key=lambda row: row["monitor_id"])
+    assert trends == [
+        {"monitor_id": own_monitor_with_failures, "failures_last_24h": 1, "failures_last_7d": 2},
+        {"monitor_id": own_monitor_without_failures, "failures_last_24h": 0, "failures_last_7d": 0},
+    ]
+
+
+def test_monitor_failure_trends_includes_zero_counts_and_excludes_other_workspaces(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    now = datetime.now(timezone.utc)
+
+    conn = app_module.db()
+    own_monitor_with_failures = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'walmart', 'https://example.com/with-failures', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    ).lastrowid
+    own_monitor_without_failures = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'target', 'https://example.com/no-failures', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into monitor_failures(monitor_id, workspace_id, error_text, failed_at)
+        values (?, 1, 'err-1', ?), (?, 1, 'err-2', ?)
+        """,
+        (
+            own_monitor_with_failures,
+            (now - timedelta(hours=3)).isoformat(),
+            own_monitor_with_failures,
+            (now - timedelta(days=2)).isoformat(),
+        ),
+    )
+
+    conn.execute(
+        "insert into workspaces(name, plan, created_at) values ('Other', 'basic', ?)",
+        (app_module.utc_now(),),
+    )
+    other_workspace = conn.execute("select id from workspaces where name = 'Other'").fetchone()["id"]
+    other_monitor_id = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (?, 'bestbuy', 'https://example.com/other', 20, ?)
+        """,
+        (other_workspace, app_module.utc_now()),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into monitor_failures(monitor_id, workspace_id, error_text, failed_at)
+        values (?, ?, 'other-err', ?)
+        """,
+        (other_monitor_id, other_workspace, (now - timedelta(hours=1)).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ops/monitor-failure-trends", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert set(payload.keys()) == {"trends"}
+    trends = sorted(payload["trends"], key=lambda row: row["monitor_id"])
+    assert trends == [
+        {"monitor_id": own_monitor_with_failures, "failures_last_24h": 1, "failures_last_7d": 2},
+        {"monitor_id": own_monitor_without_failures, "failures_last_24h": 0, "failures_last_7d": 0},
+    ]
+
+
+def test_ops_metrics_returns_expected_schema_and_non_negative_counts(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    conn = app_module.db()
+    checked_monitor_id = conn.execute(
+        """
+        insert into monitors(
+            workspace_id, retailer, product_url, poll_interval_seconds, enabled, last_checked_at, failure_streak, created_at
+        ) values (1, 'walmart', 'https://example.com/checked', 20, 1, ?, 1, ?)
+        """,
+        (app_module.utc_now(), app_module.utc_now()),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into webhooks(workspace_id, name, webhook_url, created_at)
+        values (1, 'Main', 'https://discord.com/api/webhooks/main', ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    webhook_id = conn.execute("select id from webhooks where name = 'Main'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into events(monitor_id, event_type, title, product_url, retailer, price_cents, event_time, dedupe_key)
+        values (?, 'in_stock', 'seed', 'https://example.com/checked', 'walmart', 1200, ?, 'metrics-event-1')
+        """,
+        (checked_monitor_id, app_module.utc_now()),
+    )
+    event_id = conn.execute("select id from events where dedupe_key = 'metrics-event-1'").fetchone()["id"]
+    conn.execute(
+        """
+        insert into deliveries(event_id, webhook_id, status, response_code, response_body, delivered_at)
+        values
+        (?, ?, 'sent', 204, '', ?),
+        (?, ?, 'failed', 500, 'oops', ?)
+        """,
+        (event_id, webhook_id, app_module.utc_now(), event_id, webhook_id, app_module.utc_now()),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/ops/metrics", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert set(payload.keys()) == {
+        "checks_total",
+        "checks_failed_total",
+        "alerts_created_total",
+        "webhook_sent_total",
+        "webhook_failed_total",
+    }
+    assert all(isinstance(payload[key], int) for key in payload)
+    assert all(payload[key] >= 0 for key in payload)
+    assert payload["checks_total"] == 1
+    assert payload["checks_failed_total"] == 1
+    assert payload["alerts_created_total"] == 1
+    assert payload["webhook_sent_total"] == 1
+    assert payload["webhook_failed_total"] == 1
+
+
 def test_monitor_failure_trends_returns_seeded_counts(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
@@ -7633,6 +9059,24 @@ def test_bestbuy_parser_handles_pickup_available_and_sold_out_online_markers(tmp
     assert sold_out_online.parser_confidence == 0.98
 
 
+def test_bestbuy_parser_handles_pickup_available_and_sold_out_online_markers(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    pickup_available_html = load_fixture_html("bestbuy", "in_stock_pickup_available")
+    sold_out_online_html = load_fixture_html("bestbuy", "out_of_stock_sold_out_online")
+
+    pickup_available = app_module.evaluate_page(pickup_available_html, retailer="bestbuy")
+    sold_out_online = app_module.evaluate_page(sold_out_online_html, retailer="bestbuy")
+
+    assert pickup_available.in_stock is True
+    assert pickup_available.price_cents == 5499
+    assert pickup_available.availability_reason == "bestbuy_marker_in_stock"
+    assert pickup_available.parser_confidence == 0.98
+    assert sold_out_online.in_stock is False
+    assert sold_out_online.price_cents == 5499
+    assert sold_out_online.availability_reason == "bestbuy_marker_out_of_stock"
+    assert sold_out_online.parser_confidence == 0.98
+
+
 def test_target_and_bestbuy_parsers_keep_default_fallback_for_unknown_markup(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     target_unknown_html = load_fixture_html("target", "ambiguous")
@@ -7665,6 +9109,49 @@ def test_queue_claim_due_job_recovers_from_stale_lock(tmp_path, monkeypatch):
     assert claimed.id == cur.lastrowid
     assert row["status"] == "running"
     assert row["locked_by"] == "new-worker"
+
+def test_bestbuy_parser_handles_pickup_available_and_sold_out_online_markers(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    pickup_available_html = load_fixture_html("bestbuy", "in_stock_pickup_available")
+    sold_out_online_html = load_fixture_html("bestbuy", "out_of_stock_sold_out_online")
+
+    pickup_available = app_module.evaluate_page(pickup_available_html, retailer="bestbuy")
+    sold_out_online = app_module.evaluate_page(sold_out_online_html, retailer="bestbuy")
+
+    assert pickup_available.in_stock is True
+    assert pickup_available.price_cents == 5499
+    assert pickup_available.availability_reason == "bestbuy_marker_in_stock"
+    assert pickup_available.parser_confidence == 0.98
+    assert sold_out_online.in_stock is False
+    assert sold_out_online.price_cents == 5499
+    assert sold_out_online.availability_reason == "bestbuy_marker_out_of_stock"
+    assert sold_out_online.parser_confidence == 0.98
+
+
+def test_target_and_bestbuy_parsers_keep_default_fallback_for_unknown_markup(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    unknown_html = load_fixture_html("target", "unknown_markup")
+
+    target_result = app_module.evaluate_page(unknown_html, retailer="target")
+    default_result = app_module.default_parser(unknown_html)
+
+    assert target_result.in_stock == default_result.in_stock
+    assert target_result.status_text == default_result.status_text
+    assert target_result.availability_reason == default_result.availability_reason
+    assert target_result.parser_confidence == default_result.parser_confidence
+
+
+def test_bestbuy_parser_uses_default_fallback_for_unknown_markup_fixture(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    unknown_html = load_fixture_html("bestbuy", "unknown_markup")
+
+    bestbuy_result = app_module.evaluate_page(unknown_html, retailer="bestbuy")
+    default_result = app_module.default_parser(unknown_html)
+
+    assert bestbuy_result.in_stock == default_result.in_stock
+    assert bestbuy_result.status_text == default_result.status_text
+    assert bestbuy_result.availability_reason == default_result.availability_reason
+    assert bestbuy_result.parser_confidence == default_result.parser_confidence
 
 
 def test_target_parser_uses_default_fallback_for_unknown_markup_fixture(tmp_path, monkeypatch):
@@ -7710,6 +9197,144 @@ def _seed_monitor(app_module):
     assert resp.status_code == 200
     assert payload["availability_reason"] == "fallback_unknown"
     assert payload["parser_confidence"] == 0.2
+
+
+def test_check_monitor_api_normalizes_parser_confidence_for_response(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    monitor_id = _seed_monitor(app_module)
+    expected = app_module.MonitorResult(
+        in_stock=True,
+        price_cents=2499,
+        title="Pokemon Product",
+        status_text="in_stock",
+        availability_reason="marker_in_stock",
+        parser_confidence=1.7,
+        keyword_matched=True,
+    )
+
+    monkeypatch.setattr(app_module, "fetch_monitor", lambda monitor: expected)
+
+    resp = client.post(f"/api/monitors/{monitor_id}/check", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["availability_reason"] == "marker_in_stock"
+    assert payload["parser_confidence"] == 1.0
+
+
+def test_emit_monitor_events_normalizes_parser_confidence(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    monitor_id = _seed_monitor(app_module)
+    conn = app_module.db()
+    monitor = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
+    conn.close()
+    emitted = []
+
+    monkeypatch.setattr(app_module.socketio, "emit", lambda event, payload: emitted.append((event, payload)))
+
+    result = app_module.MonitorResult(
+        in_stock=False,
+        price_cents=9999,
+        title="Pokemon Product",
+        status_text="out_or_unknown",
+        availability_reason="marker_out_of_stock",
+        parser_confidence=float("nan"),
+    )
+
+    app_module.emit_monitor_events(monitor, result, eligible=False)
+
+def test_target_parser_uses_default_fallback_for_unknown_markup_fixture(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    unknown_html = load_fixture_html("target", "unknown_markup")
+
+    target_result = app_module.evaluate_page(unknown_html, retailer="target")
+    default_result = app_module.default_parser(unknown_html)
+
+    assert target_result.in_stock == default_result.in_stock
+    assert target_result.status_text == default_result.status_text
+    assert target_result.availability_reason == default_result.availability_reason
+    assert target_result.parser_confidence == default_result.parser_confidence
+
+
+def test_bestbuy_parser_uses_default_fallback_for_unknown_markup_fixture(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    unknown_html = load_fixture_html("bestbuy", "unknown_markup")
+
+    bestbuy_result = app_module.evaluate_page(unknown_html, retailer="bestbuy")
+    default_result = app_module.default_parser(unknown_html)
+
+    assert bestbuy_result.in_stock == default_result.in_stock
+    assert bestbuy_result.status_text == default_result.status_text
+    assert bestbuy_result.availability_reason == default_result.availability_reason
+    assert bestbuy_result.parser_confidence == default_result.parser_confidence
+
+
+def _seed_monitor(app_module):
+    conn = app_module.db()
+    cur = conn.execute(
+        """
+        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, created_at)
+        values (1, 'target', 'https://example.com/item', 20, ?)
+        """,
+        (app_module.utc_now(),),
+    )
+    conn.commit()
+    monitor_id = cur.lastrowid
+    conn.close()
+    return monitor_id
+
+
+def test_check_monitor_api_normalizes_parser_confidence_for_response(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    monitor_id = _seed_monitor(app_module)
+    expected = app_module.MonitorResult(
+        in_stock=True,
+        price_cents=2499,
+        title="Pokemon Product",
+        status_text="in_stock",
+        availability_reason="marker_in_stock",
+        parser_confidence=1.7,
+        keyword_matched=True,
+    )
+
+    monkeypatch.setattr(app_module, "fetch_monitor", lambda monitor: expected)
+
+    resp = client.post(f"/api/monitors/{monitor_id}/check", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload["availability_reason"] == "marker_in_stock"
+    assert payload["parser_confidence"] == 1.0
+
+
+def test_emit_monitor_events_normalizes_parser_confidence(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    monitor_id = _seed_monitor(app_module)
+    conn = app_module.db()
+    monitor = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
+    conn.close()
+    emitted = []
+
+    monkeypatch.setattr(app_module.socketio, "emit", lambda event, payload: emitted.append((event, payload)))
+
+    result = app_module.MonitorResult(
+        in_stock=False,
+        price_cents=9999,
+        title="Pokemon Product",
+        status_text="out_or_unknown",
+        availability_reason="marker_out_of_stock",
+        parser_confidence=float("nan"),
+    )
+
+    app_module.emit_monitor_events(monitor, result, eligible=False)
+
+    assert emitted
+    event, payload = emitted[0]
+    assert event == "monitor_update"
+    assert payload["availability_reason"] == "marker_out_of_stock"
+    assert payload["parser_confidence"] is None
 
 
 def test_check_monitor_api_normalizes_parser_confidence_for_response(tmp_path, monkeypatch):
@@ -8066,3 +9691,68 @@ def test_monitor_assist_apply_updates_monitor_and_logs_task_history(tmp_path, mo
     assert monitor_row["product_url"] == "https://www.pokemoncenter.com/product/12-34567-890"
     assert attempt_row["step"] == "PID updated from monitor assist"
     assert attempt_row["error_text"] == "PID updated from monitor assist"
+
+
+def test_dashboard_commerce_returns_expected_aggregates(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+    now_iso = app_module.utc_now()
+
+    conn = app_module.db()
+    monitor_id = conn.execute(
+        """
+        insert into monitors(
+            workspace_id,
+            retailer,
+            product_url,
+            poll_interval_seconds,
+            last_price_cents,
+            created_at
+        ) values (?, ?, ?, ?, ?, ?)
+        """,
+        (1, "target", "https://example.com/product", 20, 2599, now_iso),
+    ).lastrowid
+    conn.execute(
+        """
+        insert into checkout_tasks(
+            workspace_id,
+            monitor_id,
+            task_name,
+            task_config,
+            current_state,
+            created_at,
+            updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (1, monitor_id, "Pokemon Elite Trainer Box", json.dumps({"quantity": 2}), "success", now_iso, now_iso),
+    )
+    conn.execute(
+        """
+        insert into checkout_tasks(
+            workspace_id,
+            monitor_id,
+            task_name,
+            task_config,
+            current_state,
+            created_at,
+            updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (1, monitor_id, "Pokemon Elite Trainer Box", json.dumps({"quantity": 1}), "decline", now_iso, now_iso),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/api/dashboard/commerce", headers=_auth_headers())
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["checkouts_total"] == 1
+    assert payload["declines_total"] == 1
+    assert payload["spent_total_cents"] == 5198
+    assert payload["average_order_value_cents"] == 5198
+    assert payload["success_rate"] == 0.5
+    assert payload["sites_checkouts"] == [{"site": "target", "checkouts": 1}]
+    assert payload["amount_spent_daily"] == [{"date": now_iso[:10], "spent_cents": 5198}]
+    assert len(payload["product_orders"]) == 1
+    assert payload["product_orders"][0]["product_name"] == "Pokemon Elite Trainer Box"
