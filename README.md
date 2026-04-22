@@ -32,14 +32,20 @@ Run the same commands used in CI:
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 pip install pytest ruff
-ruff check tests
-python -m compileall -q app.py tests
-pytest -q tests
-pytest -q tests/test_billing_schema.py::test_init_db_creates_billing_tables_and_columns
-pytest -q tests/test_app.py::test_init_db_migrates_existing_monitors_table_with_msrp_column
+./scripts/ci_quality_gates.sh
 ```
 
-The last two commands are explicit migration-safety checks for:
+Equivalent expanded commands:
+
+```bash
+ruff check tests/test_billing_schema.py tests/test_parser_fixtures.py tests/parser_fixture_harness.py retailers network
+python -m compileall -q app.py retailers network tests/test_billing_schema.py tests/test_parser_fixtures.py tests/parser_fixture_harness.py
+pytest -q -ra tests
+pytest -q -ra tests/test_billing_schema.py::test_init_db_creates_billing_tables_and_columns
+pytest -q -ra tests/test_app.py::test_init_db_migrates_existing_monitors_table_with_msrp_column
+```
+
+The migration-safety checks are explicit guards for:
 
 - fresh database creation via `init_db()`,
 - legacy `monitors` schema upgrade behavior (including `msrp_cents` migration).

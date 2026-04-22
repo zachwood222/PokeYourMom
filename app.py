@@ -3464,6 +3464,75 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
+def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    config_raw = payload.get("task_config")
+    try:
+        payload["task_config"] = json.loads(config_raw) if config_raw else {}
+    except (TypeError, json.JSONDecodeError):
+        payload["task_config"] = {}
+    return payload
+
+
+def redact_webhook_url(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 12:
+        return "***"
+    return f"{value[:8]}...{value[-4:]}"
+
+
+def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    confidence = float(value)
+    if math.isnan(confidence) or math.isinf(confidence):
+        return None
+    return min(1.0, max(0.0, confidence))
+
+
+def parser_metadata_payload(result: MonitorResult) -> dict[str, Any]:
+    return {
+        "availability_reason": result.availability_reason,
+        "parser_confidence": normalize_parser_confidence(result.parser_confidence),
+    }
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
         insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
         values (?, ?, ?, ?, ?, ?, ?)
         """,
@@ -4758,9 +4827,16 @@ def get_monitor_for_workspace(
     ).fetchone()
 
 
+def validate_monitor_retailer_and_url(retailer: str, url: str) -> None:
+    if retailer not in SUPPORTED_RETAILERS:
+        raise ValueError(f"Unsupported retailer '{retailer}'")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise ValueError("product_url must be http(s)")
+
+
 @app.get("/api/monitors/<int:monitor_id>")
 @require_auth
-def api_get_monitor_dup2(monitor_id: int):
+def api_get_monitor(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
     row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
@@ -5037,24 +5113,7 @@ def api_create_monitor():
         msrp_cents = body.get("msrp_cents")
         if msrp_cents is not None:
             msrp_cents = int(msrp_cents)
-        proxy_url = (body.get("proxy_url") or "").strip() or None
-        session_task_key = (body.get("session_task_key") or "").strip() or None
-        session_metadata = _validate_json_object(body.get("session_metadata"), field_name="session_metadata")
-        behavior_metadata = _validate_behavior_policy(body.get("behavior_metadata"))
-        if retailer not in SUPPORTED_RETAILERS:
-            raise ValueError(f"Unsupported retailer '{retailer}'")
-        if category not in SUPPORTED_MONITOR_CATEGORIES:
-            raise ValueError(f"Unsupported category '{category}'")
-        if category not in RETAILER_CATEGORY_SUPPORT.get(retailer, set()):
-            raise ValueError(f"Retailer '{retailer}' does not support category '{category}'")
-        if retailer == "pokemoncenter":
-            url, normalized_products = _resolve_monitor_input(url)
-            if url == "placeholder":
-                raise ValueError("placeholder is not allowed when creating monitors")
-        elif not (url.startswith("http://") or url.startswith("https://")):
-            raise ValueError("product_url must be http(s)")
-        if session_task_key and len(session_task_key) > 80:
-            raise ValueError("session_task_key must be <= 80 chars")
+        validate_monitor_retailer_and_url(retailer, url)
 
         enforce_plan_limits(current_workspace_id(), poll_interval)
     except (KeyError, ValueError, MonitorInputValidationError) as exc:
