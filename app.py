@@ -3681,6 +3681,7 @@ def _checkout_step_payment(
     fail_step = str(config.get("simulate_fail_step") or "")
     fail_error = str(config.get("simulate_fail_error") or "")
     fail_times = int(config.get("simulate_fail_times") or 0)
+    fail_error = str(config.get("simulate_fail_error") or "simulated_payment_retryable_failure")
     if fail_step in {"payment", "checking_out"} and attempt_number <= fail_times:
         if bool(config.get("simulate_retryable", True)):
             raise CheckoutRetryableError(fail_error)
@@ -3698,9 +3699,9 @@ def _checkout_step_submitting(
 
 
 CHECKOUT_STEP_HANDLERS = {
-    "monitoring_product": _checkout_step_monitoring,
-    "adding_to_cart": _checkout_step_carting,
-    "checking_out": _checkout_step_payment,
+    "monitoring_product": globals().get("_checkout_step_monitoring"),
+    "adding_to_cart": globals().get("_checkout_step_carting") or globals().get("_checkout_step_shipping"),
+    "checking_out": globals().get("_checkout_step_payment"),
 }
 
 
@@ -4262,6 +4263,7 @@ def _checkout_step_payment(
     fail_step = str(config.get("simulate_fail_step") or "")
     fail_error = str(config.get("simulate_fail_error") or "")
     fail_times = int(config.get("simulate_fail_times") or 0)
+    fail_error = str(config.get("simulate_fail_error") or "simulated_payment_retryable_failure")
     if fail_step in {"payment", "checking_out"} and attempt_number <= fail_times:
         if bool(config.get("simulate_retryable", True)):
             raise CheckoutRetryableError(fail_error)
@@ -4279,9 +4281,9 @@ def _checkout_step_submitting(
 
 
 CHECKOUT_STEP_HANDLERS = {
-    "monitoring_product": _checkout_step_monitoring,
-    "adding_to_cart": _checkout_step_carting,
-    "checking_out": _checkout_step_payment,
+    "monitoring_product": globals().get("_checkout_step_monitoring"),
+    "adding_to_cart": globals().get("_checkout_step_carting") or globals().get("_checkout_step_shipping"),
+    "checking_out": globals().get("_checkout_step_payment"),
 }
 
 
