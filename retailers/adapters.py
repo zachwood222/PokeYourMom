@@ -6,6 +6,15 @@ from dataclasses import dataclass
 from typing import Any
 
 RETAILER_ALIASES = {
+    "walmart.com": "walmart",
+    "walmart com": "walmart",
+    "wal-mart": "walmart",
+    "wal mart": "walmart",
+    "target.com": "target",
+    "target com": "target",
+    "best-buy": "bestbuy",
+    "best buy": "bestbuy",
+    "bestbuy.com": "bestbuy",
     "pokemon-center": "pokemoncenter",
     "pokemon_center": "pokemoncenter",
     "pokemon center": "pokemoncenter",
@@ -204,6 +213,7 @@ class TargetAdapter(DefaultRetailerAdapter):
             "add to cart",
             "ship it",
             "pick up",
+            "limited stock",
         ]
         out_markers = [
             '"availability":"outofstock"',
@@ -211,6 +221,7 @@ class TargetAdapter(DefaultRetailerAdapter):
             "out of stock",
             "sold out",
             "unavailable",
+            "currently unavailable online",
         ]
         has_in = any(marker in text for marker in in_markers)
         has_out = any(marker in text for marker in out_markers)
@@ -245,6 +256,7 @@ class BestBuyAdapter(DefaultRetailerAdapter):
             '"buttonstate":"add to cart"',
             '"shipping":"available"',
             "ready for pickup today",
+            "available for pickup today",
         ]
         out_markers = [
             '"buttonstate":"sold out"',
@@ -252,6 +264,7 @@ class BestBuyAdapter(DefaultRetailerAdapter):
             '"shipping":"unavailable"',
             "sold out",
             "coming soon",
+            "sold out online",
         ]
         has_in = any(marker in text for marker in in_markers)
         has_out = any(marker in text for marker in out_markers)
@@ -295,3 +308,13 @@ def run_retailer_flow(adapter: RetailerAdapter, task_ctx: TaskContext) -> Monito
     adapter.submit_payment(task_ctx)
     adapter.place_order(task_ctx)
     return result
+
+
+def parse_monitor_html(
+    *,
+    html: str,
+    retailer: str | None = None,
+    keyword: str | None = None,
+) -> MonitorResult:
+    adapter = resolve_retailer_adapter(retailer)
+    return run_retailer_flow(adapter, {"html": html, "keyword": keyword})

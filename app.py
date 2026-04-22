@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
 import secrets
@@ -24,6 +25,7 @@ from retailers import (
     MonitorResult,
     canonical_retailer,
     default_parser,
+    parse_monitor_html,
     resolve_retailer_adapter,
     run_retailer_flow,
 )
@@ -44,12 +46,16 @@ DEFAULT_PLAN = os.getenv("DEFAULT_PLAN", "basic")
 POKEMON_MSRP_BUFFER_CENTS = int(os.getenv("POKEMON_MSRP_BUFFER_CENTS", "1000"))
 APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
 RELEASE_CHANNEL = os.getenv("RELEASE_CHANNEL", "stable")
+CORRELATION_ID_HEADER = "X-Correlation-ID"
 _api_auth_token_raw = os.getenv("API_AUTH_TOKEN")
 API_AUTH_TOKEN = _api_auth_token_raw.strip() if _api_auth_token_raw is not None else "dev-token"
 SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY", "local-dev-secret-key")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_WEBHOOK_TOLERANCE_SECONDS = int(os.getenv("STRIPE_WEBHOOK_TOLERANCE_SECONDS", "300"))
 UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
 UPDATE_CHECK_TIMEOUT_SECONDS = float(os.getenv("UPDATE_CHECK_TIMEOUT_SECONDS", "2.0"))
+UPDATE_CHECK_AUTH_HEADER = os.getenv("UPDATE_CHECK_AUTH_HEADER", "").strip() or "Authorization"
+UPDATE_CHECK_AUTH_TOKEN = os.getenv("UPDATE_CHECK_AUTH_TOKEN", "").strip()
 CAPTCHA_PROVIDER = os.getenv("CAPTCHA_PROVIDER", "turnstile")
 CAPTCHA_SITE_KEY = os.getenv("CAPTCHA_SITE_KEY", "")
 CAPTCHA_SCRIPT_URL = os.getenv("CAPTCHA_SCRIPT_URL", "https://challenges.cloudflare.com/turnstile/v0/api.js")
@@ -71,6 +77,11 @@ PLAN_LOOKUP_TO_INTERNAL_PLAN = {
     "basic": "basic",
     "pro": "pro",
     "team": "team",
+}
+STRIPE_SUBSCRIPTION_EVENT_TYPES = {
+    "customer.subscription.created",
+    "customer.subscription.updated",
+    "customer.subscription.deleted",
 }
 SUPPORTED_RETAILERS = {"walmart", "target", "bestbuy", "pokemoncenter"}
 DEFAULT_WORKSPACE = {
@@ -166,9 +177,9 @@ def verify_stripe_webhook_signature(payload: bytes, signature_header: str | None
         timestamp = int(timestamp_raw)
     except ValueError as exc:
         raise PermissionError("Invalid Stripe signature timestamp") from exc
-    if abs(time.time() - timestamp) > 300:
+    if abs(time.time() - timestamp) > STRIPE_WEBHOOK_TOLERANCE_SECONDS:
         raise PermissionError("Stripe signature timestamp outside tolerance")
-    signed_payload = f"{timestamp}.{payload.decode('utf-8')}".encode("utf-8")
+    signed_payload = f"{timestamp}.".encode("utf-8") + payload
     expected_signature = hmac.new(
         STRIPE_WEBHOOK_SECRET.encode("utf-8"),
         signed_payload,
@@ -351,6 +362,21 @@ def sync_billing_subscription_event(conn: sqlite3.Connection, event: dict[str, A
             now_iso,
             now_iso,
         ),
+    )
+    apply_workspace_subscription_state(
+        conn,
+        workspace_id=workspace_id,
+        status=status,
+        plan_code=plan_obj.get("id"),
+        plan_lookup_key=(
+            (subscription.get("items") or {}).get("data", [{}])[0].get("price", {}).get("lookup_key")
+            if isinstance((subscription.get("items") or {}).get("data"), list)
+            and (subscription.get("items") or {}).get("data")
+            else None
+        ),
+        cancel_at_period_end=bool(cancel_at_period_end),
+        source="stripe_webhook",
+        now_iso=now_iso,
     )
 
 
@@ -817,6 +843,13 @@ def current_workspace_id() -> int:
     return workspace_id
 
 
+def current_user_context() -> dict[str, Any]:
+    user = getattr(g, "current_user", None)
+    if not user:
+        raise RuntimeError("Missing user context")
+    return dict(user)
+
+
 def get_workspace_for_user(user_id: int) -> sqlite3.Row | None:
     conn = db()
     row = conn.execute(
@@ -867,10 +900,19 @@ def get_workspace(workspace_id: int) -> sqlite3.Row:
     return row
 
 
+def get_default_workspace() -> sqlite3.Row:
+    conn = db()
+    row = conn.execute("select * from workspaces order by id asc limit 1").fetchone()
+    conn.close()
+    if not row:
+        raise ValueError("Workspace not found")
+    return row
+
+
 def get_workspace_for_request() -> sqlite3.Row:
     workspace = getattr(g, "current_workspace", None)
     if workspace is None:
-        workspace = get_workspace(1)
+        workspace = get_default_workspace()
     return workspace
 
 
@@ -950,7 +992,7 @@ def verify_captcha_token(token: str) -> tuple[bool, str | None]:
 def _is_captcha_protected_request() -> bool:
     if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
         return False
-    if request.path == "/api/billing/stripe/webhook":
+    if request.path in {"/api/billing/stripe/webhook", "/api/stripe/webhook"}:
         return False
     return request.path.startswith("/api/")
 
@@ -1002,9 +1044,9 @@ def verify_captcha_token(token: str) -> tuple[bool, str]:
 
 @app.before_request
 def require_api_auth() -> tuple[dict[str, str], int] | None:
-    incoming_correlation_id = (request.headers.get("X-Correlation-ID") or "").strip()
+    incoming_correlation_id = (request.headers.get(CORRELATION_ID_HEADER) or "").strip()
     g.correlation_id = incoming_correlation_id or str(uuid4())
-    if request.path == "/api/billing/stripe/webhook":
+    if request.path in {"/api/billing/stripe/webhook", "/api/stripe/webhook"}:
         return None
     if not request.path.startswith("/api/"):
         return None
@@ -1017,7 +1059,7 @@ def require_api_auth() -> tuple[dict[str, str], int] | None:
     else:
         token = _token_from_request()
         if token and token == API_AUTH_TOKEN:
-            _set_auth_context(DEFAULT_USER, get_workspace(1))
+            _set_auth_context(DEFAULT_USER, get_default_workspace())
         else:
             return jsonify({"error": "Unauthorized"}), 401
 
@@ -1050,7 +1092,7 @@ def require_api_auth() -> tuple[dict[str, str], int] | None:
 def add_correlation_id_header(response):
     correlation_id = getattr(g, "correlation_id", None)
     if correlation_id:
-        response.headers["X-Correlation-ID"] = correlation_id
+        response.headers[CORRELATION_ID_HEADER] = correlation_id
     if request.path.startswith("/api/") and response.is_json:
         try:
             payload = response.get_json(silent=True)
@@ -1137,6 +1179,35 @@ def map_subscription_to_internal_plan(
     if "pro" in combined:
         return "pro"
     return "basic"
+
+
+def apply_workspace_subscription_state(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: int,
+    status: str,
+    plan_code: str | None,
+    plan_lookup_key: str | None,
+    cancel_at_period_end: bool,
+    source: str,
+    now_iso: str | None = None,
+) -> dict[str, Any]:
+    now = now_iso or utc_now()
+    internal_plan = map_subscription_to_internal_plan(
+        status=status,
+        plan_code=plan_code,
+        plan_lookup_key=plan_lookup_key,
+        cancel_at_period_end=cancel_at_period_end,
+    )
+    conn.execute(
+        """
+        update workspaces
+        set plan = ?, subscription_status = ?, subscription_source = ?, subscription_updated_at = ?
+        where id = ?
+        """,
+        (internal_plan, status, source, now, workspace_id),
+    )
+    return {"workspace_id": workspace_id, "plan": internal_plan, "status": status, "source": source}
 
 
 def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1232,19 +1303,15 @@ def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str,
             ),
         )
 
-        internal_plan = map_subscription_to_internal_plan(
+        result = apply_workspace_subscription_state(
+            conn,
+            workspace_id=workspace_id,
             status=status,
             plan_code=plan_code,
             plan_lookup_key=plan_lookup_key,
             cancel_at_period_end=cancel_at_period_end,
-        )
-        conn.execute(
-            """
-            update workspaces
-            set plan = ?, subscription_status = ?, subscription_source = ?, subscription_updated_at = ?
-            where id = ?
-            """,
-            (internal_plan, status, source, now, workspace_id),
+            source=source,
+            now_iso=now,
         )
         conn.commit()
     except Exception:
@@ -1252,194 +1319,11 @@ def sync_manual_billing_subscription_event(payload: dict[str, Any]) -> dict[str,
         raise
     finally:
         conn.close()
-    return {"workspace_id": workspace_id, "plan": internal_plan, "status": status}
+    return result
 
 
 def sync_billing_subscription_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return sync_manual_billing_subscription_event(payload)
-
-
-def extract_price_cents(text: str) -> int | None:
-    matches = re.findall(r"\$\s*(\d{1,4}(?:\.\d{2})?)", text)
-    if not matches:
-        return None
-    values = []
-    for m in matches:
-        try:
-            v = float(m)
-            if 1.0 <= v <= 2000.0:
-                values.append(int(round(v * 100)))
-        except ValueError:
-            continue
-    return min(values) if values else None
-
-
-def _parse_common_title_and_text(html: str) -> tuple[str, str]:
-    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
-    title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "Product"
-    text = re.sub(r"<[^>]+>", " ", html).lower()
-    return title[:180], text
-
-
-def default_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-
-    out_markers = [
-        "out of stock",
-        "sold out",
-        "unavailable",
-        "not available",
-        "coming soon",
-        "temporarily out of stock",
-    ]
-    in_markers = [
-        "in stock",
-        "add to cart",
-        "buy now",
-        "pickup",
-        "ship it",
-    ]
-
-    has_out = any(m in text for m in out_markers)
-    has_in = any(m in text for m in in_markers)
-
-    in_stock = has_in and not has_out
-    availability_reason = "fallback_unknown"
-    parser_confidence = 0.2
-    if has_out and not has_in:
-        availability_reason = "marker_out_of_stock"
-        parser_confidence = 0.9
-    elif has_in and not has_out:
-        availability_reason = "marker_in_stock"
-        parser_confidence = 0.9
-    elif has_in and has_out:
-        availability_reason = "marker_conflict"
-        parser_confidence = 0.35
-    keyword_matched: bool | None = None
-    if keyword:
-        keyword_matched = keyword.lower() in text
-    price_cents = extract_price_cents(re.sub(r"<[^>]+>", " ", html))
-    status_text = "in_stock" if in_stock else "out_or_unknown"
-    return MonitorResult(
-        in_stock=in_stock,
-        price_cents=price_cents,
-        title=title[:180],
-        status_text=status_text,
-        availability_reason=availability_reason,
-        parser_confidence=parser_confidence,
-        keyword_matched=keyword_matched,
-    )
-
-
-def pokemoncenter_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-    result = default_parser(html, keyword=keyword)
-    out_markers = ["notify me when available", "currently unavailable"]
-    in_markers = ["add to bag"]
-    has_out = any(m in text for m in out_markers)
-    has_in = any(m in text for m in in_markers)
-    if has_out:
-        result.in_stock = False
-        result.status_text = "out_or_unknown"
-        result.availability_reason = "pokemoncenter_marker_out_of_stock"
-        result.parser_confidence = 0.98
-    elif has_in:
-        result.in_stock = True
-        result.status_text = "in_stock"
-        result.availability_reason = "pokemoncenter_marker_in_stock"
-        result.parser_confidence = 0.98
-    result.title = title
-    return result
-
-
-def walmart_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-    result = default_parser(html, keyword=keyword)
-    if '"availability":"instock"' in text or "fulfillmentoptions" in text:
-        result.in_stock = True
-        result.status_text = "in_stock"
-        result.availability_reason = "walmart_marker_in_stock"
-        result.parser_confidence = 0.98
-    if '"availability":"outofstock"' in text or "out of stock" in text:
-        result.in_stock = False
-        result.status_text = "out_or_unknown"
-        result.availability_reason = "walmart_marker_out_of_stock"
-        result.parser_confidence = 0.98
-    result.price_cents = extract_price_cents(html)
-    result.title = title
-    return result
-
-
-def target_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-    result = default_parser(html, keyword=keyword)
-
-    in_markers = [
-        '"availability":"instock"',
-        '"availability":"in_stock"',
-        "add to cart",
-        "ship it",
-        "pick up",
-    ]
-    out_markers = [
-        '"availability":"outofstock"',
-        '"availability":"out_of_stock"',
-        "out of stock",
-        "sold out",
-        "unavailable",
-    ]
-    has_in = any(marker in text for marker in in_markers)
-    has_out = any(marker in text for marker in out_markers)
-
-    if has_out:
-        result.in_stock = False
-        result.status_text = "out_or_unknown"
-        result.availability_reason = "target_marker_out_of_stock"
-        result.parser_confidence = 0.98
-    elif has_in:
-        result.in_stock = True
-        result.status_text = "in_stock"
-        result.availability_reason = "target_marker_in_stock"
-        result.parser_confidence = 0.98
-
-    result.price_cents = extract_price_cents(html)
-    result.title = title
-    return result
-
-
-def bestbuy_parser(html: str, keyword: str | None = None) -> MonitorResult:
-    title, text = _parse_common_title_and_text(html)
-    result = default_parser(html, keyword=keyword)
-
-    in_markers = [
-        '"buttonstate":"add to cart"',
-        '"shipping":"available"',
-        "ready for pickup today",
-    ]
-    out_markers = [
-        '"buttonstate":"sold out"',
-        '"buttonstate":"coming soon"',
-        '"shipping":"unavailable"',
-        "sold out",
-        "coming soon",
-    ]
-    has_in = any(marker in text for marker in in_markers)
-    has_out = any(marker in text for marker in out_markers)
-
-    if has_out:
-        result.in_stock = False
-        result.status_text = "out_or_unknown"
-        result.availability_reason = "bestbuy_marker_out_of_stock"
-        result.parser_confidence = 0.98
-    elif has_in:
-        result.in_stock = True
-        result.status_text = "in_stock"
-        result.availability_reason = "bestbuy_marker_in_stock"
-        result.parser_confidence = 0.98
-
-    result.price_cents = extract_price_cents(html)
-    result.title = title
-    return result
 
 
 def get_adapter_for_retailer(retailer: str | None):
@@ -1449,8 +1333,7 @@ def get_adapter_for_retailer(retailer: str | None):
 def evaluate_page(
     html: str, keyword: str | None = None, retailer: str | None = None
 ) -> MonitorResult:
-    adapter = get_adapter_for_retailer(retailer)
-    return run_retailer_flow(adapter, {"html": html, "keyword": keyword})
+    return parse_monitor_html(html=html, keyword=keyword, retailer=retailer)
 
 
 def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
@@ -1891,6 +1774,57 @@ def cents_to_dollars(cents: int | None) -> str:
     return f"${cents / 100:.2f}"
 
 
+def normalize_parser_confidence(value: Any) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    confidence = float(value)
+    if math.isnan(confidence) or math.isinf(confidence):
+        return None
+    return min(1.0, max(0.0, confidence))
+
+
+def parser_metadata_payload(result: MonitorResult) -> dict[str, Any]:
+    return {
+        "availability_reason": result.availability_reason,
+        "parser_confidence": normalize_parser_confidence(result.parser_confidence),
+    }
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
 def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
@@ -1901,6 +1835,14 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
     except (TypeError, json.JSONDecodeError):
         payload["task_config"] = {}
     return payload
+
+
+def redact_webhook_url(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 12:
+        return "***"
+    return f"{value[:8]}...{value[-4:]}"
 
 
 def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -2024,6 +1966,7 @@ def create_monitor_error_events(monitor: sqlite3.Row, error_text: str) -> None:
 
 
 def emit_monitor_events(monitor: sqlite3.Row, result: MonitorResult, eligible: bool) -> None:
+    parser_metadata = parser_metadata_payload(result)
     payload = {
         "monitor_id": monitor["id"],
         "workspace_id": monitor["workspace_id"],
@@ -2032,8 +1975,8 @@ def emit_monitor_events(monitor: sqlite3.Row, result: MonitorResult, eligible: b
         "eligible_for_alert": bool(eligible),
         "in_stock": bool(result.in_stock),
         "price_cents": result.price_cents,
-        "availability_reason": result.availability_reason,
-        "parser_confidence": result.parser_confidence,
+        "availability_reason": parser_metadata["availability_reason"],
+        "parser_confidence": parser_metadata["parser_confidence"],
         "checked_at": utc_now(),
     }
     try:
@@ -2096,6 +2039,7 @@ def run_monitor_pipeline_once(monitor: sqlite3.Row) -> dict[str, Any]:
     eligible = alert_eligibility(monitor, result)
     persist_monitor_state(monitor, result, eligible)
     emit_monitor_events(monitor, result, eligible)
+    parser_metadata = parser_metadata_payload(result)
 
     log(
         f"Checked monitor {monitor['id']} | {monitor['retailer']} | {result.status_text} | {cents_to_dollars(result.price_cents)}",
@@ -2107,8 +2051,8 @@ def run_monitor_pipeline_once(monitor: sqlite3.Row) -> dict[str, Any]:
         "in_stock": result.in_stock,
         "eligible_for_alert": eligible,
         "price_cents": result.price_cents,
-        "availability_reason": result.availability_reason,
-        "parser_confidence": result.parser_confidence,
+        "availability_reason": parser_metadata["availability_reason"],
+        "parser_confidence": parser_metadata["parser_confidence"],
         "keyword_matched": result.keyword_matched,
         "price_within_limit": result.price_within_limit,
         "within_msrp_delta": result.within_msrp_delta,
@@ -2577,12 +2521,16 @@ def resolve_latest_version() -> tuple[str, str | None]:
         return fallback_version, "update_check_url_not_configured"
 
     try:
+        headers = {"User-Agent": "StockSentinel-UpdateCheck/1.0"}
+        if UPDATE_CHECK_AUTH_TOKEN:
+            headers[UPDATE_CHECK_AUTH_HEADER] = UPDATE_CHECK_AUTH_TOKEN
         req = perform_request(
             task_key="meta-update-check",
             method="GET",
             url=UPDATE_CHECK_URL,
             workspace_id=None,
             proxy_url=None,
+            headers=headers,
             timeout=UPDATE_CHECK_TIMEOUT_SECONDS,
             retry_total=1,
             backoff_factor=0.1,
@@ -2614,35 +2562,17 @@ def api_meta_check_update():
     return jsonify(payload)
 
 
-@app.post("/api/billing/stripe/webhook")
-def api_billing_stripe_webhook():
-    payload = request.get_data(cache=False, as_text=False)
-    signature_header = request.headers.get("Stripe-Signature")
-    try:
-        verify_stripe_webhook_signature(payload, signature_header)
-    except PermissionError as exc:
-        return jsonify({"error": str(exc)}), 401
-
-    try:
-        event = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return jsonify({"error": "Invalid JSON payload"}), 400
-
+def _ingest_stripe_event(event: dict[str, Any]) -> tuple[bool, int, dict[str, Any]]:
     event_id = event.get("id")
     event_type = event.get("type", "")
     if not event_id:
-        return jsonify({"error": "Missing Stripe event id"}), 400
+        return False, 400, {"error": "Missing Stripe event id"}
 
     subscription = ((event.get("data") or {}).get("object") or {})
     workspace_id = None
     if isinstance(subscription, dict):
         workspace_id = _workspace_id_from_subscription_object(subscription)
 
-    supported_types = {
-        "customer.subscription.created",
-        "customer.subscription.updated",
-        "customer.subscription.deleted",
-    }
     conn = db()
     try:
         conn.execute("begin")
@@ -2656,23 +2586,94 @@ def api_billing_stripe_webhook():
         if insert_result.rowcount == 0:
             conn.rollback()
             conn.close()
-            return jsonify({"ok": True, "noop": True}), 200
-        if event_type in supported_types:
+            return True, 200, {"ok": True, "noop": True}
+        if event_type in STRIPE_SUBSCRIPTION_EVENT_TYPES:
             sync_billing_subscription_event(conn, event)
         conn.commit()
     except sqlite3.DatabaseError as exc:
         conn.rollback()
         conn.close()
-        return jsonify({"error": f"Database error: {exc}"}), 400
+        return False, 400, {"error": f"Database error: {exc}"}
     conn.close()
-    return jsonify({"ok": True, "noop": False}), 200
+    return True, 200, {"ok": True, "noop": False}
+
+
+def _handle_stripe_webhook_request():
+    payload = request.get_data(cache=False, as_text=False)
+    signature_header = request.headers.get("Stripe-Signature")
+    try:
+        verify_stripe_webhook_signature(payload, signature_header)
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+
+    try:
+        event = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return jsonify({"error": "Invalid JSON payload"}), 400
+    ok, status_code, payload = _ingest_stripe_event(event)
+    return jsonify(payload), status_code
+
+
+@app.post("/api/billing/stripe/webhook")
+def api_billing_stripe_webhook():
+    return _handle_stripe_webhook_request()
+
+
+@app.post("/api/stripe/webhook")
+def api_stripe_webhook():
+    return _handle_stripe_webhook_request()
 
 
 @app.get("/api/workspace")
 @require_auth
 def api_workspace():
     row = get_workspace(current_workspace_id())
-    return jsonify({"workspace": dict(row), "user": dict(g.current_user)})
+    return jsonify({"workspace": dict(row), "user": current_user_context()})
+
+
+@app.get("/api/workspace/usage-limits")
+@require_auth
+def api_workspace_usage_limits():
+    workspace_id = get_workspace_id_for_request()
+    workspace = get_workspace(workspace_id)
+    limits = PLAN_LIMITS[workspace["plan"]]
+    conn = db()
+    usage = conn.execute(
+        """
+        select count(*) as monitor_count, min(poll_interval_seconds) as min_poll_interval_seconds
+        from monitors
+        where workspace_id = ?
+        """,
+        (workspace_id,),
+    ).fetchone()
+    conn.close()
+
+    monitor_count = int(usage["monitor_count"] or 0)
+    min_poll_interval_seconds = usage["min_poll_interval_seconds"]
+    monitor_slots_remaining = max(0, limits["max_monitors"] - monitor_count)
+
+    return jsonify(
+        {
+            "plan": workspace["plan"],
+            "usage": {
+                "monitor_count": monitor_count,
+                "min_poll_interval_seconds": min_poll_interval_seconds,
+            },
+            "limits": {
+                "max_monitors": limits["max_monitors"],
+                "min_poll_seconds": limits["min_poll_seconds"],
+            },
+            "derived": {
+                "monitor_slots_remaining": monitor_slots_remaining,
+                "monitor_limit_reached": monitor_count >= limits["max_monitors"],
+                "poll_minimum_satisfied": (
+                    True
+                    if min_poll_interval_seconds is None
+                    else min_poll_interval_seconds >= limits["min_poll_seconds"]
+                ),
+            },
+        }
+    )
 
 
 @app.post("/api/workspace/plan")
@@ -2732,206 +2733,32 @@ def api_list_monitors():
     return jsonify([dict(r) for r in rows])
 
 
-@app.post("/api/tasks")
+def get_monitor_for_workspace(
+    conn: sqlite3.Connection, monitor_id: int, workspace_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (monitor_id, workspace_id),
+    ).fetchone()
+
+
+def validate_monitor_retailer_and_url(retailer: str, url: str) -> None:
+    if retailer not in SUPPORTED_RETAILERS:
+        raise ValueError(f"Unsupported retailer '{retailer}'")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise ValueError("product_url must be http(s)")
+
+
+@app.get("/api/monitors/<int:monitor_id>")
 @require_auth
-def api_create_task():
-    body = request.json or {}
-    try:
-        retailer = canonical_retailer((body.get("retailer") or "").strip())
-        product_url = (body.get("url") or body.get("product_url") or "").strip()
-        profile = (body.get("profile") or "").strip()
-        account = (body.get("account") or "").strip()
-        payment = (body.get("payment") or "").strip()
-        if retailer not in SUPPORTED_RETAILERS:
-            raise ValueError(f"Unsupported retailer '{retailer}'")
-        if not (product_url.startswith("http://") or product_url.startswith("https://")):
-            raise ValueError("url must be http(s)")
-        if not profile:
-            raise ValueError("profile is required")
-        if not account:
-            raise ValueError("account is required")
-        if not payment:
-            raise ValueError("payment is required")
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-
-    workspace_id = current_workspace_id()
+def api_get_monitor(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
     conn = db()
-    enforce_plan_limits(workspace_id, 20)
-    monitor_cur = conn.execute(
-        """
-        insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, enabled, created_at)
-        values (?, ?, ?, 20, 0, ?)
-        """,
-        (workspace_id, retailer, product_url, utc_now()),
-    )
-    monitor_id = int(monitor_cur.lastrowid)
-    task = create_checkout_task(
-        conn,
-        workspace_id=workspace_id,
-        monitor_id=monitor_id,
-        task_name=f"{retailer} task",
-        task_config={
-            "retailer": retailer,
-            "product_url": product_url,
-            "profile": profile,
-            "account": account,
-            "payment": payment,
-        },
-        initial_state="queued",
-    )
-    conn.commit()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
-
-    payload = {
-        "id": task["id"],
-        "workspace_id": workspace_id,
-        "retailer": retailer,
-        "product_url": product_url,
-        "profile": profile,
-        "account": account,
-        "payment": payment,
-        "state": "idle",
-        "retries": 0,
-        "last_step": None,
-        "last_error": None,
-    }
-    socketio.emit("task_update", payload)
-    return jsonify(payload), 201
-
-
-@app.get("/api/tasks")
-@require_auth
-def api_list_tasks():
-    conn = db()
-    rows = conn.execute(
-        "select * from checkout_tasks where workspace_id = ? order by id desc",
-        (current_workspace_id(),),
-    ).fetchall()
-    payloads = []
-    for row in rows:
-        config = {}
-        raw = row["task_config"]
-        if raw:
-            try:
-                config = json.loads(raw)
-            except (TypeError, json.JSONDecodeError):
-                config = {}
-        state = row["current_state"]
-        compat_state = "idle" if state == "queued" and not row["enabled"] else ("running" if state == "monitoring" else state)
-        payloads.append(
-            {
-                "id": row["id"],
-                "workspace_id": row["workspace_id"],
-                "retailer": config.get("retailer"),
-                "product_url": config.get("product_url"),
-                "profile": config.get("profile"),
-                "account": config.get("account"),
-                "payment": config.get("payment"),
-                "state": compat_state,
-                "retries": 0,
-                "last_step": row["current_state"],
-                "last_error": row["last_error"],
-            }
-        )
-    conn.close()
-    return jsonify(payloads)
-
-
-@app.post("/api/tasks/<int:task_id>/start")
-@require_auth
-def api_start_task(task_id: int):
-    workspace_id = current_workspace_id()
-    conn = db()
-    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
-    if not task:
-        conn.close()
-        return jsonify({"error": "Task not found"}), 404
-    transitioned = transition_checkout_task(
-        conn,
-        task_id=task_id,
-        workspace_id=workspace_id,
-        requested_state="monitoring",
-        reason="compat_api_start_task",
-    )
-    conn.commit()
-    conn.close()
-    assert transitioned is not None
-    config = json.loads(transitioned["task_config"] or "{}")
-    payload = {
-        "id": transitioned["id"],
-        "workspace_id": workspace_id,
-        "retailer": config.get("retailer"),
-        "product_url": config.get("product_url"),
-        "profile": config.get("profile"),
-        "account": config.get("account"),
-        "payment": config.get("payment"),
-        "state": "running",
-        "retries": 0,
-        "last_step": transitioned["current_state"],
-        "last_error": transitioned["last_error"],
-    }
-    socketio.emit("task_update", payload)
-    return jsonify({"ok": True, "task": payload, "already_running": False})
-
-
-@app.post("/api/tasks/<int:task_id>/stop")
-@require_auth
-def api_stop_task(task_id: int):
-    workspace_id = current_workspace_id()
-    conn = db()
-    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
-    if not task:
-        conn.close()
-        return jsonify({"error": "Task not found"}), 404
-    transitioned = transition_checkout_task(
-        conn,
-        task_id=task_id,
-        workspace_id=workspace_id,
-        requested_state="stopped",
-        reason="compat_api_stop_task",
-    )
-    conn.commit()
-    conn.close()
-    assert transitioned is not None
-    config = json.loads(transitioned["task_config"] or "{}")
-    payload = {
-        "id": transitioned["id"],
-        "workspace_id": workspace_id,
-        "retailer": config.get("retailer"),
-        "product_url": config.get("product_url"),
-        "profile": config.get("profile"),
-        "account": config.get("account"),
-        "payment": config.get("payment"),
-        "state": "stopped",
-        "retries": 0,
-        "last_step": transitioned["current_state"],
-        "last_error": transitioned["last_error"],
-    }
-    socketio.emit("task_update", payload)
-    return jsonify({"ok": True, "task": payload})
-
-
-@app.get("/api/tasks/<int:task_id>/attempts")
-@require_auth
-def api_task_attempts(task_id: int):
-    workspace_id = current_workspace_id()
-    conn = db()
-    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
-    if not task:
-        conn.close()
-        return jsonify({"error": "Task not found"}), 404
-    attempts = conn.execute(
-        """
-        select * from checkout_attempts
-        where workspace_id = ? and task_id = ?
-          and status != 'created'
-        order by id desc
-        """,
-        (workspace_id, task_id),
-    ).fetchall()
-    conn.close()
-    return jsonify([dict(row) for row in attempts])
+    if not row:
+        return jsonify({"error": "Monitor not found"}), 404
+    return jsonify(dict(row))
 
 
 @app.get("/api/dashboard/summary")
@@ -3127,10 +2954,7 @@ def api_create_monitor():
         msrp_cents = body.get("msrp_cents")
         if msrp_cents is not None:
             msrp_cents = int(msrp_cents)
-        if retailer not in SUPPORTED_RETAILERS:
-            raise ValueError(f"Unsupported retailer '{retailer}'")
-        if not (url.startswith("http://") or url.startswith("https://")):
-            raise ValueError("product_url must be http(s)")
+        validate_monitor_retailer_and_url(retailer, url)
 
         enforce_plan_limits(current_workspace_id(), poll_interval)
     except (KeyError, ValueError) as exc:
@@ -3161,15 +2985,16 @@ def api_update_monitor(monitor_id: int):
         return jsonify({"error": "enabled is required"}), 400
 
     conn = db()
-    conn.execute("update monitors set enabled = ? where id = ? and workspace_id = ?", (int(bool(enabled)), monitor_id, workspace_id))
-    conn.commit()
-    row = conn.execute(
-        "select * from monitors where id = ? and workspace_id = ?",
-        (monitor_id, workspace_id),
-    ).fetchone()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     if not row:
         conn.close()
         return jsonify({"error": "Monitor not found"}), 404
+    conn.execute(
+        "update monitors set enabled = ? where id = ? and workspace_id = ?",
+        (int(bool(enabled)), monitor_id, workspace_id),
+    )
+    conn.commit()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
     return jsonify(dict(row))
 
@@ -3179,10 +3004,11 @@ def api_update_monitor(monitor_id: int):
 def api_delete_monitor(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
-    conn.execute(
-        "delete from monitors where id = ? and workspace_id = ?",
-        (monitor_id, current_workspace_id()),
-    )
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+    conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -3193,10 +3019,7 @@ def api_delete_monitor(monitor_id: int):
 def api_check_monitor(monitor_id: int):
     workspace_id = get_workspace_id_for_request()
     conn = db()
-    row = conn.execute(
-        "select * from monitors where id = ? and workspace_id = ?",
-        (monitor_id, current_workspace_id()),
-    ).fetchone()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
     if not row:
         return jsonify({"error": "Monitor not found"}), 404
@@ -3360,15 +3183,16 @@ def api_add_webhook():
     if not url.startswith("https://discord.com/api/webhooks/"):
         return jsonify({"error": "Invalid Discord webhook URL"}), 400
 
+    workspace_id = get_workspace_id_for_request()
     conn = db()
-    secret_id = create_secret(conn, current_workspace_id(), "webhook_url", url, int(g.current_user["id"]))
+    secret_id = create_secret(conn, workspace_id, "webhook_url", url, int(g.current_user["id"]))
     cur = conn.execute(
         """
         insert into webhooks(workspace_id, name, webhook_url, webhook_secret_id, notify_success, notify_failures, notify_restock_only, created_at)
         values (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            current_workspace_id(),
+            workspace_id,
             name,
             redact_webhook_url(url),
             secret_id,
@@ -3384,16 +3208,26 @@ def api_add_webhook():
     return jsonify(serialize_webhook(row)), 201
 
 
+def get_webhook_for_workspace(
+    conn: sqlite3.Connection, webhook_id: int, workspace_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from webhooks where id = ? and workspace_id = ?",
+        (webhook_id, workspace_id),
+    ).fetchone()
+
+
 @app.get("/api/webhooks")
 @require_auth
 def api_list_webhooks():
     role_error = ensure_workspace_role("owner", "admin")
     if role_error:
         return role_error
+    workspace_id = get_workspace_id_for_request()
     conn = db()
     rows = conn.execute(
         "select * from webhooks where workspace_id = ? order by id desc",
-        (current_workspace_id(),),
+        (workspace_id,),
     ).fetchall()
     conn.close()
     return jsonify([serialize_webhook(r) for r in rows])
@@ -3405,11 +3239,9 @@ def api_test_webhook(webhook_id: int):
     role_error = ensure_workspace_role("owner", "admin")
     if role_error:
         return role_error
+    workspace_id = get_workspace_id_for_request()
     conn = db()
-    hook = conn.execute(
-        "select * from webhooks where id = ? and workspace_id = ?",
-        (webhook_id, current_workspace_id()),
-    ).fetchone()
+    hook = get_webhook_for_workspace(conn, webhook_id, workspace_id)
     conn.close()
     if not hook:
         return jsonify({"error": "Webhook not found"}), 404
@@ -3425,7 +3257,7 @@ def api_test_webhook(webhook_id: int):
             task_key=f"webhook-test-{webhook_id}",
             method="POST",
             url=hook["webhook_url"],
-            workspace_id=current_workspace_id(),
+            workspace_id=workspace_id,
             proxy_url=None,
             timeout=8,
             retry_total=1,
@@ -3477,20 +3309,20 @@ def api_update_webhook(webhook_id: int):
         fields.append(("notify_restock_only", int(bool(body["notify_restock_only"]))))
     if not fields:
         return jsonify({"error": "No mutable fields provided"}), 400
+    workspace_id = get_workspace_id_for_request()
     conn = db()
+    row = get_webhook_for_workspace(conn, webhook_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Webhook not found"}), 404
     for key, value in fields:
         conn.execute(
             f"update webhooks set {key} = ? where id = ? and workspace_id = ?",
-            (value, webhook_id, current_workspace_id()),
+            (value, webhook_id, workspace_id),
         )
     conn.commit()
-    row = conn.execute(
-        "select * from webhooks where id = ? and workspace_id = ?",
-        (webhook_id, current_workspace_id()),
-    ).fetchone()
+    row = get_webhook_for_workspace(conn, webhook_id, workspace_id)
     conn.close()
-    if not row:
-        return jsonify({"error": "Webhook not found"}), 404
     return jsonify(dict(row))
 
 
@@ -3500,15 +3332,15 @@ def api_delete_webhook(webhook_id: int):
     role_error = ensure_workspace_role("owner", "admin")
     if role_error:
         return role_error
+    workspace_id = get_workspace_id_for_request()
     conn = db()
-    cur = conn.execute(
-        "delete from webhooks where id = ? and workspace_id = ?",
-        (webhook_id, current_workspace_id()),
-    )
+    row = get_webhook_for_workspace(conn, webhook_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Webhook not found"}), 404
+    conn.execute("delete from webhooks where id = ? and workspace_id = ?", (webhook_id, workspace_id))
     conn.commit()
     conn.close()
-    if cur.rowcount == 0:
-        return jsonify({"error": "Webhook not found"}), 404
     return jsonify({"ok": True})
 
 
