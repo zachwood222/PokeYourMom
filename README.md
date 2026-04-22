@@ -81,6 +81,13 @@ Billing state transitions (workspace plan sync):
 - `customer.subscription.created` / `customer.subscription.updated`: workspace `subscription_status` is updated and plan is mapped from Stripe plan metadata (`pro`/`team` lookup keys map to higher tiers, otherwise `basic`).
 - `customer.subscription.deleted`: workspace is forced to `basic` with `subscription_status=canceled` (preserves existing plan enforcement behavior for monitor count/poll minimums).
 
+Update-check configuration (`GET /api/meta/check-update`):
+
+- `UPDATE_CHECK_URL`: upstream URL for latest-version metadata (JSON `latest_version`/`version`/`tag_name`, or plain text version).
+- `UPDATE_CHECK_TIMEOUT_SECONDS` (optional, default `2.0`): upstream timeout.
+- `UPDATE_CHECK_AUTH_HEADER` (optional, default `Authorization`): header name used when auth token is configured.
+- `UPDATE_CHECK_AUTH_TOKEN` (optional): auth value sent to the upstream update-check source.
+
 Monitor check response compatibility notes:
 
 - `POST /api/monitors/:id/check` now includes `availability_reason` and `parser_confidence`.
