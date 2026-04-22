@@ -503,14 +503,23 @@
     .dashboard-chart-row { display:grid; grid-template-columns: 1.3fr 1fr; gap:12px; margin-top:12px; }
     .chart-card, .donut-card { min-height:220px; }
     .line-graph { height:170px; border-radius: 10px; background: linear-gradient(180deg, rgba(109,224,185,0.28), rgba(20,27,47,0.2)); position: relative; overflow:hidden; }
-    .line-graph span { position:absolute; inset: 18px; border-left:1px solid rgba(132,149,200,.3); border-bottom:1px solid rgba(132,149,200,.3); clip-path: polygon(0% 85%, 10% 45%, 20% 62%, 33% 30%, 45% 54%, 58% 38%, 68% 58%, 80% 42%, 100% 66%, 100% 100%, 0 100%); background: rgba(119,234,198,.45); }
+    .line-graph span { position:absolute; inset: 18px; border-left:1px solid rgba(132,149,200,.3); border-bottom:1px solid rgba(132,149,200,.3); }
+    .line-graph svg { position:absolute; inset:18px; width: calc(100% - 36px); height: calc(100% - 36px); overflow: visible; }
+    .line-graph polyline { fill: rgba(119,234,198,.28); stroke: #77eac6; stroke-width: 2; }
     .donut-wrap { display:flex; align-items:center; gap:18px; margin-top:20px; }
     .donut { width:120px; height:120px; border-radius:50%; background: conic-gradient(#f2c84b 0 35%, #6d93ff 35% 55%, #55d7a6 55% 73%, #d76ae6 73% 85%, #9aa6c5 85% 100%); position:relative; }
     .donut::after { content:""; position:absolute; inset:28px; background:#161a35; border-radius:50%; }
     .donut-legend { list-style:none; margin:0; padding:0; color:#c9d4ef; font-size:12px; }
     .donut-legend li { margin-bottom:8px; display:flex; align-items:center; gap:8px; }
+    .donut-center-label { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; color: #dce5f7; z-index: 2; text-align: center; padding-top: 4px; }
     .dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
     .dot.w { background:#f2c84b; } .dot.t { background:#6d93ff; } .dot.b { background:#55d7a6; } .dot.o { background:#d76ae6; }
+    .order-product-cell { display:flex; align-items:center; gap:10px; min-width: 220px; }
+    .order-thumb { width:36px; height:36px; border-radius:8px; border:1px solid #2a3856; object-fit:cover; background:#121a2f; }
+    .insight-grid { margin-top: 12px; display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:10px; }
+    .insight-card { background:#161c36; border:1px solid #303b72; border-radius:10px; padding:10px; }
+    .insight-card strong { font-size:12px; color:#c2d0f0; display:block; margin-bottom:4px; }
+    .insight-card span { font-size:20px; font-weight:700; color:#f4f8ff; }
 
 
     .tasks-clone-shell {
@@ -592,6 +601,7 @@
       .sidebar { order: 2; }
       .content { order: 1; }
       .topbar { height: auto; min-height: 62px; padding: 10px 14px; flex-wrap: wrap; gap: 8px; }
+      .insight-grid { grid-template-columns: 1fr; }
     }
 
     @media (max-width: 740px) {
@@ -680,35 +690,53 @@
 
         <div class="dashboard-chart-row">
           <div class="card chart-card">
-            <h3>Amount Spent Monthly</h3>
-            <div class="line-graph"><span></span></div>
+            <h3>Amount Spent (Last 14 Days)</h3>
+            <div class="line-graph">
+              <span></span>
+              <svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                <polyline id="amount_spent_polyline" points="0,100 20,80 40,72 60,60 80,45 100,35 100,100 0,100"></polyline>
+              </svg>
+            </div>
           </div>
           <div class="card donut-card">
-            <h3>Most Sites Checkouts</h3>
+            <h3>Sites Checkouts</h3>
             <div class="donut-wrap">
-              <div class="donut"></div>
-              <ul class="donut-legend">
-                <li><span class="dot w"></span>Walmart</li>
-                <li><span class="dot t"></span>Target</li>
-                <li><span class="dot b"></span>BestBuy</li>
-                <li><span class="dot o"></span>Other Sites</li>
+              <div id="site_checkout_donut" class="donut">
+                <div id="site_checkout_donut_center" class="donut-center-label">0<br/>orders</div>
+              </div>
+              <ul id="site_checkout_legend" class="donut-legend">
+                <li><span class="dot w"></span>No checkout data yet</li>
               </ul>
             </div>
           </div>
         </div>
+        <div class="insight-grid">
+          <div class="insight-card">
+            <strong>Conversion</strong>
+            <span id="dashboard_conversion_rate">0%</span>
+          </div>
+          <div class="insight-card">
+            <strong>Average Order</strong>
+            <span id="dashboard_average_order">$0.00</span>
+          </div>
+          <div class="insight-card">
+            <strong>Best Site</strong>
+            <span id="dashboard_best_site">N/A</span>
+          </div>
+        </div>
 
         <div class="card" style="margin-top:14px;">
-          <h3>Previous Checkouts</h3>
+          <h3>Product Orders</h3>
           <table>
-            <thead><tr><th>Site</th><th>Product</th><th>Profile</th><th>Price</th><th>Order #</th><th>Order Date & Time</th></tr></thead>
+            <thead><tr><th>Site</th><th>Product</th><th>Qty</th><th>Price</th><th>Spent</th><th>Purchased</th></tr></thead>
             <tbody id="ops_monitor_failure_trends"></tbody>
           </table>
         </div>
 
         <div class="card" style="margin-top:14px;">
-          <h3>Webhook Health Trends</h3>
+          <h3>Site Checkout Breakdown</h3>
           <table>
-            <thead><tr><th>Webhook</th><th>Fail Streak</th><th>Last Code</th><th>Failures (24h)</th></tr></thead>
+            <thead><tr><th>Site</th><th>Checkouts</th><th>Share</th></tr></thead>
             <tbody id="ops_webhook_health_trends"></tbody>
           </table>
         </div>
@@ -1533,7 +1561,7 @@
       loopRunning = !!data.running;
       document.getElementById('loopBtn').textContent = loopRunning ? 'Stop Monitor Loop' : 'Start Monitor Loop';
       await loadOpsMetrics();
-      await loadOpsTrends();
+      await loadCommerceDashboard();
     }
 
     async function loadOpsMetrics() {
@@ -1553,33 +1581,109 @@
       document.getElementById('ops_webhook_failed_total').textContent = webhookFailed;
     }
 
-    async function loadOpsTrends() {
-      const monitorData = await apiFetch('/api/ops/monitor-failure-trends').then(r => r.json()).catch(() => ({trends: []}));
-      const webhookData = await apiFetch('/api/ops/webhook-health-trends').then(r => r.json()).catch(() => ({webhooks: []}));
+    function formatMoney(cents) {
+      return `$${(Number(cents || 0) / 100).toFixed(2)}`;
+    }
 
-      const monitorRows = toArray(monitorData, 'trends');
+    function formatDateTime(value) {
+      const dt = value ? new Date(value) : null;
+      if (!dt || Number.isNaN(dt.getTime())) return '—';
+      return dt.toLocaleString();
+    }
+
+    function renderAmountSpentLine(points) {
+      const polyline = document.getElementById('amount_spent_polyline');
+      if (!polyline) return;
+      const rows = Array.isArray(points) ? points : [];
+      if (!rows.length) {
+        polyline.setAttribute('points', '0,100 100,100 100,100 0,100');
+        return;
+      }
+      const max = Math.max(...rows.map(p => Number(p.spent_cents || 0)), 1);
+      const path = rows.map((point, idx) => {
+        const x = rows.length === 1 ? 0 : (idx / (rows.length - 1)) * 100;
+        const y = 100 - ((Number(point.spent_cents || 0) / max) * 100);
+        return `${x.toFixed(2)},${y.toFixed(2)}`;
+      });
+      polyline.setAttribute('points', `${path.join(' ')} 100,100 0,100`);
+    }
+
+    function renderSiteCheckoutDonut(siteRows) {
+      const rows = Array.isArray(siteRows) ? siteRows : [];
+      const donut = document.getElementById('site_checkout_donut');
+      const legend = document.getElementById('site_checkout_legend');
+      const center = document.getElementById('site_checkout_donut_center');
+      if (!donut || !legend || !center) return;
+      const total = rows.reduce((sum, row) => sum + Number(row.checkouts || 0), 0);
+      center.innerHTML = `${total}<br/>orders`;
+      if (!total) {
+        donut.style.background = 'conic-gradient(#9aa6c5 0 100%)';
+        legend.innerHTML = '<li><span class="dot o"></span>No checkout data yet</li>';
+        return;
+      }
+
+      const colors = ['#f2c84b', '#6d93ff', '#55d7a6', '#d76ae6', '#f28d4b', '#7ee77a'];
+      let cursor = 0;
+      const slices = rows.slice(0, 6).map((row, idx) => {
+        const count = Number(row.checkouts || 0);
+        const pct = (count / total) * 100;
+        const start = cursor;
+        cursor += pct;
+        return {site: row.site, count, pct, color: colors[idx % colors.length], start, end: cursor};
+      });
+      donut.style.background = `conic-gradient(${slices.map(s => `${s.color} ${s.start}% ${s.end}%`).join(', ')})`;
+      legend.innerHTML = slices.map((s, idx) => (
+        `<li><span class="dot ${idx === 0 ? 'w' : idx === 1 ? 't' : idx === 2 ? 'b' : 'o'}" style="background:${s.color};"></span>${String(s.site || 'unknown').toUpperCase()} · ${s.count}</li>`
+      )).join('');
+    }
+
+    async function loadCommerceDashboard() {
+      const commerce = await apiFetch('/api/dashboard/commerce').then(r => r.json()).catch(() => ({}));
+      const checkouts = Number(commerce.checkouts_total || 0);
+      const declines = Number(commerce.declines_total || 0);
+      const spent = Number(commerce.spent_total_cents || 0);
+      document.getElementById('kpi_total_monitors').textContent = checkouts;
+      document.getElementById('ops_checks_failed_total').textContent = declines;
+      document.getElementById('ops_webhook_sent_total').textContent = formatMoney(spent);
+      document.getElementById('dashboard_conversion_rate').textContent = `${Math.round(Number(commerce.success_rate || 0) * 100)}%`;
+      document.getElementById('dashboard_average_order').textContent = formatMoney(commerce.average_order_value_cents || 0);
+
+      const monitorRows = toArray(commerce, 'product_orders');
       const monitorBody = document.getElementById('ops_monitor_failure_trends');
       monitorBody.innerHTML = '';
       if (!monitorRows.length) {
-        monitorBody.innerHTML = '<tr><td colspan="3">No failures recorded.</td></tr>';
+        monitorBody.innerHTML = '<tr><td colspan="6">No successful orders yet. Start tasks to populate Product Orders.</td></tr>';
       }
       for (const row of monitorRows) {
+        const productName = String(row.product_name || 'Product').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const image = `https://logo.clearbit.com/${String(row.site || 'example.com').replace(/[^a-z0-9.-]/gi, '')}.com`;
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${row.monitor_id}</td><td>${row.failures_last_24h || 0}</td><td>${row.failures_last_7d || 0}</td>`;
+        tr.innerHTML = `<td>${String(row.site || '').toUpperCase()}</td>
+          <td><div class="order-product-cell"><img class="order-thumb" src="${image}" alt="${productName}" onerror="this.style.display='none';" /><a href="${row.product_url || '#'}" target="_blank" rel="noopener noreferrer">${productName}</a></div></td>
+          <td>${row.quantity || 1}</td>
+          <td>${formatMoney(row.price_cents || 0)}</td>
+          <td>${formatMoney(row.spent_cents || 0)}</td>
+          <td>${formatDateTime(row.purchased_at)}</td>`;
         monitorBody.appendChild(tr);
       }
 
-      const webhookRows = toArray(webhookData, 'webhooks');
+      const webhookRows = toArray(commerce, 'sites_checkouts');
       const webhookBody = document.getElementById('ops_webhook_health_trends');
       webhookBody.innerHTML = '';
+      const siteTotal = webhookRows.reduce((sum, row) => sum + Number(row.checkouts || 0), 0);
       if (!webhookRows.length) {
-        webhookBody.innerHTML = '<tr><td colspan="4">No webhook health data yet.</td></tr>';
+        webhookBody.innerHTML = '<tr><td colspan="3">No site checkout data yet.</td></tr>';
       }
       for (const row of webhookRows) {
+        const share = siteTotal > 0 ? `${((Number(row.checkouts || 0) / siteTotal) * 100).toFixed(1)}%` : '0%';
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${row.webhook_id}</td><td>${row.fail_streak || 0}</td><td>${row.last_status_code || '-'}</td><td>${row.recent_failures_24h || 0}</td>`;
+        tr.innerHTML = `<td>${String(row.site || 'unknown').toUpperCase()}</td><td>${row.checkouts || 0}</td><td>${share}</td>`;
         webhookBody.appendChild(tr);
       }
+
+      renderSiteCheckoutDonut(webhookRows);
+      renderAmountSpentLine(toArray(commerce, 'amount_spent_daily'));
+      document.getElementById('dashboard_best_site').textContent = webhookRows[0]?.site ? String(webhookRows[0].site).toUpperCase() : 'N/A';
     }
 
     async function savePlan() {
