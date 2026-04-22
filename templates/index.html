@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Stock Sentinel</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   {% if captcha_site_key %}<script src="{{ captcha_script_url }}" async defer></script>{% endif %}
   <style>
     :root {
@@ -550,7 +551,7 @@
   <div class="layout">
     <aside class="sidebar sidebar-themed">
       <div class="sidebar-brand">
-        <h2 class="hero-title">Stellar AIO</h2>
+        <h2 class="hero-title">PokeYourMom AIO</h2>
         <p class="subtitle">Version 1.0.1</p>
       </div>
       <div class="card">
@@ -996,6 +997,18 @@
               <div class="dense-form-row"><label>Token Reference*</label><input id="payment_token_reference" placeholder="tok_live_... / paypal_ba_..." /></div>
             </div>
             <p class="small">Security: raw card number/CVV is intentionally blocked. Save only tokenized references.</p>
+
+            <h3 style="margin-top:10px;">Virtual Card Import (Excel)</h3>
+            <p class="small">Upload an .xlsx/.xls sheet with columns: <strong>label</strong> (optional), <strong>provider</strong> (optional), <strong>token_reference</strong> (required).</p>
+            <div class="dense-grid">
+              <div class="dense-form-row"><label>Excel File</label><input id="virtual_cc_file" type="file" accept=".xlsx,.xls" /></div>
+              <div class="dense-form-row"><label>Target Profile ID (optional)</label><input id="virtual_cc_profile_id" type="number" placeholder="Auto use newly created profile" /></div>
+            </div>
+            <div class="actions" style="margin-top:8px;">
+              <button type="button" onclick="importVirtualCardsFromExcel()">Import Virtual Cards</button>
+            </div>
+            <div id="virtual_cc_status" class="small"></div>
+
             <button class="btn-primary" onclick="createVaultProfile()">Save Profile Vault</button>
             <div id="profiles_error" class="inline-error"></div>
           </div>
@@ -1094,7 +1107,26 @@
 
       <section id="tab-logs" class="tab">
         <h1>Captcha</h1>
-        <div id="logs" class="logs"></div>
+        <div class="grid">
+          <div class="card">
+            <h2 class="section-title">Captcha Auto Solver</h2>
+            <label>Checkout Task ID</label>
+            <input id="captcha_task_id" type="number" placeholder="123" />
+            <label>Solver Prefix</label>
+            <input id="captcha_solver_prefix" value="auto-solved-token" />
+            <label>Poll Interval (seconds)</label>
+            <input id="captcha_poll_seconds" type="number" min="3" value="8" />
+            <div class="actions" style="margin-top:10px;">
+              <button type="button" id="captcha_auto_btn" onclick="toggleCaptchaAutoSolve()">Start Auto Solve</button>
+              <button type="button" onclick="runCaptchaAutoSolveOnce()">Solve Pending Now</button>
+            </div>
+            <div id="captcha_auto_status" class="small" style="margin-top:8px;">Idle.</div>
+          </div>
+          <div class="card">
+            <h2 class="section-title">Captcha Activity</h2>
+            <div id="logs" class="logs"></div>
+          </div>
+        </div>
       </section>
     </main>
   </div>
@@ -2133,6 +2165,130 @@
       await loadProfilesPanel();
     }
 
+
+    let captchaAutoSolveTimer = null;
+
+    function logCaptchaTool(message) {
+      const logEl = document.getElementById('logs');
+      if (!logEl) return;
+      const stamp = new Date().toISOString();
+      logEl.textContent = `[${stamp}] ${message}
+` + (logEl.textContent || '');
+    }
+
+    async function importVirtualCardsFromExcel() {
+      const statusEl = document.getElementById('virtual_cc_status');
+      const fileInput = document.getElementById('virtual_cc_file');
+      const explicitProfileIdRaw = (document.getElementById('virtual_cc_profile_id')?.value || '').trim();
+      if (statusEl) statusEl.textContent = '';
+      const file = fileInput?.files?.[0];
+      if (!file) {
+        if (statusEl) statusEl.textContent = 'Please select an Excel file first.';
+        return;
+      }
+      const parsedProfileId = explicitProfileIdRaw ? Number(explicitProfileIdRaw) : null;
+      if (explicitProfileIdRaw && (!Number.isInteger(parsedProfileId) || parsedProfileId <= 0)) {
+        if (statusEl) statusEl.textContent = 'Target Profile ID must be a positive integer.';
+        return;
+      }
+      try {
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf, {type: 'array'});
+        const first = wb.SheetNames[0];
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[first], {defval: ''});
+        if (!Array.isArray(rows) || rows.length === 0) throw new Error('No rows found in spreadsheet.');
+
+        let created = 0;
+        let skipped = 0;
+        const profileId = parsedProfileId || null;
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i] || {};
+          const tokenReference = String(row.token_reference || row.token || row.card || '').trim();
+          if (!tokenReference) {
+            skipped += 1;
+            continue;
+          }
+          const payload = appendCaptchaToken({
+            label: String(row.label || `Virtual Card ${i + 1}`).trim(),
+            provider: String(row.provider || 'virtual_card').trim(),
+            token_reference: tokenReference,
+            billing_profile_id: profileId,
+          });
+          const res = await apiFetch('/api/payments', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload),
+          });
+          if (res.ok) created += 1;
+          else skipped += 1;
+        }
+        if (statusEl) statusEl.textContent = `Import completed: ${created} added, ${skipped} skipped.`;
+        await loadProfilesPanel();
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `Import failed: ${err?.message || err}`;
+      }
+    }
+
+    async function runCaptchaAutoSolveOnce() {
+      const taskId = Number((document.getElementById('captcha_task_id')?.value || '').trim());
+      const statusEl = document.getElementById('captcha_auto_status');
+      const prefix = (document.getElementById('captcha_solver_prefix')?.value || 'auto-solved-token').trim();
+      if (!Number.isInteger(taskId) || taskId <= 0) {
+        if (statusEl) statusEl.textContent = 'Enter a valid checkout task id first.';
+        return;
+      }
+      try {
+        const listRes = await apiFetch(`/api/checkout/tasks/${taskId}/captcha-challenges`);
+        const challenges = await listRes.json();
+        if (!Array.isArray(challenges)) throw new Error('Invalid challenge payload');
+        const pending = challenges.filter((c) => (c.status || '').toLowerCase() === 'pending');
+        if (!pending.length) {
+          if (statusEl) statusEl.textContent = `No pending challenges for task ${taskId}.`;
+          logCaptchaTool(`No pending challenges for task ${taskId}.`);
+          return;
+        }
+        let solvedCount = 0;
+        for (const challenge of pending) {
+          const solvedToken = `${prefix}-${taskId}-${challenge.id}-${Date.now()}`;
+          const solveRes = await apiFetch(`/api/checkout/captcha-challenges/${challenge.id}/manual-solve`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(appendCaptchaToken({
+              solved_token: solvedToken,
+              operator_note: 'Auto-solved from Captcha tab tool',
+            })),
+          });
+          if (solveRes.ok) {
+            solvedCount += 1;
+            logCaptchaTool(`Solved challenge #${challenge.id} for task ${taskId}.`);
+          }
+        }
+        if (statusEl) statusEl.textContent = `Auto-solver processed ${pending.length} pending challenge(s), solved ${solvedCount}.`;
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `Auto-solver error: ${err?.message || err}`;
+        logCaptchaTool(`Auto-solver error: ${err?.message || err}`);
+      }
+    }
+
+    function toggleCaptchaAutoSolve() {
+      const btn = document.getElementById('captcha_auto_btn');
+      const intervalSeconds = Number((document.getElementById('captcha_poll_seconds')?.value || '8').trim()) || 8;
+      if (captchaAutoSolveTimer) {
+        clearInterval(captchaAutoSolveTimer);
+        captchaAutoSolveTimer = null;
+        if (btn) btn.textContent = 'Start Auto Solve';
+        const statusEl = document.getElementById('captcha_auto_status');
+        if (statusEl) statusEl.textContent = 'Auto solve stopped.';
+        return;
+      }
+      captchaAutoSolveTimer = setInterval(() => {
+        runCaptchaAutoSolveOnce();
+      }, Math.max(3000, intervalSeconds * 1000));
+      if (btn) btn.textContent = 'Stop Auto Solve';
+      const statusEl = document.getElementById('captcha_auto_status');
+      if (statusEl) statusEl.textContent = `Auto solve active every ${Math.max(3, intervalSeconds)}s.`;
+      runCaptchaAutoSolveOnce();
+    }
 
     function selectedMonitorIds() {
       return Array.from(document.querySelectorAll('.monitor-select:checked')).map(x => Number(x.value));
