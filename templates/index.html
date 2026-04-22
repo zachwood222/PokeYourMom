@@ -844,6 +844,15 @@
             <strong>Best Site</strong>
             <span id="dashboard_best_site">N/A</span>
           </div>
+          <div class="metric-card">
+            <h3>Autopilot Spend</h3>
+            <span id="dashboard_autopilot_spend">$0.00 / $0.00</span>
+          </div>
+          <div class="metric-card">
+            <h3>Strategy State</h3>
+            <span id="dashboard_autopilot_state">N/A</span>
+            <small id="dashboard_autopilot_pause_reason">No automatic pauses</small>
+          </div>
         </div>
 
         <div class="card" style="margin-top:14px;">
@@ -974,6 +983,9 @@
               <div class="dense-form-row"><label>Name</label><input id="task_name" placeholder="Enter Task Name" /></div>
               <div class="dense-form-row"><label>Monitor</label><select id="task_monitor_id"></select></div>
               <div class="dense-form-row"><label>Mode</label><select id="task_mode"><option value="default">default</option><option value="safe">safe</option><option value="fast">fast</option><option value="instore">instore</option></select></div>
+              <div class="dense-form-row"><label>Autopilot Preset</label><select id="task_autopilot_preset"><option value="safe">Safe</option><option value="balanced" selected>Balanced</option><option value="aggressive">Aggressive</option></select></div>
+              <div class="dense-form-row"><label>Autopilot Profile</label><select id="task_autopilot_profile_id"><option value="">No profile</option></select></div>
+              <div class="dense-form-row" style="grid-column:1/-1;"><label>Estimated Behavior</label><div id="task_autopilot_behavior_summary" class="small">Balanced: moderate retries and budget caps.</div></div>
               <div class="dense-form-row"><label>Profile / Group</label><input id="task_profile_group" placeholder="Select Profile" /></div>
               <div class="dense-form-row"><label>Monitor Proxy</label><input id="task_proxy_group" placeholder="Select Monitor Proxy" /></div>
               <div class="dense-form-row"><label>Checkout Proxy</label><input id="task_checkout_proxy_group" placeholder="Select Checkout Proxy" /></div>
@@ -999,6 +1011,7 @@
                 <div class="summary-item"><strong>Products</strong><span id="summary_products">monitor default</span></div>
                 <div class="summary-item"><strong>Profile Group</strong><span id="summary_profile_group">-</span></div>
                 <div class="summary-item"><strong>Proxy Group</strong><span id="summary_proxy_group">-</span></div>
+                <div class="summary-item"><strong>Autopilot</strong><span id="summary_autopilot">balanced</span></div>
               </div>
             </div>
             <div class="modal-footer">
@@ -1813,6 +1826,12 @@
       renderSiteCheckoutDonut(webhookRows);
       renderAmountSpentLine(toArray(commerce, 'amount_spent_daily'));
       document.getElementById('dashboard_best_site').textContent = webhookRows[0]?.site ? String(webhookRows[0].site).toUpperCase() : 'N/A';
+      const autopilotRows = Array.isArray(commerce.autopilot) ? commerce.autopilot : [];
+      const spendConsumed = autopilotRows.reduce((sum, row) => sum + Number(row.spend_consumed_cents || 0), 0);
+      const spendCap = autopilotRows.reduce((sum, row) => sum + Number(row.spend_cap_cents || 0), 0);
+      document.getElementById('dashboard_autopilot_spend').textContent = `${formatMoney(spendConsumed)} / ${formatMoney(spendCap)}`;
+      document.getElementById('dashboard_autopilot_state').textContent = autopilotRows[0]?.state || 'N/A';
+      document.getElementById('dashboard_autopilot_pause_reason').textContent = autopilotRows[0]?.pause_reason || 'No automatic pauses';
     }
 
     async function savePlan() {
@@ -1981,6 +2000,26 @@
       await loadDashboardSummary();
     }
 
+
+    function autopilotPresetSummary(preset) {
+      if (preset === 'safe') return 'Safe: low budget cap, minimal retries, sticky identities.';
+      if (preset === 'aggressive') return 'Aggressive: high cap, higher retries, frequent rotation.';
+      return 'Balanced: moderate retries and budget caps.';
+    }
+
+    async function loadAutopilotProfiles() {
+      const select = document.getElementById('task_autopilot_profile_id');
+      if (!select) return;
+      const rows = await apiFetch('/api/autopilot-profiles').then(r => r.json()).catch(() => []);
+      select.innerHTML = '<option value="">No profile</option>';
+      rows.forEach((profile) => {
+        const option = document.createElement('option');
+        option.value = String(profile.id);
+        option.textContent = `${profile.name} (${profile.preset || 'balanced'})`;
+        select.appendChild(option);
+      });
+    }
+
     async function createTask() {
       const monitorIdRaw = (document.getElementById('task_monitor_id')?.value || '').trim();
       const taskName = (document.getElementById('task_name')?.value || '').trim();
@@ -2006,6 +2045,9 @@
       const checkoutProxyGroup = (document.getElementById('task_checkout_proxy_group')?.value || '').trim();
       const queueDelayRaw = (document.getElementById('task_queue_entry_delay_ms')?.value || '').trim();
       const promoCode = (document.getElementById('task_promo_code')?.value || '').trim();
+      const autopilotPreset = (document.getElementById('task_autopilot_preset')?.value || 'balanced').trim();
+      const autopilotProfileRaw = (document.getElementById('task_autopilot_profile_id')?.value || '').trim();
+      const autopilotProfileId = autopilotProfileRaw ? Number(autopilotProfileRaw) : null;
       const payloadBase = {
         monitor_id: monitorId,
         initial_state: 'queued',
@@ -2016,9 +2058,13 @@
           checkout_proxy_group: checkoutProxyGroup || null,
           queue_entry_delay_ms: queueDelayRaw === '' ? null : Number(queueDelayRaw),
           promo_code: promoCode || null,
+          autopilot_preset: autopilotPreset,
         }
       };
 
+      if (autopilotProfileId) {
+        payloadBase.autopilot_profile_id = autopilotProfileId;
+      }
       if (taskName) {
         payloadBase.task_name = taskName;
       }
@@ -2087,6 +2133,7 @@
       const profileGroup = (document.getElementById('task_profile_group')?.value || '').trim();
       const proxyGroup = (document.getElementById('task_proxy_group')?.value || '').trim();
       const monitorId = (document.getElementById('task_monitor_id')?.value || '').trim();
+      const autopilotPreset = (document.getElementById('task_autopilot_preset')?.value || 'balanced').trim();
       const promoCode = (document.getElementById('task_promo_code')?.value || '').trim();
       const createBtn = document.getElementById('create_task_btn');
       const promoWarning = document.getElementById('task_promo_warning');
@@ -2099,6 +2146,9 @@
       document.getElementById('summary_products').textContent = productInput || 'monitor default';
       document.getElementById('summary_profile_group').textContent = profileGroup || '-';
       document.getElementById('summary_proxy_group').textContent = proxyGroup || '-';
+      document.getElementById('summary_autopilot').textContent = autopilotPreset;
+      const behaviorSummary = document.getElementById('task_autopilot_behavior_summary');
+      if (behaviorSummary) behaviorSummary.textContent = autopilotPresetSummary(autopilotPreset);
       if (promoWarning) promoWarning.textContent = promoOk ? '' : 'Promo code appears invalid and may be rejected at checkout.';
       if (taskErrorEl) taskErrorEl.textContent = productError || '';
 
@@ -3117,7 +3167,7 @@
     hydrateTaskGroups();
     ensureDefaultTaskGroups();
     renderTaskGroups();
-    ['task_monitor_id', 'task_name', 'task_count', 'task_mode', 'task_products', 'task_profile_group', 'task_proxy_group', 'task_checkout_proxy_group', 'task_queue_entry_delay_ms', 'task_promo_code']
+    ['task_monitor_id', 'task_name', 'task_count', 'task_mode', 'task_autopilot_preset', 'task_autopilot_profile_id', 'task_products', 'task_profile_group', 'task_proxy_group', 'task_checkout_proxy_group', 'task_queue_entry_delay_ms', 'task_promo_code']
       .forEach((id) => {
         const el = document.getElementById(id);
         if (!el) return;
@@ -3149,6 +3199,7 @@
     updateTaskModeFields();
     loadTasks();
     loadDashboardSummary();
+    loadAutopilotProfiles();
     startClock();
   </script>
 </body>
