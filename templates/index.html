@@ -691,12 +691,12 @@
     <div class="topbar-left">
       <div class="app-mark"></div>
       <nav class="top-nav">
-        <button class="active" data-tab="home" onclick="setTab('home')">Dashboard</button>
-        <button data-tab="monitors" onclick="setTab('monitors')">Tasks</button>
-        <button data-tab="profiles" onclick="setTab('profiles')">Profiles</button>
-        <button data-tab="webhooks" onclick="setTab('webhooks')">Proxies</button>
-        <button data-tab="logs" onclick="setTab('logs')">Captcha</button>
-        <button data-tab="settings" onclick="setTab('settings')">Settings</button>
+        <button type="button" class="active" data-tab="home">Dashboard</button>
+        <button type="button" data-tab="monitors">Tasks</button>
+        <button type="button" data-tab="profiles">Profiles</button>
+        <button type="button" data-tab="webhooks">Proxies</button>
+        <button type="button" data-tab="logs">Captcha</button>
+        <button type="button" data-tab="settings">Settings</button>
       </nav>
     </div>
     <div class="topbar-right" id="clock">--:--:--</div>
@@ -1240,7 +1240,7 @@
 
         <div class="card" style="margin-top:16px;">
           <h2>Live Captcha Logs</h2>
-          <div id="logs" class="logs"></div>
+          <div id="captcha_guide_logs" class="logs"></div>
         </div>
         <h1>Captcha</h1>
         <div class="grid">
@@ -1260,7 +1260,7 @@
           </div>
           <div class="card">
             <h2 class="section-title">Captcha Activity</h2>
-            <div id="logs" class="logs"></div>
+            <div id="captcha_activity_logs" class="logs"></div>
           </div>
         </div>
       </section>
@@ -1625,10 +1625,30 @@
     }
 
     function setTab(tab) {
+      const tabPane = document.getElementById(`tab-${tab}`);
+      const tabBtn = document.querySelector(`.top-nav button[data-tab="${tab}"]`);
+      if (!tabPane || !tabBtn) {
+        console.warn(`Unknown tab requested: ${tab}`);
+        return;
+      }
       document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
-      document.querySelectorAll('.top-nav button').forEach(el => el.classList.remove('active'));
-      document.getElementById(`tab-${tab}`).classList.add('active');
-      document.querySelector(`.top-nav button[data-tab="${tab}"]`).classList.add('active');
+      document.querySelectorAll('.top-nav button[data-tab]').forEach(el => el.classList.remove('active'));
+      tabPane.classList.add('active');
+      tabBtn.classList.add('active');
+      window.location.hash = `tab-${tab}`;
+    }
+
+    function initializeTabNavigation() {
+      document.querySelectorAll('.top-nav button[data-tab]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const target = button.dataset.tab;
+          if (target) setTab(target);
+        });
+      });
+      const hashTab = (window.location.hash || '').replace(/^#tab-/, '');
+      if (hashTab) {
+        setTab(hashTab);
+      }
     }
 
     function renderApiAuthWarning() {
@@ -1643,9 +1663,11 @@
     }
 
     socket.on('log', (d) => {
-      const logs = document.getElementById('logs');
-      logs.textContent += d.message + "\n";
-      logs.scrollTop = logs.scrollHeight;
+      const logs = document.getElementById('captcha_activity_logs');
+      if (logs) {
+        logs.textContent += d.message + "\n";
+        logs.scrollTop = logs.scrollHeight;
+      }
       const selected = selectedTaskId;
       if (!selected) return;
       if ((d.message || '').includes(`Task ${selected}`)) {
@@ -2743,7 +2765,7 @@
     let captchaAutoSolveTimer = null;
 
     function logCaptchaTool(message) {
-      const logEl = document.getElementById('logs');
+      const logEl = document.getElementById('captcha_guide_logs');
       if (!logEl) return;
       const stamp = new Date().toISOString();
       logEl.textContent = `[${stamp}] ${message}
@@ -3062,6 +3084,7 @@
       setInterval(paint, 1000);
     }
 
+    initializeTabNavigation();
     renderApiAuthWarning();
     hydrateTaskGroups();
     ensureDefaultTaskGroups();
