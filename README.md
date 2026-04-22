@@ -53,9 +53,30 @@ The last two commands are explicit migration-safety checks for:
   - `X-API-Token: <token>`
 - `POST /api/webhooks` to add Discord webhook.
 - `POST /api/monitors` to add product monitor.
+- `POST /api/checkout/tasks` to create a checkout task for an existing monitor.
+- `POST /api/checkout/tasks/:id/start|pause|stop` to manage checkout task lifecycle.
+- `GET /api/checkout/tasks/:id/state` to read canonical task state and last attempt metadata.
+- `POST /api/billing/stripe/webhook` (and alias `POST /api/stripe/webhook`) for Stripe subscription lifecycle ingestion (signature-verified and idempotent by `event.id`).
 - `POST /api/start` to begin background checks.
 - `POST /api/monitors/:id/check` to run an immediate check.
 - `GET /api/workspace/usage-limits` to retrieve plan limits + current usage snapshot.
+
+Stripe webhook configuration:
+
+- `STRIPE_WEBHOOK_SECRET` (required): signing secret used to verify `Stripe-Signature`.
+- `STRIPE_WEBHOOK_TOLERANCE_SECONDS` (optional, default `300`): max allowed timestamp drift for webhook signatures.
+
+Billing state transitions (workspace plan sync):
+
+- `customer.subscription.created` / `customer.subscription.updated`: workspace `subscription_status` is updated and plan is mapped from Stripe plan metadata (`pro`/`team` lookup keys map to higher tiers, otherwise `basic`).
+- `customer.subscription.deleted`: workspace is forced to `basic` with `subscription_status=canceled` (preserves existing plan enforcement behavior for monitor count/poll minimums).
+
+Monitor check response compatibility notes:
+
+- `POST /api/monitors/:id/check` now includes `availability_reason` and `parser_confidence`.
+- Existing response fields are unchanged.
+- `parser_confidence` is normalized to the range `[0.0, 1.0]`; if unavailable/invalid, it is `null`.
+- Clients that do not use these new fields can safely ignore them.
 
 Example:
 
@@ -98,10 +119,9 @@ Schema notes:
 ## Notes
 
 This project is a scaffold for a subscription monitoring SaaS and should be expanded with:
-- authentication and multi-tenant authz,
-- Stripe billing webhooks,
+- stronger checkout automations and provider integrations,
 - stronger HTML parsing adapters per retailer,
-- observability and error dashboards.
+- richer observability and error dashboards.
 
 ## Phase 2 baseline shipped
 
@@ -129,9 +149,11 @@ The regression harness in `tests/test_parser_fixtures.py` asserts two expectatio
 
 - `expected_in_stock` (`True`/`False`)
 - `expected_status` (`in_stock` or `out_or_unknown`)
+- failure output includes the exact fixture path (for example `walmart/ambiguous.html`) to make regressions easy to triage.
 
 To add a new fixture case:
 
 1. Add the HTML snapshot in `tests/fixtures/<retailer>/`.
-2. Register a `pytest.param(...)` case in `tests/parser_fixture_harness.py` (case IDs are formatted as `<retailer>:<fixture_name>`).
-3. Run `pytest tests/test_parser_fixtures.py` to validate the new snapshot.
+2. Register the expected output in `PARSER_FIXTURE_EXPECTATIONS` in `tests/parser_fixture_harness.py`.
+3. Ensure each retailer still includes the required baseline snapshots: `in_stock`, `out_of_stock`, and `ambiguous`.
+4. Run `pytest tests/test_parser_fixtures.py` to validate the new snapshot.
