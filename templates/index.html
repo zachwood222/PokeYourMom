@@ -746,41 +746,6 @@
           <div class="card"><div class="kpi-label">Webhook Sent</div><div id="ops_webhook_sent_total" class="kpi-value">0</div></div>
           <div class="card"><div class="kpi-label">Webhook Failed</div><div id="ops_webhook_failed_total" class="kpi-value">0</div></div>
         </div>
-        <div class="kpi-grid" style="margin-top:12px;">
-          <div class="card"><div class="kpi-label">Checks Total</div><div id="ops_checks_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Checks Failed</div><div id="ops_checks_failed_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Alerts Created</div><div id="ops_alerts_created_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Webhook Sent</div><div id="ops_webhook_sent_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Webhook Failed</div><div id="ops_webhook_failed_total" class="kpi-value">0</div></div>
-        </div>
-        <div class="kpi-grid" style="margin-top:12px;">
-          <div class="card"><div class="kpi-label">Checks Total</div><div id="ops_checks_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Checks Failed</div><div id="ops_checks_failed_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Alerts Created</div><div id="ops_alerts_created_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Webhook Sent</div><div id="ops_webhook_sent_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Webhook Failed</div><div id="ops_webhook_failed_total" class="kpi-value">0</div></div>
-        </div>
-        <div class="kpi-grid" style="margin-top:12px;">
-          <div class="card"><div class="kpi-label">Checks Total</div><div id="ops_checks_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Checks Failed</div><div id="ops_checks_failed_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Alerts Created</div><div id="ops_alerts_created_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Webhook Sent</div><div id="ops_webhook_sent_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Webhook Failed</div><div id="ops_webhook_failed_total" class="kpi-value">0</div></div>
-        </div>
-        <div class="kpi-grid" style="margin-top:12px;">
-          <div class="card"><div class="kpi-label">Checks Total</div><div id="ops_checks_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Checks Failed</div><div id="ops_checks_failed_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Alerts Created</div><div id="ops_alerts_created_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Webhook Sent</div><div id="ops_webhook_sent_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Webhook Failed</div><div id="ops_webhook_failed_total" class="kpi-value">0</div></div>
-        </div>
-        <div class="kpi-grid" style="margin-top:12px;">
-          <div class="card"><div class="kpi-label">Checks Total</div><div id="ops_checks_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Checks Failed</div><div id="ops_checks_failed_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Alerts Created</div><div id="ops_alerts_created_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Webhook Sent</div><div id="ops_webhook_sent_total" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Webhook Failed</div><div id="ops_webhook_failed_total" class="kpi-value">0</div></div>
-        </div>
 
         <div class="workspace">
           <div class="card">
@@ -802,12 +767,12 @@
           </div>
           <div class="dash-stat rose">
             <div class="dash-stat-label">Declines</div>
-            <div id="ops_checks_failed_total" class="dash-stat-value">0</div>
+            <div id="dash_declines_total" class="dash-stat-value">0</div>
             <div class="dash-stat-sub">Total Declines</div>
           </div>
           <div class="dash-stat blue">
             <div class="dash-stat-label">Spent</div>
-            <div id="ops_webhook_sent_total" class="dash-stat-value">0</div>
+            <div id="dash_spent_total" class="dash-stat-value">0</div>
             <div class="dash-stat-sub">Total Spent</div>
           </div>
           <div class="dash-welcome card">
@@ -878,16 +843,6 @@
           </table>
         </div>
 
-        <div style="display:none;">
-          <input id="runtime_running" disabled />
-          <input id="runtime_latest_check" disabled />
-          <div id="kpi_enabled_monitors">0</div>
-          <div id="kpi_events_24h">0</div>
-          <div id="kpi_success_rate">0%</div>
-          <div id="ops_checks_total">0</div>
-          <div id="ops_alerts_created_total">0</div>
-          <div id="ops_webhook_failed_total">0</div>
-        </div>
       </section>
 
       <section id="tab-monitors" class="tab tasks-clone-tab">
@@ -1747,10 +1702,6 @@
 
     async function loadDashboardSummary() {
       const data = await apiFetch('/api/dashboard/summary').then(r => r.json());
-      document.getElementById('kpi_total_monitors').textContent = data.total_monitors;
-      document.getElementById('kpi_enabled_monitors').textContent = data.enabled_monitors;
-      document.getElementById('kpi_events_24h').textContent = data.events_last_24h;
-      document.getElementById('kpi_success_rate').textContent = `${Math.round(data.delivery_success_rate * 100)}%`;
       document.getElementById('kpi_total_monitors_side').textContent = data.total_monitors;
       document.getElementById('kpi_enabled_monitors_side').textContent = data.enabled_monitors;
       document.getElementById('kpi_events_24h_side').textContent = data.events_last_24h;
@@ -1780,20 +1731,22 @@
       document.getElementById('ops_alerts_created_total').textContent = alertsCreated;
       document.getElementById('ops_webhook_sent_total').textContent = webhookSent;
       document.getElementById('ops_webhook_failed_total').textContent = webhookFailed;
+      document.getElementById('dash_declines_total').textContent = checksFailed;
     }
 
     async function loadOpsTrends() {
-      const monitorData = await apiFetch('/api/ops/monitor-failure-trends').then(r => r.json()).catch(() => ({trends: []}));
-      const webhookData = await apiFetch('/api/ops/webhook-health-trends').then(r => r.json()).catch(() => ({webhooks: []}));
+      await loadCommerceDashboard();
+    }
 
     async function loadCommerceDashboard() {
       const commerce = await apiFetch('/api/dashboard/commerce').then(r => r.json()).catch(() => ({}));
       const checkouts = Number(commerce.checkouts_total || 0);
       const declines = Number(commerce.declines_total || 0);
       const spent = Number(commerce.spent_total_cents || 0);
-      document.getElementById('kpi_total_monitors').textContent = checkouts;
       document.getElementById('ops_checks_failed_total').textContent = declines;
       document.getElementById('ops_webhook_sent_total').textContent = formatMoney(spent);
+      document.getElementById('dash_declines_total').textContent = declines;
+      document.getElementById('dash_spent_total').textContent = formatMoney(spent);
       document.getElementById('dashboard_conversion_rate').textContent = `${Math.round(Number(commerce.success_rate || 0) * 100)}%`;
       document.getElementById('dashboard_average_order').textContent = formatMoney(commerce.average_order_value_cents || 0);
 
