@@ -1093,8 +1093,74 @@
       </section>
 
       <section id="tab-logs" class="tab">
-        <h1>Captcha</h1>
-        <div id="logs" class="logs"></div>
+        <h1>Captcha Dashboard</h1>
+        <p class="helper">Configure captcha harvesters for One-Click Gmail sessions and review best-practice setup guidance before running tasks.</p>
+
+        <div class="grid" style="margin-top:16px;">
+          <div class="card">
+            <h2>Quick Start</h2>
+            <ol class="helper" style="padding-left:18px; margin:0; display:flex; flex-direction:column; gap:8px;">
+              <li>Install <strong>Google Chrome</strong>. Captcha solvers use your local Chrome browser profile.</li>
+              <li>Go to <strong>Captchas</strong> and click <strong>Add Captcha</strong> to create a harvester.</li>
+              <li>Optional: set a proxy in <strong>Enter Proxy</strong> if you want captcha traffic on a specific IP.</li>
+              <li>Click the <strong>YouTube</strong> button and sign in to a Google account (not required for Pokémon Center).</li>
+              <li>After sign-in succeeds, close the YouTube window and open the pop-out arrow window before tasks start.</li>
+            </ol>
+          </div>
+
+          <div class="card">
+            <h2>Buttons & Actions</h2>
+            <table>
+              <thead><tr><th>Control</th><th>What it does</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Add Captcha</strong></td><td>Creates another captcha harvester for additional accounts or parallel tasks.</td></tr>
+                <tr><td><strong>Enter Proxy</strong></td><td>Optional. If blank, harvester uses localhost IP. For reCAPTCHA targets, this field proxy is used.</td></tr>
+                <tr><td><strong>Pop-out Arrow</strong></td><td>Opens the harvester window so you can manually answer challenges.</td></tr>
+                <tr><td><strong>YouTube</strong></td><td>Opens Google sign-in flow for the harvester account session.</td></tr>
+                <tr><td><strong>Eraser</strong></td><td>Logs out Google and clears stored harvester state.</td></tr>
+                <tr><td><strong>Trash Can</strong></td><td>Deletes the harvester.</td></tr>
+                <tr><td><strong>Floppy Disk</strong></td><td>Saves current harvester settings and session-related data.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="grid" style="margin-top:16px;">
+          <div class="card">
+            <h2>Auto Click & Auto Solve</h2>
+            <ul class="helper" style="margin:0; padding-left:18px; display:flex; flex-direction:column; gap:8px;">
+              <li><strong>Auto Click</strong>: Works across all modules. Automatically clicks eligible one-click checkbox captchas.</li>
+              <li><strong>Auto Solve (Serverside)</strong>: Pokémon Center only. Uses remote infrastructure and is capped at <strong>10 enabled instances</strong> at once.</li>
+              <li><strong>Auto Solve (Local AI)</strong>: Pokémon Center only. Uses your local machine (GPU/CPU) for solving.</li>
+            </ul>
+            <p class="helper" style="margin-top:10px;">Recommendation: prefer <strong>Serverside</strong> on hosted/server environments. Use <strong>Local AI</strong> on a local PC with strong hardware.</p>
+          </div>
+
+          <div class="card">
+            <h2>Local AI Requirements</h2>
+            <ul class="helper" style="margin:0; padding-left:18px; display:flex; flex-direction:column; gap:8px;">
+              <li>Enable Local AI once; the model downloads automatically and only reinstalls for updates.</li>
+              <li>Before a Pokémon Center drop, confirm solver status shows <strong>Ready</strong> and run a <strong>Test</strong> solve.</li>
+              <li>Minimum <strong>8GB VRAM</strong> recommended. CPU fallback works but is significantly slower.</li>
+              <li>Validated examples include RTX 3060, 3070, and 4060 for stable multi-harvester usage.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+          <h2>Proxy Behavior Notes</h2>
+          <ul class="helper" style="margin:0; padding-left:18px; display:flex; flex-direction:column; gap:8px;">
+            <li>You can solve all captchas with one harvester; multiple harvesters are optional for scale.</li>
+            <li>If Gmail sign-in fails repeatedly, delete the harvester and create a new one.</li>
+            <li>For Pokémon Center-style captcha flows, <strong>task proxy settings take priority</strong> over harvester proxy.</li>
+            <li>For reCAPTCHA flows, the <strong>harvester proxy field</strong> is used for captcha solving.</li>
+          </ul>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+          <h2>Live Captcha Logs</h2>
+          <div id="logs" class="logs"></div>
+        </div>
       </section>
     </main>
   </div>
