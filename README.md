@@ -56,13 +56,7 @@ The last two commands are explicit migration-safety checks for:
 - `POST /api/checkout/tasks` to create a checkout task for an existing monitor.
 - `POST /api/checkout/tasks/:id/start|pause|stop` to manage checkout task lifecycle.
 - `GET /api/checkout/tasks/:id/state` to read canonical task state and last attempt metadata.
-- `POST /api/billing/stripe/webhook` for Stripe subscription lifecycle ingestion (signature-verified and idempotent by `event.id`).
-- `GET /api/monitors/<id>` to fetch a monitor within the current workspace.
-- `PATCH /api/monitors/<id>` to update monitor fields (for example, `enabled`).
-- `DELETE /api/monitors/<id>` to remove a monitor in the current workspace.
-- `POST /api/checkout/tasks` to create a checkout task for an existing monitor.
-- `POST /api/checkout/tasks/:id/start|pause|stop` to manage checkout task lifecycle.
-- `GET /api/checkout/tasks/:id/state` to read canonical task state and last attempt metadata.
+- `POST /api/billing/stripe/webhook` (and alias `POST /api/stripe/webhook`) for Stripe subscription lifecycle ingestion (signature-verified and idempotent by `event.id`).
 - `POST /api/start` to begin background checks.
 - `POST /api/checkout/tasks` to create a checkout task from an existing monitor.
 - `POST /api/checkout/tasks/:id/start` to transition task into `monitoring`.
@@ -125,10 +119,9 @@ Schema notes:
 ## Notes
 
 This project is a scaffold for a subscription monitoring SaaS and should be expanded with:
-- authentication and multi-tenant authz,
-- Stripe billing webhooks,
+- stronger checkout automations and provider integrations,
 - stronger HTML parsing adapters per retailer,
-- observability and error dashboards.
+- richer observability and error dashboards.
 
 ## Phase 2 baseline shipped
 

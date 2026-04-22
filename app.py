@@ -93,6 +93,11 @@ PLAN_LOOKUP_TO_INTERNAL_PLAN = {
     "pro": "pro",
     "team": "team",
 }
+STRIPE_SUBSCRIPTION_EVENT_TYPES = {
+    "customer.subscription.created",
+    "customer.subscription.updated",
+    "customer.subscription.deleted",
+}
 SUPPORTED_RETAILERS = {"walmart", "target", "bestbuy", "pokemoncenter"}
 SUPPORTED_MONITOR_CATEGORIES = {"pokemon", "sports_cards", "one_piece", "lorcana"}
 RETAILER_CATEGORY_SUPPORT = {
@@ -2107,7 +2112,11 @@ def verify_captcha_token(token: str) -> tuple[bool, str | None]:
 
 
 def _is_captcha_protected_request() -> bool:
-    return captcha_verifier.is_captcha_protected_request(request)
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return False
+    if request.path in {"/api/billing/stripe/webhook", "/api/stripe/webhook"}:
+        return False
+    return request.path.startswith("/api/")
 
 
 def _captcha_token_from_request() -> str:
@@ -2118,7 +2127,7 @@ def _captcha_token_from_request() -> str:
 def require_api_auth() -> tuple[dict[str, str], int] | None:
     incoming_correlation_id = (request.headers.get(CORRELATION_ID_HEADER) or "").strip()
     g.correlation_id = incoming_correlation_id or str(uuid4())
-    if request.path == "/api/billing/stripe/webhook":
+    if request.path in {"/api/billing/stripe/webhook", "/api/stripe/webhook"}:
         return None
     if not request.path.startswith("/api/"):
         return None
@@ -2405,8 +2414,6 @@ def evaluate_page(
     category: str | None = None,
 ) -> MonitorResult:
     return parse_monitor_html(html=html, keyword=keyword, retailer=retailer)
-    adapter = get_adapter_for_retailer(retailer)
-    return run_retailer_flow(adapter, {"html": html, "keyword": keyword, "category": category})
 
 
 def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
@@ -3236,6 +3243,24 @@ def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
     return str(webhook["webhook_url"] or "")
 
 
+def normalize_parser_confidence(value: Any) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    confidence = float(value)
+    if math.isnan(confidence) or math.isinf(confidence):
+        return None
+    return min(1.0, max(0.0, confidence))
+
+
+def parser_metadata_payload(result: MonitorResult) -> dict[str, Any]:
+    return {
+        "availability_reason": result.availability_reason,
+        "parser_confidence": normalize_parser_confidence(result.parser_confidence),
+    }
+
+
 def create_secret(
     conn: sqlite3.Connection,
     workspace_id: int,
@@ -3267,6 +3292,35 @@ def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
             except ValueError:
                 pass
     return str(webhook["webhook_url"] or "")
+
+
+def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    config_raw = payload.get("task_config")
+    try:
+        payload["task_config"] = json.loads(config_raw) if config_raw else {}
+    except (TypeError, json.JSONDecodeError):
+        payload["task_config"] = {}
+    return payload
+
+
+def redact_webhook_url(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 12:
+        return "***"
+    return f"{value[:8]}...{value[-4:]}"
+
+
+def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    payload["webhook_url"] = redact_webhook_url(payload.get("webhook_url") or "")
+    payload = redact_sensitive_payload(payload)
+    return payload
 
 
 def create_secret(
@@ -3452,11 +3506,25 @@ def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
     return str(webhook["webhook_url"] or "")
 
 
-def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    if row is None:
-        return None
-    payload = dict(row)
-    config_raw = payload.get("task_config")
+def emit_monitor_events(monitor: sqlite3.Row, result: MonitorResult, eligible: bool) -> None:
+    parser_metadata = parser_metadata_payload(result)
+    payload = {
+        "monitor_id": monitor["id"],
+        "workspace_id": monitor["workspace_id"],
+        "retailer": monitor["retailer"],
+        "status_text": result.status_text,
+        "eligible_for_alert": bool(eligible),
+        "in_stock": bool(result.in_stock),
+        "price_cents": result.price_cents,
+        "availability_reason": parser_metadata["availability_reason"],
+        "parser_confidence": parser_metadata["parser_confidence"],
+        "checked_at": utc_now(),
+    }
+    try:
+        socketio.emit("monitor_update", payload)
+    except Exception as exc:  # noqa: BLE001
+        # Best-effort telemetry; never fail monitor execution because of socket emit issues.
+        print(json.dumps(format_log_entry("warning", f"monitor_update_emit_failed: {exc}", workspace_id=monitor["workspace_id"], monitor_id=monitor["id"])))
     try:
         parsed_config = json.loads(config_raw) if config_raw else {}
     except (TypeError, json.JSONDecodeError):
@@ -3555,15 +3623,30 @@ def _checkout_step_monitoring(
         raise ValueError("monitor_missing")
 
 
-def _checkout_step_carting(
-    _conn: sqlite3.Connection,
-    _task: sqlite3.Row,
-    _monitor: sqlite3.Row | None,
-    _config: dict[str, Any],
-    _attempt_number: int,
-) -> None:
-    return None
+def run_monitor_pipeline_once(monitor: sqlite3.Row) -> dict[str, Any]:
+    result = fetch_monitor(monitor)
+    eligible = alert_eligibility(monitor, result)
+    persist_monitor_state(monitor, result, eligible)
+    emit_monitor_events(monitor, result, eligible)
+    parser_metadata = parser_metadata_payload(result)
 
+    log(
+        f"Checked monitor {monitor['id']} | {monitor['retailer']} | {result.status_text} | {cents_to_dollars(result.price_cents)}",
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+    )
+    return {
+        "ok": True,
+        "in_stock": result.in_stock,
+        "eligible_for_alert": eligible,
+        "price_cents": result.price_cents,
+        "availability_reason": parser_metadata["availability_reason"],
+        "parser_confidence": parser_metadata["parser_confidence"],
+        "keyword_matched": result.keyword_matched,
+        "price_within_limit": result.price_within_limit,
+        "within_msrp_delta": result.within_msrp_delta,
+        "title": result.title,
+    }
 
 def _checkout_step_shipping(
     _conn: sqlite3.Connection,
@@ -6890,96 +6973,69 @@ def api_update_checkout_task_group_products():
     if not normalized_ids:
         return jsonify({"error": "monitor_ids must include numeric ids"}), 400
 
-    workspace_id = current_workspace_id()
-    conn = db()
-    placeholders = ",".join(["?"] * len(normalized_ids))
-    state_placeholders = ",".join(["?"] * len(RUNNING_TASK_STATES))
-    rows = conn.execute(
-        f"""
-        select ct.*, m.retailer, m.product_url
-        from checkout_tasks ct
-        join monitors m on m.id = ct.monitor_id
-        where ct.workspace_id = ?
-          and ct.monitor_id in ({placeholders})
-          and ct.current_state in ({state_placeholders})
-        order by ct.id asc
-        """,
-        (workspace_id, *normalized_ids, *RUNNING_TASK_STATES),
-    ).fetchall()
-    if not rows:
-        conn.close()
-        return jsonify({"updated": 0, "rejected": 0, "tasks_found": 0})
+def _ingest_stripe_event(event: dict[str, Any]) -> tuple[bool, int, dict[str, Any]]:
+    event_id = event.get("id")
+    event_type = event.get("type", "")
+    if not event_id:
+        return False, 400, {"error": "Missing Stripe event id"}
 
-    updated = 0
-    rejected = 0
-    errors: list[dict[str, Any]] = []
-    for row in rows:
-        task_payload = serialize_checkout_task(row) or {}
-        task_config = task_payload.get("task_config") if isinstance(task_payload.get("task_config"), dict) else {}
-        try:
-            next_config = apply_product_group_operation(task_config, operation)
-        except ValueError as exc:
-            rejected += 1
-            errors.append({"task_id": row["id"], "error": str(exc)})
-            continue
-        conn.execute(
-            "update checkout_tasks set task_config = ?, updated_at = ? where id = ? and workspace_id = ?",
-            (json.dumps(next_config), utc_now(), row["id"], workspace_id),
+
+    conn = db()
+    try:
+        conn.execute("begin")
+        insert_result = conn.execute(
+            """
+            insert or ignore into billing_webhook_events(event_id, processed_at, event_type, workspace_id)
+            values (?, ?, ?, ?)
+            """,
+            (event_id, utc_now(), event_type, workspace_id),
         )
-        refreshed = conn.execute(
-            "select * from checkout_tasks where id = ? and workspace_id = ?",
-            (row["id"], workspace_id),
-        ).fetchone()
-        if refreshed:
-            socketio.emit("task_update", serialize_task_ui(refreshed))
-        updated += 1
-
-    conn.commit()
-    conn.close()
-    return jsonify(
-        {
-            "updated": updated,
-            "rejected": rejected,
-            "tasks_found": len(rows),
-            "errors": errors[:25],
-        }
-    )
-
-
-@app.get("/api/checkout/tasks/<int:task_id>/attempts")
-@require_auth
-def api_checkout_task_attempts(task_id: int):
-    conn = db()
-    task = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
-    if not task:
+        if insert_result.rowcount == 0:
+            conn.rollback()
+            conn.close()
+            return True, 200, {"ok": True, "noop": True}
+        if event_type in STRIPE_SUBSCRIPTION_EVENT_TYPES:
+            sync_billing_subscription_event(conn, event)
+        conn.commit()
+    except sqlite3.DatabaseError as exc:
+        conn.rollback()
         conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    attempts = conn.execute(
-        """
-        select id, task_id, state, status, details, error_text, created_at
-        from checkout_attempts
-        where task_id = ? and workspace_id = ?
-        order by id desc
-        """,
-        (task_id, current_workspace_id()),
-    ).fetchall()
+        return False, 400, {"error": f"Database error: {exc}"}
     conn.close()
-    return jsonify(
-        [
-            {
-                "id": row["id"],
-                "task_id": row["task_id"],
-                "state": row["state"],
-                "step": row["status"],
-                "details": parse_json_object(row["details"]),
-                "error": row["error_text"],
-                "created_at": row["created_at"],
-            }
-            for row in attempts
-        ]
-    )
+    return True, 200, {"ok": True, "noop": False}
 
 
+def _handle_stripe_webhook_request():
+    payload = request.get_data(cache=False, as_text=False)
+    signature_header = request.headers.get("Stripe-Signature")
+    try:
+        verify_stripe_webhook_signature(payload, signature_header)
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+
+    try:
+        event = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return jsonify({"error": "Invalid JSON payload"}), 400
+    ok, status_code, payload = _ingest_stripe_event(event)
+    return jsonify(payload), status_code
+
+
+@app.post("/api/billing/stripe/webhook")
+def api_billing_stripe_webhook():
+    return _handle_stripe_webhook_request()
+
+
+@app.post("/api/stripe/webhook")
+def api_stripe_webhook():
+    return _handle_stripe_webhook_request()
+
+
+@app.get("/api/workspace")
+@require_auth
+def api_workspace():
+    row = get_workspace(current_workspace_id())
+    return jsonify({"workspace": dict(row), "user": current_user_context()})
 
 
 @app.get("/api/checkout/tasks")
@@ -7018,173 +7074,25 @@ def api_list_checkout_tasks_dup3():
     return jsonify([serialize_task_ui(row) for row in rows])
 
 
-@app.get("/api/checkout/tasks")
+def get_monitor_for_workspace(
+    conn: sqlite3.Connection, monitor_id: int, workspace_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from monitors where id = ? and workspace_id = ?",
+        (monitor_id, workspace_id),
+    ).fetchone()
+
+
+@app.get("/api/monitors/<int:monitor_id>")
 @require_auth
-def api_list_checkout_tasks_dup4():
+def api_get_monitor(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
     conn = db()
-    rows = conn.execute(
-        "select * from checkout_tasks where workspace_id = ? order by id desc",
-        (current_workspace_id(),),
-    ).fetchall()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
-    return jsonify([serialize_task_ui(row) for row in rows])
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/start")
-@require_auth
-def api_start_checkout_task(task_id: int):
-    conn = db()
-    row = transition_checkout_task(
-        conn,
-        task_id=task_id,
-        workspace_id=current_workspace_id(),
-        requested_state="monitoring",
-        reason="api_start",
-    )
     if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    conn.commit()
-    conn.close()
-    payload = serialize_checkout_task_summary(row)
-    socketio.emit("task_update", payload)
-    return jsonify({"ok": True, "task": payload})
-
-
-@app.post("/api/checkout/tasks/start-now")
-@require_auth
-def api_start_checkout_tasks_now():
-    body = request.json or {}
-    task_ids = body.get("task_ids") if isinstance(body.get("task_ids"), list) else []
-    normalized_ids = [int(task_id) for task_id in task_ids if str(task_id).isdigit()]
-    if not normalized_ids:
-        return jsonify({"error": "task_ids is required"}), 400
-    conn = db()
-    workspace_id = current_workspace_id()
-    updated_tasks: list[dict[str, Any]] = []
-    for task_id in normalized_ids:
-        task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
-        if not task:
-            continue
-        row = transition_checkout_task(
-            conn,
-            task_id=task_id,
-            workspace_id=workspace_id,
-            requested_state="monitoring",
-            reason="api_start_now_override",
-        )
-        if row:
-            updated_tasks.append(serialize_task_ui(row))
-    conn.commit()
-    conn.close()
-    for payload in updated_tasks:
-        socketio.emit("task_update", payload)
-    return jsonify({"ok": True, "tasks": updated_tasks})
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/run")
-@require_auth
-def api_run_checkout_task(task_id: int):
-    row = execute_checkout_task_state_machine(task_id, current_workspace_id())
-    if not row:
-        return jsonify({"error": "Checkout task not found"}), 404
-    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/run")
-@require_auth
-def api_run_checkout_task_dup1(task_id: int):
-    row = execute_checkout_task_state_machine(task_id, current_workspace_id())
-    if not row:
-        return jsonify({"error": "Checkout task not found"}), 404
-    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/run")
-@require_auth
-def api_run_checkout_task_dup2(task_id: int):
-    row = execute_checkout_task_state_machine(task_id, current_workspace_id())
-    if not row:
-        return jsonify({"error": "Checkout task not found"}), 404
-    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/pause")
-@require_auth
-def api_pause_checkout_task(task_id: int):
-    conn = db()
-    row = transition_checkout_task(
-        conn,
-        task_id=task_id,
-        workspace_id=current_workspace_id(),
-        requested_state="paused",
-        reason="api_pause",
-    )
-    if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    conn.commit()
-    conn.close()
-    payload = serialize_checkout_task_summary(row)
-    socketio.emit("task_update", payload)
-    return jsonify({"ok": True, "task": payload})
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/stop")
-@require_auth
-def api_stop_checkout_task(task_id: int):
-    conn = db()
-    row = transition_checkout_task(
-        conn,
-        task_id=task_id,
-        workspace_id=current_workspace_id(),
-        requested_state="stopped",
-        reason="api_stop",
-    )
-    if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    conn.commit()
-    conn.close()
-    payload = serialize_checkout_task_summary(row)
-    socketio.emit("task_update", payload)
-    return jsonify({"ok": True, "task": payload})
-
-
-
-
-@app.get("/api/checkout/tasks/<int:task_id>/attempts")
-@require_auth
-def api_checkout_task_attempts_dup1(task_id: int):
-    conn = db()
-    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
-    if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    attempts = conn.execute(
-        """
-        select id, task_id, state, status, details, error_text, created_at
-        from checkout_attempts
-        where task_id = ?
-        order by id desc
-        """,
-        (task_id,),
-    ).fetchall()
-    conn.close()
-    return jsonify(
-        [
-            {
-                "id": a["id"],
-                "task_id": a["task_id"],
-                "state": a["state"],
-                "step": a["status"],
-                "details": parse_json_object(a["details"]),
-                "error": a["error_text"],
-                "created_at": a["created_at"],
-            }
-            for a in attempts
-        ]
-    )
+        return jsonify({"error": "Monitor not found"}), 404
+    return jsonify(dict(row))
 
 
 @app.get("/api/checkout/tasks/<int:task_id>/attempts")
@@ -7414,22 +7322,30 @@ def api_submit_manual_captcha_solution(challenge_id: int):
 @require_auth
 def api_issue_captcha_handoff_token(challenge_id: int):
     conn = db()
-    row = conn.execute(
-        """
-        select * from captcha_challenges
-        where id = ? and workspace_id = ?
-        """,
-        (challenge_id, current_workspace_id()),
-    ).fetchone()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     if not row:
         conn.close()
-        return jsonify({"error": "Captcha challenge not found"}), 404
-    try:
-        token = checkout_captcha_service.issue_worker_handoff_token(conn, challenge_id=challenge_id)
-    except ValueError as exc:
+        return jsonify({"error": "Monitor not found"}), 404
+    conn.execute(
+        "update monitors set enabled = ? where id = ? and workspace_id = ?",
+        (int(bool(enabled)), monitor_id, workspace_id),
+    )
+    conn.commit()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    conn.close()
+    return jsonify(dict(row))
+
+
+@app.delete("/api/monitors/<int:monitor_id>")
+@require_auth
+def api_delete_monitor(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    if not row:
         conn.close()
-        return jsonify({"error": str(exc)}), 400
-    updated = conn.execute("select * from captcha_challenges where id = ?", (challenge_id,)).fetchone()
+        return jsonify({"error": "Monitor not found"}), 404
+    conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
     conn.commit()
     conn.close()
     if updated:
@@ -7441,7 +7357,8 @@ def api_issue_captcha_handoff_token(challenge_id: int):
 @require_auth
 def api_checkout_task_attempts_dup4(task_id: int):
     conn = db()
-    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    conn.close()
     if not row:
         conn.close()
         return jsonify({"error": "Checkout task not found"}), 404
@@ -7724,7 +7641,7 @@ def api_test_webhook(webhook_id: int):
         req = perform_request(
             task_key=f"webhook-test-{webhook_id}",
             method="POST",
-            url=target_url,
+            url=hook["webhook_url"],
             workspace_id=workspace_id,
             proxy_url=None,
             timeout=8,
@@ -7805,217 +7722,6 @@ def api_delete_webhook(webhook_id: int):
         conn.close()
         return jsonify({"error": "Webhook not found"}), 404
     conn.execute("delete from webhooks where id = ? and workspace_id = ?", (webhook_id, workspace_id))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
-
-
-def _captcha_harvester_for_workspace(
-    conn: sqlite3.Connection, harvester_id: int, workspace_id: int
-) -> sqlite3.Row | None:
-    return conn.execute(
-        "select * from captcha_harvesters where id = ? and workspace_id = ?",
-        (harvester_id, workspace_id),
-    ).fetchone()
-
-
-@app.get("/api/captcha/harvesters")
-@require_auth
-def api_list_captcha_harvesters():
-    workspace_id = get_workspace_id_for_request()
-    conn = db()
-    rows = conn.execute(
-        "select * from captcha_harvesters where workspace_id = ? order by id asc",
-        (workspace_id,),
-    ).fetchall()
-    conn.close()
-    return jsonify([dict(row) for row in rows])
-
-
-@app.post("/api/captcha/harvesters")
-@require_auth
-def api_create_captcha_harvester():
-    body = request.json or {}
-    workspace_id = get_workspace_id_for_request()
-    now_iso = utc_now()
-    name = (body.get("name") or f"Harvester {int(time.time())}").strip()
-    proxy_url = (body.get("proxy_url") or "").strip() or None
-    auto_click_enabled = int(bool(body.get("auto_click_enabled", True)))
-    auto_solve_mode = (body.get("auto_solve_mode") or "off").strip().lower()
-    if auto_solve_mode not in {"off", "serverside", "local_ai"}:
-        return jsonify({"error": "auto_solve_mode must be one of: off, serverside, local_ai"}), 400
-    local_ai_enabled = int(auto_solve_mode == "local_ai")
-    local_ai_status = "ready" if local_ai_enabled else "not_installed"
-
-    conn = db()
-    cur = conn.execute(
-        """
-        insert into captcha_harvesters(
-            workspace_id, name, proxy_url, auto_click_enabled, auto_solve_mode,
-            local_ai_enabled, local_ai_status, created_at, updated_at
-        )
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            workspace_id,
-            name,
-            proxy_url,
-            auto_click_enabled,
-            auto_solve_mode,
-            local_ai_enabled,
-            local_ai_status,
-            now_iso,
-            now_iso,
-        ),
-    )
-    conn.commit()
-    row = conn.execute("select * from captcha_harvesters where id = ?", (cur.lastrowid,)).fetchone()
-    conn.close()
-    return jsonify(dict(row)), 201
-
-
-@app.patch("/api/captcha/harvesters/<int:harvester_id>")
-@require_auth
-def api_update_captcha_harvester(harvester_id: int):
-    body = request.json or {}
-    workspace_id = get_workspace_id_for_request()
-    conn = db()
-    row = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
-    if not row:
-        conn.close()
-        return jsonify({"error": "Captcha harvester not found"}), 404
-
-    updates: dict[str, Any] = {}
-    if "name" in body:
-        updates["name"] = (body.get("name") or "").strip() or row["name"]
-    if "proxy_url" in body:
-        updates["proxy_url"] = (body.get("proxy_url") or "").strip() or None
-    if "gmail_email" in body:
-        updates["gmail_email"] = (body.get("gmail_email") or "").strip() or None
-    if "auto_click_enabled" in body:
-        updates["auto_click_enabled"] = int(bool(body.get("auto_click_enabled")))
-    if "notes" in body:
-        updates["notes"] = (body.get("notes") or "").strip() or None
-    if "auto_solve_mode" in body:
-        mode = (body.get("auto_solve_mode") or "off").strip().lower()
-        if mode not in {"off", "serverside", "local_ai"}:
-            conn.close()
-            return jsonify({"error": "auto_solve_mode must be one of: off, serverside, local_ai"}), 400
-        updates["auto_solve_mode"] = mode
-        updates["local_ai_enabled"] = int(mode == "local_ai")
-        if mode == "local_ai":
-            updates["local_ai_status"] = row["local_ai_status"] if row["local_ai_status"] != "not_installed" else "ready"
-        else:
-            updates["local_ai_status"] = "not_installed"
-
-    if not updates:
-        conn.close()
-        return jsonify({"error": "No mutable fields provided"}), 400
-
-    updates["updated_at"] = utc_now()
-    set_sql = ", ".join(f"{key} = ?" for key in updates.keys())
-    conn.execute(
-        f"update captcha_harvesters set {set_sql} where id = ? and workspace_id = ?",
-        (*updates.values(), harvester_id, workspace_id),
-    )
-    conn.commit()
-    refreshed = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
-    conn.close()
-    return jsonify(dict(refreshed))
-
-
-@app.post("/api/captcha/harvesters/<int:harvester_id>/youtube-signin")
-@require_auth
-def api_signin_captcha_harvester(harvester_id: int):
-    body = request.json or {}
-    workspace_id = get_workspace_id_for_request()
-    gmail_email = (body.get("gmail_email") or "").strip()
-    if not gmail_email:
-        return jsonify({"error": "gmail_email is required"}), 400
-    now_iso = utc_now()
-    conn = db()
-    row = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
-    if not row:
-        conn.close()
-        return jsonify({"error": "Captcha harvester not found"}), 404
-    conn.execute(
-        """
-        update captcha_harvesters
-        set gmail_email = ?, session_status = 'signed_in', updated_at = ?
-        where id = ? and workspace_id = ?
-        """,
-        (gmail_email, now_iso, harvester_id, workspace_id),
-    )
-    conn.commit()
-    refreshed = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
-    conn.close()
-    return jsonify(dict(refreshed))
-
-
-@app.post("/api/captcha/harvesters/<int:harvester_id>/clear")
-@require_auth
-def api_clear_captcha_harvester(harvester_id: int):
-    workspace_id = get_workspace_id_for_request()
-    now_iso = utc_now()
-    conn = db()
-    row = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
-    if not row:
-        conn.close()
-        return jsonify({"error": "Captcha harvester not found"}), 404
-    conn.execute(
-        """
-        update captcha_harvesters
-        set gmail_email = null, session_status = 'logged_out', notes = null, updated_at = ?
-        where id = ? and workspace_id = ?
-        """,
-        (now_iso, harvester_id, workspace_id),
-    )
-    conn.commit()
-    refreshed = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
-    conn.close()
-    return jsonify(dict(refreshed))
-
-
-@app.post("/api/captcha/harvesters/<int:harvester_id>/local-ai-test")
-@require_auth
-def api_test_captcha_local_ai(harvester_id: int):
-    workspace_id = get_workspace_id_for_request()
-    now_iso = utc_now()
-    conn = db()
-    row = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
-    if not row:
-        conn.close()
-        return jsonify({"error": "Captcha harvester not found"}), 404
-    if row["auto_solve_mode"] != "local_ai":
-        conn.close()
-        return jsonify({"error": "Local AI test is only available when auto_solve_mode is local_ai"}), 400
-    conn.execute(
-        """
-        update captcha_harvesters
-        set local_ai_status = 'ready', last_tested_at = ?, updated_at = ?
-        where id = ? and workspace_id = ?
-        """,
-        (now_iso, now_iso, harvester_id, workspace_id),
-    )
-    conn.commit()
-    refreshed = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
-    conn.close()
-    return jsonify({"ok": True, "harvester": dict(refreshed)})
-
-
-@app.delete("/api/captcha/harvesters/<int:harvester_id>")
-@require_auth
-def api_delete_captcha_harvester(harvester_id: int):
-    workspace_id = get_workspace_id_for_request()
-    conn = db()
-    row = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
-    if not row:
-        conn.close()
-        return jsonify({"error": "Captcha harvester not found"}), 404
-    conn.execute(
-        "delete from captcha_harvesters where id = ? and workspace_id = ?",
-        (harvester_id, workspace_id),
-    )
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
