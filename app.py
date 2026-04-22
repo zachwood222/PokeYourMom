@@ -13,6 +13,8 @@ import time
 import traceback
 import hashlib
 import hmac
+
+from cryptography.fernet import Fernet, InvalidToken
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from functools import wraps
@@ -41,8 +43,35 @@ from tasks.parsers import MonitorInputValidationError, parse_monitor_input
 from network.session_manager import RequestResult, SessionManager
 from network.session_manager import RequestBehaviorPolicy
 
+def _current_app_mode() -> str:
+    return (
+        os.getenv("FLASK_ENV")
+        or os.getenv("APP_ENV")
+        or os.getenv("ENV")
+        or os.getenv("PYTHON_ENV")
+        or ""
+    ).strip().lower()
+
+
+def is_dev_environment() -> bool:
+    mode = _current_app_mode()
+    if mode in {"dev", "development", "local", "test", "testing"}:
+        return True
+    return (os.getenv("FLASK_DEBUG", "0") or "").strip() == "1"
+
+
+def _parse_allowed_origins(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+IS_DEV_ENVIRONMENT = is_dev_environment()
+RAW_ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = "*" if IS_DEV_ENVIRONMENT else _parse_allowed_origins(RAW_ALLOWED_ORIGINS)
+
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS, async_mode="threading")
 session_manager = SessionManager()
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
@@ -64,10 +93,15 @@ CORRELATION_ID_HEADER = "X-Correlation-ID"
 _api_auth_token_raw = os.getenv("API_AUTH_TOKEN")
 API_AUTH_TOKEN = _api_auth_token_raw.strip() if _api_auth_token_raw is not None else "dev-token"
 SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY", "local-dev-secret-key")
+SECRET_ENCRYPTION_KEY_VERSION = os.getenv("SECRET_ENCRYPTION_KEY_VERSION", "v1")
+SECRET_ENCRYPTION_KEYS_RAW = os.getenv("SECRET_ENCRYPTION_KEYS", "")
+LEGACY_SECRET_KEY_VERSION = "legacy-v0"
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_WEBHOOK_TOLERANCE_SECONDS = int(os.getenv("STRIPE_WEBHOOK_TOLERANCE_SECONDS", "300"))
 UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
 UPDATE_CHECK_TIMEOUT_SECONDS = float(os.getenv("UPDATE_CHECK_TIMEOUT_SECONDS", "2.0"))
+UPDATE_CHECK_AUTH_HEADER = os.getenv("UPDATE_CHECK_AUTH_HEADER", "").strip() or "Authorization"
+UPDATE_CHECK_AUTH_TOKEN = os.getenv("UPDATE_CHECK_AUTH_TOKEN", "").strip()
 CAPTCHA_PROVIDER = os.getenv("CAPTCHA_PROVIDER", "turnstile")
 CAPTCHA_SITE_KEY = os.getenv("CAPTCHA_SITE_KEY", "")
 CAPTCHA_SCRIPT_URL = os.getenv("CAPTCHA_SCRIPT_URL", "https://challenges.cloudflare.com/turnstile/v0/api.js")
@@ -270,31 +304,24 @@ def parse_json_object(raw: str | None) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def is_dev_environment() -> bool:
-    mode = (
-        os.getenv("FLASK_ENV")
-        or os.getenv("APP_ENV")
-        or os.getenv("ENV")
-        or os.getenv("PYTHON_ENV")
-        or ""
-    ).strip().lower()
-    if mode in {"dev", "development", "local", "test", "testing"}:
-        return True
-    return (os.getenv("FLASK_DEBUG", "0") or "").strip() == "1"
-
-
 def validate_startup_configuration() -> None:
-    if API_AUTH_TOKEN:
-        return
-    warning_message = (
-        "API_AUTH_TOKEN is empty after normalization. /api/* endpoints will return 401 "
-        "unless requests include a valid bearer token."
-    )
-    log(warning_message, level="error")
-    if STRICT_API_AUTH_TOKEN and not is_dev_environment():
-        raise RuntimeError(
-            f"{warning_message} Set API_AUTH_TOKEN to a non-empty value before startup."
-        )
+    missing_env_vars: list[str] = []
+    if not API_AUTH_TOKEN:
+        missing_env_vars.append("API_AUTH_TOKEN")
+    if not SECRET_ENCRYPTION_KEY:
+        missing_env_vars.append("SECRET_ENCRYPTION_KEY")
+
+    if missing_env_vars:
+        missing_env_text = ", ".join(missing_env_vars)
+        message = f"Missing required environment variables: {missing_env_text}."
+        log(message, level="error")
+        if not is_dev_environment():
+            raise RuntimeError(
+                f"{message} Set explicit values before starting in non-development environments."
+            )
+
+    if not IS_DEV_ENVIRONMENT and (ALLOWED_ORIGINS == "*" or "*" in ALLOWED_ORIGINS):
+        raise RuntimeError("Wildcard CORS is disabled outside development mode.")
 
 
 def verify_stripe_webhook_signature(payload: bytes, signature_header: str | None) -> None:
@@ -337,16 +364,7 @@ def _encryption_keystream(secret_key: str, nonce: bytes, length: int) -> bytes:
     return bytes(stream[:length])
 
 
-def encrypt_secret_value(plaintext: str) -> str:
-    nonce = secrets.token_bytes(16)
-    payload = plaintext.encode("utf-8")
-    keystream = _encryption_keystream(SECRET_ENCRYPTION_KEY, nonce, len(payload))
-    cipher = bytes(a ^ b for a, b in zip(payload, keystream))
-    mac = hmac.new(SECRET_ENCRYPTION_KEY.encode("utf-8"), nonce + cipher, hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(nonce + cipher + mac).decode("ascii")
-
-
-def decrypt_secret_value(ciphertext: str) -> str:
+def _decrypt_legacy_secret_value(ciphertext: str) -> str:
     raw = base64.urlsafe_b64decode(ciphertext.encode("ascii"))
     if len(raw) < 48:
         raise ValueError("Invalid secret payload")
@@ -359,6 +377,94 @@ def decrypt_secret_value(ciphertext: str) -> str:
     keystream = _encryption_keystream(SECRET_ENCRYPTION_KEY, nonce, len(cipher))
     payload = bytes(a ^ b for a, b in zip(cipher, keystream))
     return payload.decode("utf-8")
+
+
+def _normalize_fernet_key(raw_key: str) -> bytes:
+    candidate = (raw_key or "").strip().encode("ascii")
+    try:
+        decoded = base64.urlsafe_b64decode(candidate)
+    except Exception:
+        decoded = b""
+    if len(decoded) == 32:
+        return candidate
+    digest = hashlib.sha256((raw_key or "").encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest)
+
+
+def _load_secret_encryption_keys() -> tuple[str, dict[str, Fernet]]:
+    keys: dict[str, bytes] = {}
+    for entry in (SECRET_ENCRYPTION_KEYS_RAW or "").split(","):
+        item = entry.strip()
+        if not item:
+            continue
+        if ":" in item:
+            version, key_value = item.split(":", 1)
+        elif "=" in item:
+            version, key_value = item.split("=", 1)
+        else:
+            continue
+        version = version.strip()
+        key_value = key_value.strip()
+        if version and key_value:
+            keys[version] = _normalize_fernet_key(key_value)
+
+    active_version = (SECRET_ENCRYPTION_KEY_VERSION or "v1").strip() or "v1"
+    if active_version not in keys:
+        keys[active_version] = _normalize_fernet_key(SECRET_ENCRYPTION_KEY)
+
+    return active_version, {version: Fernet(key) for version, key in keys.items()}
+
+
+ACTIVE_SECRET_KEY_VERSION, SECRET_FERNETS = _load_secret_encryption_keys()
+
+
+def encrypt_secret_value(plaintext: str) -> str:
+    return SECRET_FERNETS[ACTIVE_SECRET_KEY_VERSION].encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+
+def encrypt_secret_value_with_version(plaintext: str) -> tuple[str, str]:
+    return encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION
+
+
+def decrypt_secret_value(ciphertext: str, key_version: str | None = None) -> str:
+    if key_version == LEGACY_SECRET_KEY_VERSION:
+        return _decrypt_legacy_secret_value(ciphertext)
+
+    candidate_versions: list[str]
+    if key_version:
+        candidate_versions = [key_version]
+    else:
+        candidate_versions = list(SECRET_FERNETS.keys())
+
+    for version in candidate_versions:
+        fernet = SECRET_FERNETS.get(version)
+        if not fernet:
+            continue
+        try:
+            return fernet.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+        except (InvalidToken, ValueError):
+            continue
+
+    if key_version is None:
+        return _decrypt_legacy_secret_value(ciphertext)
+    raise ValueError("Secret decryption failed for configured key version")
+
+
+def decrypt_secret_value_with_details(ciphertext: str, key_version: str | None = None) -> tuple[str, str, bool]:
+    if key_version == LEGACY_SECRET_KEY_VERSION:
+        return decrypt_secret_value(ciphertext, key_version=key_version), LEGACY_SECRET_KEY_VERSION, True
+
+    if key_version:
+        return decrypt_secret_value(ciphertext, key_version=key_version), key_version, False
+
+    for version, fernet in SECRET_FERNETS.items():
+        try:
+            value = fernet.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+            return value, version, False
+        except (InvalidToken, ValueError):
+            continue
+
+    return _decrypt_legacy_secret_value(ciphertext), LEGACY_SECRET_KEY_VERSION, True
 
 
 SENSITIVE_FIELD_MARKERS = ("token", "secret", "password", "authorization", "webhook_url")
@@ -389,14 +495,14 @@ def create_secret(
     normalized_type = (secret_type or "").strip().lower()
     if not normalized_type:
         raise ValueError("secret_type is required")
-    ciphertext = encrypt_secret_value(plaintext)
+    ciphertext, key_version = encrypt_secret_value_with_version(plaintext)
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, normalized_type, ciphertext, now_iso, now_iso),
+        (workspace_id, user_id, normalized_type, ciphertext, key_version, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -416,7 +522,17 @@ def get_secret_plaintext(
         raise ValueError("Secret not found")
     if allowed_types and row["secret_type"] not in allowed_types:
         raise ValueError("Secret type not allowed")
-    return decrypt_secret_value(row["ciphertext"])
+    plaintext, resolved_version, should_migrate = decrypt_secret_value_with_details(
+        row["ciphertext"],
+        key_version=row["key_version"],
+    )
+    if should_migrate or resolved_version != ACTIVE_SECRET_KEY_VERSION:
+        migrated_ciphertext, migrated_version = encrypt_secret_value_with_version(plaintext)
+        conn.execute(
+            "update account_secrets set ciphertext = ?, key_version = ?, updated_at = ? where id = ?",
+            (migrated_ciphertext, migrated_version, utc_now(), row["id"]),
+        )
+    return plaintext
 
 
 def redact_webhook_url(url: str) -> str:
@@ -1285,6 +1401,7 @@ def init_db() -> None:
             user_id integer,
             secret_type text not null,
             ciphertext text not null,
+            key_version text,
             created_at text not null,
             updated_at text not null,
             foreign key(workspace_id) references workspaces(id),
@@ -1358,6 +1475,7 @@ def init_db() -> None:
             monitor_id integer not null,
             task_name text,
             task_config text,
+            autopilot_profile_id integer,
             active_proxy_id integer,
             active_proxy_lease_key text,
             current_state text not null default 'idle',
@@ -1370,6 +1488,7 @@ def init_db() -> None:
             last_transition_at text,
             foreign key(workspace_id) references workspaces(id),
             foreign key(monitor_id) references monitors(id),
+            foreign key(autopilot_profile_id) references autopilot_profiles(id),
             foreign key(active_proxy_id) references proxies(id)
         );
 
@@ -1577,6 +1696,28 @@ def init_db() -> None:
             foreign key(payment_method_id) references payment_methods(id)
         );
 
+
+        create table if not exists autopilot_profiles (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            name text not null,
+            preset text not null default 'balanced',
+            budget_daily_cap_cents integer,
+            budget_session_cap_cents integer,
+            max_attempts_per_sku integer not null default 3,
+            max_attempts_per_site integer not null default 6,
+            retailer_priority_json text not null default '[]',
+            proxy_rotation_strategy text not null default 'sticky',
+            account_rotation_strategy text not null default 'sticky',
+            captcha_loop_threshold integer not null default 3,
+            decline_threshold integer not null default 2,
+            antibot_threshold integer not null default 2,
+            enabled integer not null default 1,
+            created_at text not null,
+            updated_at text not null,
+            foreign key(workspace_id) references workspaces(id)
+        );
+
         create table if not exists alert_subscriptions (
             id integer primary key autoincrement,
             workspace_id integer not null,
@@ -1732,8 +1873,10 @@ def init_db() -> None:
     ensure_column(conn, "checkout_attempts", "error", "text")
     ensure_column(conn, "checkout_attempts", "updated_at", "text")
     ensure_column(conn, "checkout_tasks", "status_timestamps_json", "text")
+    ensure_column(conn, "checkout_tasks", "autopilot_profile_id", "integer")
     ensure_column(conn, "captcha_harvesters", "notes", "text")
     ensure_column(conn, "captcha_harvesters", "last_tested_at", "text")
+    ensure_column(conn, "account_secrets", "key_version", "text")
     run_legacy_tasks_migration(conn)
     run_pokemon_center_task_group_config_migration(conn)
     conn.commit()
@@ -3050,6 +3193,7 @@ def create_checkout_task(
     task_name: str | None = None,
     task_config: dict[str, Any] | None = None,
     initial_state: str = "idle",
+    autopilot_profile_id: int | None = None,
 ) -> sqlite3.Row:
     task_config = dict(task_config or {})
     monitor_row = conn.execute(
@@ -3060,6 +3204,13 @@ def create_checkout_task(
     if "proxy_policy" in task_config:
         task_config["proxy_policy"] = normalize_proxy_policy(task_config.get("proxy_policy"))
     normalized_state = normalize_checkout_state(initial_state, allow_control_states=False)
+    if autopilot_profile_id is not None:
+        profile_row = conn.execute(
+            "select id from autopilot_profiles where id = ? and workspace_id = ?",
+            (autopilot_profile_id, workspace_id),
+        ).fetchone()
+        if not profile_row:
+            raise ValueError("autopilot_profile_id not found")
     now_iso = utc_now()
     cur = conn.execute(
         """
@@ -3068,6 +3219,7 @@ def create_checkout_task(
             monitor_id,
             task_name,
             task_config,
+            autopilot_profile_id,
             current_state,
             enabled,
             is_paused,
@@ -3076,13 +3228,14 @@ def create_checkout_task(
             updated_at,
             last_transition_at
         )
-        values (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
+        values (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
         """,
         (
             workspace_id,
             monitor_id,
             task_name,
             json.dumps(task_config or {}),
+            autopilot_profile_id,
             normalized_state,
             json.dumps({normalized_state: now_iso}),
             now_iso,
@@ -3260,10 +3413,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3311,10 +3464,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3362,10 +3515,61 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
+def normalize_parser_confidence(value: Any) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    confidence = float(value)
+    if math.isnan(confidence) or math.isinf(confidence):
+        return None
+    return min(1.0, max(0.0, confidence))
+
+
+def parser_metadata_payload(result: MonitorResult) -> dict[str, Any]:
+    return {
+        "availability_reason": result.availability_reason,
+        "parser_confidence": normalize_parser_confidence(result.parser_confidence),
+    }
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3475,10 +3679,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3508,10 +3712,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3541,10 +3745,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3574,10 +3778,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3625,10 +3829,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3751,6 +3955,13 @@ def _compute_retry_preset(
     group_max = _coerce_optional_int(group_limits.get("max_retries"))
     if group_max is not None and group_max > 0:
         max_attempts = min(max_attempts, group_max)
+    autopilot = task_config.get("autopilot") if isinstance(task_config.get("autopilot"), dict) else {}
+    sku_max = _coerce_optional_int(autopilot.get("max_attempts_per_sku"))
+    site_max = _coerce_optional_int(autopilot.get("max_attempts_per_site"))
+    if sku_max is not None and sku_max > 0:
+        max_attempts = min(max_attempts, sku_max)
+    if site_max is not None and site_max > 0:
+        max_attempts = min(max_attempts, site_max)
     return {"max_attempts": max(1, max_attempts), "base_backoff_seconds": float(preset["base_backoff_seconds"])}
 
 
@@ -4326,12 +4537,16 @@ def resolve_latest_version() -> tuple[str, str | None]:
         return fallback_version, "update_check_url_not_configured"
 
     try:
+        headers = {"User-Agent": "StockSentinel-UpdateCheck/1.0"}
+        if UPDATE_CHECK_AUTH_TOKEN:
+            headers[UPDATE_CHECK_AUTH_HEADER] = UPDATE_CHECK_AUTH_TOKEN
         req = perform_request(
             task_key="meta-update-check",
             method="GET",
             url=UPDATE_CHECK_URL,
             workspace_id=None,
             proxy_url=None,
+            headers=headers,
             timeout=UPDATE_CHECK_TIMEOUT_SECONDS,
             retry_total=1,
             backoff_factor=0.1,
@@ -4415,11 +4630,66 @@ def _handle_stripe_webhook_request():
     return jsonify(payload), status_code
 
 
+@app.post("/api/billing/stripe/webhook")
+def api_billing_stripe_webhook():
+    return _handle_stripe_webhook_request()
+
+
+@app.post("/api/stripe/webhook")
+def api_stripe_webhook():
+    return _handle_stripe_webhook_request()
+
+
 @app.get("/api/workspace")
 @require_auth
 def api_workspace():
     row = get_workspace(current_workspace_id())
     return jsonify({"workspace": dict(row), "user": current_user_context()})
+
+
+@app.get("/api/workspace/usage-limits")
+@require_auth
+def api_workspace_usage_limits():
+    workspace_id = get_workspace_id_for_request()
+    workspace = get_workspace(workspace_id)
+    limits = PLAN_LIMITS[workspace["plan"]]
+    conn = db()
+    usage = conn.execute(
+        """
+        select count(*) as monitor_count, min(poll_interval_seconds) as min_poll_interval_seconds
+        from monitors
+        where workspace_id = ?
+        """,
+        (workspace_id,),
+    ).fetchone()
+    conn.close()
+
+    monitor_count = int(usage["monitor_count"] or 0)
+    min_poll_interval_seconds = usage["min_poll_interval_seconds"]
+    monitor_slots_remaining = max(0, limits["max_monitors"] - monitor_count)
+
+    return jsonify(
+        {
+            "plan": workspace["plan"],
+            "usage": {
+                "monitor_count": monitor_count,
+                "min_poll_interval_seconds": min_poll_interval_seconds,
+            },
+            "limits": {
+                "max_monitors": limits["max_monitors"],
+                "min_poll_seconds": limits["min_poll_seconds"],
+            },
+            "derived": {
+                "monitor_slots_remaining": monitor_slots_remaining,
+                "monitor_limit_reached": monitor_count >= limits["max_monitors"],
+                "poll_minimum_satisfied": (
+                    True
+                    if min_poll_interval_seconds is None
+                    else min_poll_interval_seconds >= limits["min_poll_seconds"]
+                ),
+            },
+        }
+    )
 
 
 @app.post("/api/workspace/plan")
@@ -4587,21 +4857,16 @@ def api_dashboard_commerce():
         """
         select
             ct.id as checkout_task_id,
-            ct.task_name,
-            ct.task_config,
             ct.current_state,
-            ct.updated_at,
             m.retailer,
-            m.product_url,
-            m.last_price_cents
+            coalesce(m.last_price_cents, 0) as price_cents,
+            date(coalesce(ct.updated_at, ct.created_at)) as day_bucket
         from checkout_tasks ct
         join monitors m on m.id = ct.monitor_id
         where ct.workspace_id = ?
-        order by datetime(ct.updated_at) desc, ct.id desc
         """,
         (workspace_id,),
     ).fetchall()
-    conn.close()
 
     successful = [row for row in rows if str(row["current_state"] or "").strip().lower() == "success"]
     declines = [row for row in rows if str(row["current_state"] or "").strip().lower() == "decline"]
@@ -4639,11 +4904,6 @@ def api_dashboard_commerce():
             }
         )
 
-    daily_points = [{"date": date, "spent_cents": amount} for date, amount in sorted(daily_spend_cents.items())][-14:]
-    sites = [
-        {"site": site, "checkouts": count}
-        for site, count in sorted(site_totals.items(), key=lambda item: (-item[1], item[0]))
-    ]
     average_order_value_cents = 0 if checkout_count == 0 else int(round(spent_total_cents / checkout_count))
     success_rate = 0.0 if (checkout_count + decline_count) == 0 else checkout_count / (checkout_count + decline_count)
 
@@ -4864,253 +5124,11 @@ def api_delete_monitor_dup2(monitor_id: int):
     conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
     conn.commit()
     conn.close()
-    return jsonify({"ok": True})
+    assert challenge is not None
+    emit_captcha_challenge_update(challenge)
+    return jsonify(serialize_challenge(challenge)), 201
 
 
-@app.post("/api/monitors/<int:monitor_id>/check")
-@require_auth
-def api_check_monitor(monitor_id: int):
-    workspace_id = get_workspace_id_for_request()
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    if not row:
-        return jsonify({"error": "Monitor not found"}), 404
-    return jsonify(check_monitor_once(row))
-
-
-def get_monitor_for_workspace(
-    conn: sqlite3.Connection, monitor_id: int, workspace_id: int
-) -> sqlite3.Row | None:
-    return conn.execute(
-        "select * from monitors where id = ? and workspace_id = ?",
-        (monitor_id, workspace_id),
-    ).fetchone()
-
-
-@app.get("/api/monitors/<int:monitor_id>")
-@require_auth
-def api_get_monitor_dup3(monitor_id: int):
-    workspace_id = get_workspace_id_for_request()
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    if not row:
-        return jsonify({"error": "Monitor not found"}), 404
-    return jsonify(dict(row))
-
-
-@app.get("/api/checkout/tasks")
-@require_auth
-def api_list_checkout_tasks_dup2():
-    conn = db()
-    rows = conn.execute(
-        "select * from checkout_tasks where workspace_id = ? order by id desc",
-        (current_workspace_id(),),
-    ).fetchall()
-    conn.close()
-    return jsonify([serialize_task_ui(row) for row in rows])
-
-
-@app.get("/api/checkout/tasks")
-@require_auth
-def api_list_checkout_tasks_dup3():
-    conn = db()
-    rows = conn.execute(
-        "select * from checkout_tasks where workspace_id = ? order by id desc",
-        (current_workspace_id(),),
-    ).fetchall()
-    conn.close()
-    return jsonify([serialize_task_ui(row) for row in rows])
-
-
-def get_monitor_for_workspace(
-    conn: sqlite3.Connection, monitor_id: int, workspace_id: int
-) -> sqlite3.Row | None:
-    return conn.execute(
-        "select * from monitors where id = ? and workspace_id = ?",
-        (monitor_id, workspace_id),
-    ).fetchone()
-
-
-@app.get("/api/monitors/<int:monitor_id>")
-@require_auth
-def api_get_monitor(monitor_id: int):
-    workspace_id = get_workspace_id_for_request()
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    if not row:
-        return jsonify({"error": "Monitor not found"}), 404
-    return jsonify(dict(row))
-
-
-@app.get("/api/checkout/tasks/<int:task_id>/attempts")
-@require_auth
-def api_checkout_task_attempts_dup2(task_id: int):
-    conn = db()
-    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
-    if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    attempts = conn.execute(
-        """
-        select id, task_id, state, status, details, error_text, created_at
-        from checkout_attempts
-        where task_id = ?
-        order by id desc
-        """,
-        (task_id,),
-    ).fetchall()
-    conn.close()
-    return jsonify(
-        [
-            {
-                "id": a["id"],
-                "task_id": a["task_id"],
-                "state": a["state"],
-                "step": a["status"],
-                "details": parse_json_object(a["details"]),
-                "error": a["error_text"],
-                "created_at": a["created_at"],
-            }
-            for a in attempts
-        ]
-    )
-
-
-@app.get("/api/checkout/tasks/<int:task_id>/attempts")
-@require_auth
-def api_checkout_task_attempts_dup3(task_id: int):
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    if not row:
-        conn.close()
-        return jsonify({"error": "Monitor not found"}), 404
-    conn.execute(
-        "update monitors set enabled = ? where id = ? and workspace_id = ?",
-        (int(bool(enabled)), monitor_id, workspace_id),
-    )
-    conn.commit()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    return jsonify(dict(row))
-
-
-    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
-    if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    attempts = conn.execute(
-        """
-        select id, task_id, state, status, error_text, created_at
-        from checkout_attempts
-        where task_id = ?
-        order by id desc
-        """,
-        (task_id,),
-    ).fetchall()
-    conn.close()
-    return jsonify(
-        [
-            {
-                "id": a["id"],
-                "task_id": a["task_id"],
-                "state": a["state"],
-                "step": a["status"],
-                "error": a["error_text"],
-                "created_at": a["created_at"],
-            }
-            for a in attempts
-        ]
-    )
-
-
-@app.get("/api/checkout/tasks/<int:task_id>/state")
-@require_auth
-def api_checkout_task_state(task_id: int):
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    if not row:
-        conn.close()
-        return jsonify({"error": "Monitor not found"}), 404
-    conn.execute(
-        "update monitors set enabled = ? where id = ? and workspace_id = ?",
-        (int(bool(enabled)), monitor_id, workspace_id),
-    )
-    conn.commit()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    return jsonify(
-        {
-            "task_id": task_id,
-            "current_state": row["current_state"],
-            "last_error": row["last_error"],
-            "last_transition_at": row["last_transition_at"],
-            "last_attempt": dict(last_attempt) if last_attempt else None,
-        }
-    )
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/captcha-challenges")
-@require_auth
-def api_create_checkout_captcha_challenge(task_id: int):
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    if not row:
-        conn.close()
-        return jsonify({"error": "Monitor not found"}), 404
-    conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
-    conn.commit()
-    conn.close()
-    assert updated is not None
-    emit_captcha_challenge_update(updated)
-    return jsonify(serialize_challenge(updated)), 201
-
-
-@app.get("/api/checkout/tasks")
-@require_auth
-def api_list_checkout_tasks_dup5():
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    return jsonify([serialize_task_ui(row) for row in rows])
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/start")
-@app.get("/api/checkout/tasks/<int:task_id>/captcha-challenges")
-@require_auth
-def api_list_checkout_captcha_challenges(task_id: int):
-    conn = db()
-    workspace_id = current_workspace_id()
-    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
-    if not task:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    checkout_captcha_service.expire_stale_challenges(conn)
-    rows = conn.execute(
-        """
-        select * from captcha_challenges
-        where workspace_id = ? and task_id = ?
-        order by id desc
-        """,
-        (workspace_id, task_id),
-    ).fetchall()
-    conn.commit()
-    conn.close()
-    return jsonify([serialize_challenge(row) for row in rows])
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/run")
-@require_auth
-def api_run_checkout_task_dup3(task_id: int):
-    row = execute_checkout_task_state_machine(task_id, current_workspace_id())
-    if not row:
-        return jsonify({"error": "Checkout task not found"}), 404
-    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/pause")
 @app.post("/api/checkout/captcha-challenges/<int:challenge_id>/manual-solve")
 @require_auth
 def api_submit_manual_captcha_solution(challenge_id: int):
@@ -5119,14 +5137,13 @@ def api_submit_manual_captcha_solution(challenge_id: int):
     if not solved_token:
         return jsonify({"error": "solved_token is required"}), 400
 
+@app.get("/api/monitors/<int:monitor_id>")
+@require_auth
+def api_get_monitor_dup3(monitor_id: int):
+    workspace_id = get_workspace_id_for_request()
     conn = db()
-    row = conn.execute(
-        """
-        select cc.* from captcha_challenges cc
-        where cc.id = ? and cc.workspace_id = ?
-        """,
-        (challenge_id, current_workspace_id()),
-    ).fetchone()
+    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    conn.close()
     if not row:
         conn.close()
         return jsonify({"error": "Captcha challenge not found"}), 404
@@ -5147,31 +5164,29 @@ def api_submit_manual_captcha_solution(challenge_id: int):
 @app.post("/api/checkout/captcha-challenges/<int:challenge_id>/handoff-token")
 @require_auth
 def api_issue_captcha_handoff_token(challenge_id: int):
+    body = request.json or {}
+    ttl_seconds = body.get("ttl_seconds", 90)
+    try:
+        ttl_seconds = int(ttl_seconds)
+    except (TypeError, ValueError):
+        return jsonify({"error": "ttl_seconds must be an integer"}), 400
+    if ttl_seconds <= 0:
+        return jsonify({"error": "ttl_seconds must be greater than 0"}), 400
+
     conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    row = conn.execute(
+        "select * from captcha_challenges where id = ? and workspace_id = ?",
+        (challenge_id, current_workspace_id()),
+    ).fetchone()
     if not row:
         conn.close()
-        return jsonify({"error": "Monitor not found"}), 404
-    conn.execute(
-        "update monitors set enabled = ? where id = ? and workspace_id = ?",
-        (int(bool(enabled)), monitor_id, workspace_id),
-    )
-    conn.commit()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    return jsonify(dict(row))
-
-
-@app.delete("/api/monitors/<int:monitor_id>")
-@require_auth
-def api_delete_monitor(monitor_id: int):
-    workspace_id = get_workspace_id_for_request()
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    if not row:
+        return jsonify({"error": "Captcha challenge not found"}), 404
+    try:
+        token = checkout_captcha_service.issue_worker_handoff_token(conn, challenge_id=challenge_id)
+    except ValueError as exc:
         conn.close()
-        return jsonify({"error": "Monitor not found"}), 404
-    conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
+        return jsonify({"error": str(exc)}), 400
+    updated = conn.execute("select * from captcha_challenges where id = ?", (challenge_id,)).fetchone()
     conn.commit()
     conn.close()
     if updated:
@@ -5179,55 +5194,6 @@ def api_delete_monitor(monitor_id: int):
     return jsonify({"ok": True, "challenge_id": challenge_id, "handoff_token": token})
 
 
-@app.get("/api/checkout/tasks/<int:task_id>/attempts")
-@require_auth
-def api_checkout_task_attempts_dup4(task_id: int):
-    conn = db()
-    row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
-    conn.close()
-    if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    include_created = request.args.get("include_created", "").strip().lower() in {"1", "true", "yes"}
-    if include_created:
-        attempts = conn.execute(
-            """
-            select id, task_id, state, status, details, error_text, created_at
-            from checkout_attempts
-            where task_id = ?
-            order by id desc
-            """,
-            (task_id,),
-        ).fetchall()
-    else:
-        attempts = conn.execute(
-            """
-            select id, task_id, state, status, details, error_text, created_at
-            from checkout_attempts
-            where task_id = ?
-              and status != 'created'
-            order by id desc
-            """,
-            (task_id,),
-        ).fetchall()
-    conn.close()
-    return jsonify(
-        [
-            {
-                "id": a["id"],
-                "task_id": a["task_id"],
-                "state": a["state"],
-                "step": a["status"],
-                "details": parse_json_object(a["details"]),
-                "error": a["error_text"],
-                "created_at": a["created_at"],
-            }
-            for a in attempts
-        ]
-    )
-
-
-@app.get("/api/checkout/tasks/<int:task_id>/state")
 @app.post("/api/internal/checkout/captcha-handoffs/consume")
 @require_auth
 def api_consume_captcha_handoff_token():
@@ -6139,6 +6105,635 @@ def api_delete_schedule(schedule_id: int):
     conn.close()
     return jsonify({"ok": True})
 
+
+
+
+AUTOPILOT_PRESET_DEFAULTS = {
+    "safe": {
+        "budget_daily_cap_cents": 15_000,
+        "budget_session_cap_cents": 6_000,
+        "max_attempts_per_sku": 2,
+        "max_attempts_per_site": 3,
+        "proxy_rotation_strategy": "sticky",
+        "account_rotation_strategy": "sticky",
+        "captcha_loop_threshold": 2,
+        "decline_threshold": 1,
+        "antibot_threshold": 1,
+    },
+    "balanced": {
+        "budget_daily_cap_cents": 40_000,
+        "budget_session_cap_cents": 15_000,
+        "max_attempts_per_sku": 3,
+        "max_attempts_per_site": 6,
+        "proxy_rotation_strategy": "adaptive",
+        "account_rotation_strategy": "round_robin",
+        "captcha_loop_threshold": 3,
+        "decline_threshold": 2,
+        "antibot_threshold": 2,
+    },
+    "aggressive": {
+        "budget_daily_cap_cents": 120_000,
+        "budget_session_cap_cents": 60_000,
+        "max_attempts_per_sku": 6,
+        "max_attempts_per_site": 12,
+        "proxy_rotation_strategy": "always_rotate",
+        "account_rotation_strategy": "always_rotate",
+        "captcha_loop_threshold": 5,
+        "decline_threshold": 4,
+        "antibot_threshold": 4,
+    },
+}
+
+
+def _normalize_autopilot_profile_payload(body: dict[str, Any], *, allow_partial: bool = False) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if not allow_partial or "name" in body:
+        name = str(body.get("name") or "").strip()
+        if not allow_partial and not name:
+            raise ValueError("name is required")
+        if name:
+            payload["name"] = name
+
+    if not allow_partial or "preset" in body:
+        preset = str(body.get("preset") or "balanced").strip().lower()
+        if preset not in AUTOPILOT_PRESET_DEFAULTS:
+            raise ValueError("preset must be safe, balanced, or aggressive")
+        payload["preset"] = preset
+
+    int_fields = (
+        "budget_daily_cap_cents",
+        "budget_session_cap_cents",
+        "max_attempts_per_sku",
+        "max_attempts_per_site",
+        "captcha_loop_threshold",
+        "decline_threshold",
+        "antibot_threshold",
+    )
+    for field in int_fields:
+        if allow_partial and field not in body:
+            continue
+        raw = body.get(field)
+        if raw is None:
+            payload[field] = None
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{field} must be an integer")
+        if value < 0:
+            raise ValueError(f"{field} must be >= 0")
+        payload[field] = value
+
+    for strategy_field in ("proxy_rotation_strategy", "account_rotation_strategy"):
+        if allow_partial and strategy_field not in body:
+            continue
+        value = str(body.get(strategy_field) or "sticky").strip().lower()
+        if not value:
+            value = "sticky"
+        payload[strategy_field] = value
+
+    if not allow_partial or "retailer_priority" in body:
+        priorities = body.get("retailer_priority")
+        if priorities is None:
+            priorities = []
+        if not isinstance(priorities, list):
+            raise ValueError("retailer_priority must be an array")
+        payload["retailer_priority_json"] = json.dumps([str(item).strip().lower() for item in priorities if str(item).strip()])
+
+    if not allow_partial or "enabled" in body:
+        payload["enabled"] = int(bool(body.get("enabled", True)))
+
+    preset = payload.get("preset")
+    if preset:
+        defaults = AUTOPILOT_PRESET_DEFAULTS[preset]
+        for key, value in defaults.items():
+            payload.setdefault(key, value)
+
+    return payload
+
+
+def _serialize_autopilot_profile(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    raw_priorities = payload.pop("retailer_priority_json", "[]")
+    try:
+        parsed_priorities = json.loads(raw_priorities) if raw_priorities else []
+    except (TypeError, json.JSONDecodeError):
+        parsed_priorities = []
+    payload["retailer_priority"] = parsed_priorities if isinstance(parsed_priorities, list) else []
+    return payload
+
+
+def _task_autopilot_guard(conn: sqlite3.Connection, task: sqlite3.Row) -> tuple[bool, str | None, dict[str, Any]]:
+    profile_id = task["autopilot_profile_id"]
+    if not profile_id:
+        return True, None, {}
+    profile = conn.execute(
+        "select * from autopilot_profiles where id = ? and workspace_id = ?",
+        (profile_id, task["workspace_id"]),
+    ).fetchone()
+    if not profile:
+        return False, "autopilot_profile_missing", {}
+    if int(profile["enabled"] or 0) == 0:
+        return False, "autopilot_profile_disabled", dict(profile)
+
+    monitor = conn.execute("select retailer, coalesce(last_price_cents, 0) as price from monitors where id = ?", (task["monitor_id"],)).fetchone()
+    estimated_price = int((monitor["price"] if monitor else 0) or 0)
+
+    total_success_spend = conn.execute(
+        """
+        select coalesce(sum(coalesce(m.last_price_cents, 0)), 0) as spent
+        from checkout_attempts a
+        join checkout_tasks t on t.id = a.task_id
+        join monitors m on m.id = t.monitor_id
+        where t.workspace_id = ?
+          and t.autopilot_profile_id = ?
+          and a.status = 'success'
+        """,
+        (task["workspace_id"], profile_id),
+    ).fetchone()["spent"]
+    daily_cap = profile["budget_daily_cap_cents"]
+    session_cap = profile["budget_session_cap_cents"]
+    if session_cap is not None and int(total_success_spend) + estimated_price > int(session_cap):
+        return False, "session_budget_cap_reached", dict(profile)
+    if daily_cap is not None and int(total_success_spend) + estimated_price > int(daily_cap):
+        return False, "daily_budget_cap_reached", dict(profile)
+
+    attempts = conn.execute(
+        """
+        select count(*) as c
+        from checkout_attempts
+        where task_id = ? and status in ('failed', 'retrying')
+        """,
+        (task["id"],),
+    ).fetchone()["c"]
+    if int(attempts or 0) >= int(profile["max_attempts_per_site"] or 0):
+        return False, "max_attempts_per_site_reached", dict(profile)
+
+    return True, None, dict(profile)
+
+
+def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqlite3.Row | None:
+    conn = db()
+    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+    if not task:
+        conn.close()
+        return None
+    allowed, reason, profile = _task_autopilot_guard(conn, task)
+    if not allowed:
+        updated = transition_checkout_task(
+            conn,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            requested_state="paused",
+            reason="autopilot_guard",
+            error_text=reason,
+        )
+        record_task_log(
+            conn,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            monitor_id=task["monitor_id"],
+            level="warning",
+            event_type="autopilot_paused",
+            message=f"Autopilot paused task: {reason}",
+            payload={"reason": reason, "autopilot_profile_id": task["autopilot_profile_id"]},
+        )
+        conn.commit()
+        conn.close()
+        return updated
+
+    config = parse_json_object(task["task_config"])
+    if profile:
+        config["autopilot"] = {
+            "max_attempts_per_sku": profile.get("max_attempts_per_sku"),
+            "max_attempts_per_site": profile.get("max_attempts_per_site"),
+        }
+    for step in CHECKOUT_STEP_SEQUENCE:
+        try:
+            preset = _compute_retry_preset(step=step, failure_class="network", task_config=config)
+            if preset["max_attempts"] <= 0:
+                raise CheckoutRetryableError("autopilot_attempts_blocked")
+            transition_checkout_task(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                requested_state=step,
+                reason="state_machine_step",
+            )
+            record_checkout_attempt(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                monitor_id=task["monitor_id"],
+                state=step,
+                step=step,
+                status="success",
+                details={"strategy_state": profile.get("preset") if profile else None, "retry": preset},
+            )
+        except Exception as exc:  # noqa: BLE001
+            record_checkout_attempt(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                monitor_id=task["monitor_id"],
+                state=step,
+                step=step,
+                status="failed",
+                error_text=str(exc),
+                details={"strategy_state": profile.get("preset") if profile else None},
+            )
+            transition_checkout_task(
+                conn,
+                task_id=task_id,
+                workspace_id=workspace_id,
+                requested_state="error",
+                reason="state_machine_error",
+                error_text=str(exc),
+            )
+            conn.commit()
+            row = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+            conn.close()
+            return row
+
+    updated = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        requested_state="success",
+        reason="state_machine_complete",
+    )
+    conn.commit()
+    conn.close()
+    return updated
+
+
+@app.post("/api/autopilot-profiles")
+@require_auth
+def api_create_autopilot_profile():
+    body = request.json or {}
+    try:
+        normalized = _normalize_autopilot_profile_payload(body, allow_partial=False)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    now_iso = utc_now()
+    conn = db()
+    cur = conn.execute(
+        """
+        insert into autopilot_profiles(
+            workspace_id, name, preset,
+            budget_daily_cap_cents, budget_session_cap_cents,
+            max_attempts_per_sku, max_attempts_per_site,
+            retailer_priority_json,
+            proxy_rotation_strategy, account_rotation_strategy,
+            captcha_loop_threshold, decline_threshold, antibot_threshold,
+            enabled, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            current_workspace_id(),
+            normalized["name"],
+            normalized.get("preset", "balanced"),
+            normalized.get("budget_daily_cap_cents"),
+            normalized.get("budget_session_cap_cents"),
+            normalized.get("max_attempts_per_sku", 3),
+            normalized.get("max_attempts_per_site", 6),
+            normalized.get("retailer_priority_json", "[]"),
+            normalized.get("proxy_rotation_strategy", "sticky"),
+            normalized.get("account_rotation_strategy", "sticky"),
+            normalized.get("captcha_loop_threshold", 3),
+            normalized.get("decline_threshold", 2),
+            normalized.get("antibot_threshold", 2),
+            normalized.get("enabled", 1),
+            now_iso,
+            now_iso,
+        ),
+    )
+    row = conn.execute("select * from autopilot_profiles where id = ?", (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(_serialize_autopilot_profile(row)), 201
+
+
+@app.get("/api/autopilot-profiles")
+@require_auth
+def api_list_autopilot_profiles():
+    conn = db()
+    rows = conn.execute(
+        "select * from autopilot_profiles where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([_serialize_autopilot_profile(r) for r in rows])
+
+
+@app.get("/api/autopilot-profiles/<int:profile_id>")
+@require_auth
+def api_get_autopilot_profile(profile_id: int):
+    conn = db()
+    row = conn.execute(
+        "select * from autopilot_profiles where id = ? and workspace_id = ?",
+        (profile_id, current_workspace_id()),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Autopilot profile not found"}), 404
+    return jsonify(_serialize_autopilot_profile(row))
+
+
+@app.patch("/api/autopilot-profiles/<int:profile_id>")
+@require_auth
+def api_update_autopilot_profile(profile_id: int):
+    body = request.json or {}
+    try:
+        normalized = _normalize_autopilot_profile_payload(body, allow_partial=True)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not normalized:
+        return jsonify({"error": "No mutable fields provided"}), 400
+    normalized["updated_at"] = utc_now()
+    conn = db()
+    row = conn.execute(
+        "select id from autopilot_profiles where id = ? and workspace_id = ?",
+        (profile_id, current_workspace_id()),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "Autopilot profile not found"}), 404
+    for key, value in normalized.items():
+        conn.execute(
+            f"update autopilot_profiles set {key} = ? where id = ? and workspace_id = ?",
+            (value, profile_id, current_workspace_id()),
+        )
+    row = conn.execute(
+        "select * from autopilot_profiles where id = ? and workspace_id = ?",
+        (profile_id, current_workspace_id()),
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(_serialize_autopilot_profile(row))
+
+
+@app.delete("/api/autopilot-profiles/<int:profile_id>")
+@require_auth
+def api_delete_autopilot_profile(profile_id: int):
+    conn = db()
+    cur = conn.execute(
+        "delete from autopilot_profiles where id = ? and workspace_id = ?",
+        (profile_id, current_workspace_id()),
+    )
+    conn.execute(
+        "update checkout_tasks set autopilot_profile_id = null where workspace_id = ? and autopilot_profile_id = ?",
+        (current_workspace_id(), profile_id),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Autopilot profile not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.post("/api/autopilot-profiles/simulate")
+@require_auth
+def api_simulate_autopilot_profile():
+    body = request.json or {}
+    profile_id = body.get("autopilot_profile_id")
+    if profile_id is None:
+        try:
+            profile = _normalize_autopilot_profile_payload(body.get("profile") or {}, allow_partial=False)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+    else:
+        conn = db()
+        row = conn.execute(
+            "select * from autopilot_profiles where id = ? and workspace_id = ?",
+            (int(profile_id), current_workspace_id()),
+        ).fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"error": "Autopilot profile not found"}), 404
+        profile = dict(row)
+
+    estimated_price = int(body.get("estimated_price_cents") or 0)
+    consumed_today = int(body.get("spent_today_cents") or 0)
+    site_attempts = int(body.get("site_attempts") or 0)
+
+    budget_cap = profile.get("budget_session_cap_cents") or profile.get("budget_daily_cap_cents")
+    stop_reasons: list[str] = []
+    if budget_cap is not None and consumed_today + estimated_price > int(budget_cap):
+        stop_reasons.append("budget_cap")
+    if site_attempts >= int(profile.get("max_attempts_per_site") or 0):
+        stop_reasons.append("max_attempts_per_site")
+
+    behavior = {
+        "preset": profile.get("preset", "balanced"),
+        "rotation": {
+            "proxy": profile.get("proxy_rotation_strategy", "sticky"),
+            "account": profile.get("account_rotation_strategy", "sticky"),
+        },
+        "thresholds": {
+            "captcha_loops": profile.get("captcha_loop_threshold", 3),
+            "declines": profile.get("decline_threshold", 2),
+            "antibot": profile.get("antibot_threshold", 2),
+        },
+    }
+    return jsonify(
+        {
+            "ok": True,
+            "can_start": len(stop_reasons) == 0,
+            "estimated_behavior_summary": (
+                f"{behavior['preset'].title()} profile with {behavior['rotation']['proxy']} proxy rotation "
+                f"and site max attempts {profile.get('max_attempts_per_site')}"
+            ),
+            "stop_reasons": stop_reasons,
+            "strategy_state": behavior,
+            "spend": {
+                "consumed_cents": consumed_today,
+                "estimated_order_cents": estimated_price,
+                "cap_cents": budget_cap,
+            },
+        }
+    )
+
+
+@app.post("/api/checkout/tasks")
+@require_auth
+def api_create_checkout_task_v2():
+    body = request.json or {}
+    try:
+        monitor_id = int(body.get("monitor_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "monitor_id is required"}), 400
+    workspace_id = current_workspace_id()
+    task_name = (body.get("task_name") or "").strip() or None
+    task_config = body.get("task_config") if isinstance(body.get("task_config"), dict) else {}
+    initial_state = body.get("initial_state") or "queued"
+    autopilot_profile_id = body.get("autopilot_profile_id")
+    if autopilot_profile_id is None and isinstance(task_config, dict):
+        autopilot_profile_id = task_config.get("autopilot_profile_id")
+    if autopilot_profile_id is not None:
+        try:
+            autopilot_profile_id = int(autopilot_profile_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "autopilot_profile_id must be numeric"}), 400
+
+    conn = db()
+    monitor = get_monitor_for_workspace(conn, monitor_id, workspace_id)
+    if not monitor:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+    try:
+        row = create_checkout_task(
+            conn,
+            workspace_id=workspace_id,
+            monitor_id=monitor_id,
+            task_name=task_name,
+            task_config=task_config,
+            initial_state=initial_state,
+            autopilot_profile_id=autopilot_profile_id,
+        )
+    except ValueError as exc:
+        conn.close()
+        return jsonify({"error": str(exc)}), 400
+    conn.commit()
+    payload = serialize_checkout_task(row)
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/start")
+@require_auth
+def api_start_checkout_task_v2(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="monitoring_product",
+        reason="api_start",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/pause")
+@require_auth
+def api_pause_checkout_task_v2(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="paused",
+        reason="api_pause",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/stop")
+@require_auth
+def api_stop_checkout_task_v2(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="stopped",
+        reason="api_stop",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+@app.get("/api/checkout/tasks/<int:task_id>/state")
+@require_auth
+def api_checkout_task_state_v2(task_id: int):
+    conn = db()
+    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    last_attempt = conn.execute(
+        """
+        select id, state, step, status, details, error_text, created_at
+        from checkout_attempts
+        where task_id = ?
+        order by id desc
+        limit 1
+        """,
+        (task_id,),
+    ).fetchone()
+    conn.close()
+    payload = {
+        "task_id": task_id,
+        "current_state": row["current_state"],
+        "last_error": row["last_error"],
+        "last_transition_at": row["last_transition_at"],
+        "autopilot_profile_id": row["autopilot_profile_id"],
+        "last_attempt": dict(last_attempt) if last_attempt else None,
+    }
+    return jsonify(payload)
+
+
+@app.get("/api/dashboard/autopilot")
+@require_auth
+def api_dashboard_autopilot():
+    workspace_id = current_workspace_id()
+    conn = db()
+    rows = conn.execute(
+        """
+        select
+            ct.id as task_id,
+            ct.current_state,
+            ct.last_error,
+            ap.id as profile_id,
+            ap.name as profile_name,
+            ap.preset,
+            ap.budget_daily_cap_cents,
+            ap.budget_session_cap_cents,
+            coalesce(m.last_price_cents, 0) as spend_consumed_cents
+        from checkout_tasks ct
+        left join autopilot_profiles ap on ap.id = ct.autopilot_profile_id
+        left join monitors m on m.id = ct.monitor_id
+        where ct.workspace_id = ?
+          and ct.autopilot_profile_id is not null
+        order by ct.id desc
+        limit 100
+        """,
+        (workspace_id,),
+    ).fetchall()
+    conn.close()
+    payload = []
+    for row in rows:
+        cap = row["budget_session_cap_cents"] if row["budget_session_cap_cents"] is not None else row["budget_daily_cap_cents"]
+        consumed = int(row["spend_consumed_cents"] or 0)
+        payload.append(
+            {
+                "task_id": row["task_id"],
+                "profile_id": row["profile_id"],
+                "profile_name": row["profile_name"],
+                "strategy_state": row["preset"],
+                "spend_consumed_cents": consumed,
+                "spend_cap_cents": cap,
+                "automatic_pause_reason": row["last_error"],
+                "current_state": row["current_state"],
+            }
+        )
+    return jsonify({"rows": payload})
 
 @app.post("/api/start")
 @require_auth
