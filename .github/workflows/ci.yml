@@ -23,16 +23,5 @@ jobs:
           pip install -r requirements.txt
           pip install pytest ruff
 
-      - name: Lint/static checks
-        run: |
-          ruff check tests
-          python -m compileall -q app.py tests
-
-      - name: Unit tests
-        run: pytest -q tests
-
-      - name: Migration safety: fresh database init_db() path
-        run: pytest -q tests/test_billing_schema.py::test_init_db_creates_billing_tables_and_columns
-
-      - name: Migration safety: legacy monitors table upgrade path
-        run: pytest -q tests/test_app.py::test_init_db_migrates_existing_monitors_table_with_msrp_column
+      - name: Quality gates (lint + tests + migration safety)
+        run: ./scripts/ci_quality_gates.sh
