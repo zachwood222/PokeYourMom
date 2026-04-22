@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Stock Sentinel</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   {% if captcha_site_key %}<script src="{{ captcha_script_url }}" async defer></script>{% endif %}
   <style>
     :root {
@@ -502,14 +503,96 @@
     .dashboard-chart-row { display:grid; grid-template-columns: 1.3fr 1fr; gap:12px; margin-top:12px; }
     .chart-card, .donut-card { min-height:220px; }
     .line-graph { height:170px; border-radius: 10px; background: linear-gradient(180deg, rgba(109,224,185,0.28), rgba(20,27,47,0.2)); position: relative; overflow:hidden; }
-    .line-graph span { position:absolute; inset: 18px; border-left:1px solid rgba(132,149,200,.3); border-bottom:1px solid rgba(132,149,200,.3); clip-path: polygon(0% 85%, 10% 45%, 20% 62%, 33% 30%, 45% 54%, 58% 38%, 68% 58%, 80% 42%, 100% 66%, 100% 100%, 0 100%); background: rgba(119,234,198,.45); }
+    .line-graph span { position:absolute; inset: 18px; border-left:1px solid rgba(132,149,200,.3); border-bottom:1px solid rgba(132,149,200,.3); }
+    .line-graph svg { position:absolute; inset:18px; width: calc(100% - 36px); height: calc(100% - 36px); overflow: visible; }
+    .line-graph polyline { fill: rgba(119,234,198,.28); stroke: #77eac6; stroke-width: 2; }
     .donut-wrap { display:flex; align-items:center; gap:18px; margin-top:20px; }
     .donut { width:120px; height:120px; border-radius:50%; background: conic-gradient(#f2c84b 0 35%, #6d93ff 35% 55%, #55d7a6 55% 73%, #d76ae6 73% 85%, #9aa6c5 85% 100%); position:relative; }
     .donut::after { content:""; position:absolute; inset:28px; background:#161a35; border-radius:50%; }
     .donut-legend { list-style:none; margin:0; padding:0; color:#c9d4ef; font-size:12px; }
     .donut-legend li { margin-bottom:8px; display:flex; align-items:center; gap:8px; }
+    .donut-center-label { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; color: #dce5f7; z-index: 2; text-align: center; padding-top: 4px; }
     .dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
     .dot.w { background:#f2c84b; } .dot.t { background:#6d93ff; } .dot.b { background:#55d7a6; } .dot.o { background:#d76ae6; }
+    .order-product-cell { display:flex; align-items:center; gap:10px; min-width: 220px; }
+    .order-thumb { width:36px; height:36px; border-radius:8px; border:1px solid #2a3856; object-fit:cover; background:#121a2f; }
+    .insight-grid { margin-top: 12px; display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:10px; }
+    .insight-card { background:#161c36; border:1px solid #303b72; border-radius:10px; padding:10px; }
+    .insight-card strong { font-size:12px; color:#c2d0f0; display:block; margin-bottom:4px; }
+    .insight-card span { font-size:20px; font-weight:700; color:#f4f8ff; }
+
+
+    .tasks-clone-shell {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+    .tasks-clone-groups { position: sticky; top: 80px; }
+    .tasks-groups-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; gap:8px; }
+    .tasks-groups-head button { width:auto; padding:6px 10px; }
+    .task-group-list { max-height: 460px; overflow:auto; border:1px solid #243353; border-radius:10px; padding:6px; margin:10px 0; background:#0b1222; }
+    .task-group-item { border:1px solid #25314d; border-radius:8px; padding:8px; margin-bottom:6px; cursor:pointer; }
+    .task-group-item.active { border-color:#516bb0; background:#182442; }
+    .tasks-clone-main { padding: 12px; }
+    .tasks-clone-header { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px; }
+    .task-toolbar-actions { display:flex; gap:6px; flex-wrap:wrap; }
+    .task-toolbar-actions button { width:auto; font-size:12px; padding:7px 10px; }
+    .clone-toolbar { margin-bottom: 8px; }
+    .clone-table-scroller { max-height: 520px; }
+    .clone-table-scroller table { font-size:12px; }
+    .clone-table-scroller th, .clone-table-scroller td { white-space: nowrap; }
+    .task-group-item {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 8px;
+      text-align: left;
+      background: #10182d;
+      color: #d8e2f7;
+    }
+    .task-group-meta { display:flex; flex-direction:column; gap:2px; min-width:0; }
+    .task-group-name { font-size: 13px; font-weight: 600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .task-group-site { font-size: 11px; color:#9cb0d8; text-transform: uppercase; letter-spacing: .06em; }
+    .task-group-menu-wrap { position: relative; }
+    .task-group-menu-btn { width:auto; padding:2px 7px; background:#0c1221; border:1px solid #2a3a60; border-radius: 6px; }
+    .task-group-menu {
+      position: absolute;
+      right: 0;
+      top: 28px;
+      display: none;
+      min-width: 100px;
+      z-index: 25;
+      background: #0d1528;
+      border: 1px solid #2f4068;
+      border-radius: 8px;
+      padding: 5px;
+    }
+    .task-group-menu button { width: 100%; text-align:left; background: transparent; border: 0; padding: 7px; }
+    .task-group-menu.open { display: block; }
+    .task-icon-btn { width:auto; min-width:30px; padding:5px 7px; font-size:11px; }
+    .task-modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 6, 14, 0.72);
+      z-index: 180;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .task-modal-overlay.open { display: flex; }
+    .task-modal {
+      width: min(980px, 95vw);
+      max-height: 90vh;
+      overflow: auto;
+      background: #0d1222;
+      border: 1px solid #2b3b62;
+      border-radius: 12px;
+      padding: 14px;
+    }
+    .task-modal-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
 
 
     .tasks-clone-shell {
@@ -591,6 +674,7 @@
       .sidebar { order: 2; }
       .content { order: 1; }
       .topbar { height: auto; min-height: 62px; padding: 10px 14px; flex-wrap: wrap; gap: 8px; }
+      .insight-grid { grid-template-columns: 1fr; }
     }
 
     @media (max-width: 740px) {
@@ -625,7 +709,7 @@
   <div class="layout">
     <aside class="sidebar sidebar-themed">
       <div class="sidebar-brand">
-        <h2 class="hero-title">Stellar AIO</h2>
+        <h2 class="hero-title">PokeYourMom AIO</h2>
         <p class="subtitle">Version 1.0.1</p>
       </div>
       <div class="card">
@@ -679,35 +763,53 @@
 
         <div class="dashboard-chart-row">
           <div class="card chart-card">
-            <h3>Amount Spent Monthly</h3>
-            <div class="line-graph"><span></span></div>
+            <h3>Amount Spent (Last 14 Days)</h3>
+            <div class="line-graph">
+              <span></span>
+              <svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                <polyline id="amount_spent_polyline" points="0,100 20,80 40,72 60,60 80,45 100,35 100,100 0,100"></polyline>
+              </svg>
+            </div>
           </div>
           <div class="card donut-card">
-            <h3>Most Sites Checkouts</h3>
+            <h3>Sites Checkouts</h3>
             <div class="donut-wrap">
-              <div class="donut"></div>
-              <ul class="donut-legend">
-                <li><span class="dot w"></span>Walmart</li>
-                <li><span class="dot t"></span>Target</li>
-                <li><span class="dot b"></span>BestBuy</li>
-                <li><span class="dot o"></span>Other Sites</li>
+              <div id="site_checkout_donut" class="donut">
+                <div id="site_checkout_donut_center" class="donut-center-label">0<br/>orders</div>
+              </div>
+              <ul id="site_checkout_legend" class="donut-legend">
+                <li><span class="dot w"></span>No checkout data yet</li>
               </ul>
             </div>
           </div>
         </div>
+        <div class="insight-grid">
+          <div class="insight-card">
+            <strong>Conversion</strong>
+            <span id="dashboard_conversion_rate">0%</span>
+          </div>
+          <div class="insight-card">
+            <strong>Average Order</strong>
+            <span id="dashboard_average_order">$0.00</span>
+          </div>
+          <div class="insight-card">
+            <strong>Best Site</strong>
+            <span id="dashboard_best_site">N/A</span>
+          </div>
+        </div>
 
         <div class="card" style="margin-top:14px;">
-          <h3>Previous Checkouts</h3>
+          <h3>Product Orders</h3>
           <table>
-            <thead><tr><th>Site</th><th>Product</th><th>Profile</th><th>Price</th><th>Order #</th><th>Order Date & Time</th></tr></thead>
+            <thead><tr><th>Site</th><th>Product</th><th>Qty</th><th>Price</th><th>Spent</th><th>Purchased</th></tr></thead>
             <tbody id="ops_monitor_failure_trends"></tbody>
           </table>
         </div>
 
         <div class="card" style="margin-top:14px;">
-          <h3>Webhook Health Trends</h3>
+          <h3>Site Checkout Breakdown</h3>
           <table>
-            <thead><tr><th>Webhook</th><th>Fail Streak</th><th>Last Code</th><th>Failures (24h)</th></tr></thead>
+            <thead><tr><th>Site</th><th>Checkouts</th><th>Share</th></tr></thead>
             <tbody id="ops_webhook_health_trends"></tbody>
           </table>
         </div>
@@ -882,59 +984,6 @@
           </div>
         </div>
 
-        <div id="monitor_modal_overlay" class="task-modal-overlay" onclick="dismissMonitorModal(event)">
-          <div class="task-modal" role="dialog" aria-modal="true" aria-label="Monitor manager">
-            <div class="task-modal-header">
-              <h2 class="section-title">Monitor + AutoCheckout Control Center</h2>
-              <button onclick="closeMonitorModal()">Close</button>
-            </div>
-            <div class="dense-grid">
-              <div class="dense-form-row">
-                <label>Retailer</label>
-                <select id="retailer">
-                  <option>walmart</option>
-                  <option>target</option>
-                  <option>bestbuy</option>
-                  <option>amazon</option>
-                </select>
-              </div>
-              <div class="dense-form-row">
-                <label>Poll Interval (seconds)</label>
-                <input id="poll_interval" type="number" value="20" />
-              </div>
-              <div class="dense-form-row" style="grid-column: 1 / -1;">
-                <label>Product URL / PID / SKU</label>
-                <input id="product_url" placeholder="https://www.walmart.com/ip/... or 12-34567-890" />
-              </div>
-              <div class="dense-form-row">
-                <label>Keyword Filter</label>
-                <input id="keyword" placeholder="pokemon" />
-              </div>
-              <div class="dense-form-row">
-                <label>Max Price Cents</label>
-                <input id="max_price_cents" type="number" placeholder="4000" />
-              </div>
-              <div class="dense-form-row">
-                <label>MSRP Cents (Pokemon)</label>
-                <input id="msrp_cents" type="number" placeholder="499" />
-              </div>
-            </div>
-            <div class="actions" style="margin-top:10px;">
-              <button class="btn-primary" onclick="addMonitor()">Create Monitor</button>
-              <button onclick="createTasksForSelectedMonitors()">Create AutoCheckout Bots for Selected</button>
-              <button onclick="bulkStopRunningGroup()">Stop Running Bots in Selected Group</button>
-              <button class="btn-danger" onclick="deleteAllMonitors()">Delete All Monitors</button>
-            </div>
-            <div id="monitor_input_error" class="inline-error"></div>
-            <div class="table-shell" style="margin-top:12px; max-height:320px;">
-              <table>
-                <thead><tr><th>ID</th><th>Select</th><th>Site</th><th>Product</th><th>Last Checked</th><th>Stock State</th><th>Actions</th></tr></thead>
-                <tbody id="monitors"></tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-
         <div style="display:none;">
           <input id="quick_retailer" value="walmart" />
           <input id="quick_poll_interval" value="20" />
@@ -944,9 +993,16 @@
           <input id="quick_keyword" value="" />
           <input id="quick_max_price_cents" value="" />
           <input id="quick_msrp_cents" value="" />
+          <input id="retailer" value="walmart" />
+          <input id="product_url" value="" />
+          <input id="keyword" value="" />
+          <input id="max_price_cents" value="" />
+          <input id="msrp_cents" value="" />
+          <input id="poll_interval" value="20" />
           <textarea id="monitor_payload_input"></textarea>
           <div id="monitor_payload_status"></div>
           <div id="monitor_payload_candidates"></div>
+          <table><tbody id="monitors"></tbody></table>
           <select id="manage_products_mode"></select>
           <input id="manage_products_input" />
           <table><tbody id="manage_products_rows"></tbody></table>
@@ -989,6 +1045,18 @@
               <div class="dense-form-row"><label>Token Reference*</label><input id="payment_token_reference" placeholder="tok_live_... / paypal_ba_..." /></div>
             </div>
             <p class="small">Security: raw card number/CVV is intentionally blocked. Save only tokenized references.</p>
+
+            <h3 style="margin-top:10px;">Virtual Card Import (Excel)</h3>
+            <p class="small">Upload an .xlsx/.xls sheet with columns: <strong>label</strong> (optional), <strong>provider</strong> (optional), <strong>token_reference</strong> (required).</p>
+            <div class="dense-grid">
+              <div class="dense-form-row"><label>Excel File</label><input id="virtual_cc_file" type="file" accept=".xlsx,.xls" /></div>
+              <div class="dense-form-row"><label>Target Profile ID (optional)</label><input id="virtual_cc_profile_id" type="number" placeholder="Auto use newly created profile" /></div>
+            </div>
+            <div class="actions" style="margin-top:8px;">
+              <button type="button" onclick="importVirtualCardsFromExcel()">Import Virtual Cards</button>
+            </div>
+            <div id="virtual_cc_status" class="small"></div>
+
             <button class="btn-primary" onclick="createVaultProfile()">Save Profile Vault</button>
             <div id="profiles_error" class="inline-error"></div>
           </div>
@@ -1086,8 +1154,95 @@
       </section>
 
       <section id="tab-logs" class="tab">
+        <h1>Captcha Dashboard</h1>
+        <p class="helper">Configure captcha harvesters for One-Click Gmail sessions and review best-practice setup guidance before running tasks.</p>
+
+        <div class="grid" style="margin-top:16px;">
+          <div class="card">
+            <h2>Quick Start</h2>
+            <ol class="helper" style="padding-left:18px; margin:0; display:flex; flex-direction:column; gap:8px;">
+              <li>Install <strong>Google Chrome</strong>. Captcha solvers use your local Chrome browser profile.</li>
+              <li>Go to <strong>Captchas</strong> and click <strong>Add Captcha</strong> to create a harvester.</li>
+              <li>Optional: set a proxy in <strong>Enter Proxy</strong> if you want captcha traffic on a specific IP.</li>
+              <li>Click the <strong>YouTube</strong> button and sign in to a Google account (not required for Pokémon Center).</li>
+              <li>After sign-in succeeds, close the YouTube window and open the pop-out arrow window before tasks start.</li>
+            </ol>
+          </div>
+
+          <div class="card">
+            <h2>Buttons & Actions</h2>
+            <table>
+              <thead><tr><th>Control</th><th>What it does</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Add Captcha</strong></td><td>Creates another captcha harvester for additional accounts or parallel tasks.</td></tr>
+                <tr><td><strong>Enter Proxy</strong></td><td>Optional. If blank, harvester uses localhost IP. For reCAPTCHA targets, this field proxy is used.</td></tr>
+                <tr><td><strong>Pop-out Arrow</strong></td><td>Opens the harvester window so you can manually answer challenges.</td></tr>
+                <tr><td><strong>YouTube</strong></td><td>Opens Google sign-in flow for the harvester account session.</td></tr>
+                <tr><td><strong>Eraser</strong></td><td>Logs out Google and clears stored harvester state.</td></tr>
+                <tr><td><strong>Trash Can</strong></td><td>Deletes the harvester.</td></tr>
+                <tr><td><strong>Floppy Disk</strong></td><td>Saves current harvester settings and session-related data.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="grid" style="margin-top:16px;">
+          <div class="card">
+            <h2>Auto Click & Auto Solve</h2>
+            <ul class="helper" style="margin:0; padding-left:18px; display:flex; flex-direction:column; gap:8px;">
+              <li><strong>Auto Click</strong>: Works across all modules. Automatically clicks eligible one-click checkbox captchas.</li>
+              <li><strong>Auto Solve (Serverside)</strong>: Pokémon Center only. Uses remote infrastructure and is capped at <strong>10 enabled instances</strong> at once.</li>
+              <li><strong>Auto Solve (Local AI)</strong>: Pokémon Center only. Uses your local machine (GPU/CPU) for solving.</li>
+            </ul>
+            <p class="helper" style="margin-top:10px;">Recommendation: prefer <strong>Serverside</strong> on hosted/server environments. Use <strong>Local AI</strong> on a local PC with strong hardware.</p>
+          </div>
+
+          <div class="card">
+            <h2>Local AI Requirements</h2>
+            <ul class="helper" style="margin:0; padding-left:18px; display:flex; flex-direction:column; gap:8px;">
+              <li>Enable Local AI once; the model downloads automatically and only reinstalls for updates.</li>
+              <li>Before a Pokémon Center drop, confirm solver status shows <strong>Ready</strong> and run a <strong>Test</strong> solve.</li>
+              <li>Minimum <strong>8GB VRAM</strong> recommended. CPU fallback works but is significantly slower.</li>
+              <li>Validated examples include RTX 3060, 3070, and 4060 for stable multi-harvester usage.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+          <h2>Proxy Behavior Notes</h2>
+          <ul class="helper" style="margin:0; padding-left:18px; display:flex; flex-direction:column; gap:8px;">
+            <li>You can solve all captchas with one harvester; multiple harvesters are optional for scale.</li>
+            <li>If Gmail sign-in fails repeatedly, delete the harvester and create a new one.</li>
+            <li>For Pokémon Center-style captcha flows, <strong>task proxy settings take priority</strong> over harvester proxy.</li>
+            <li>For reCAPTCHA flows, the <strong>harvester proxy field</strong> is used for captcha solving.</li>
+          </ul>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+          <h2>Live Captcha Logs</h2>
+          <div id="logs" class="logs"></div>
+        </div>
         <h1>Captcha</h1>
-        <div id="logs" class="logs"></div>
+        <div class="grid">
+          <div class="card">
+            <h2 class="section-title">Captcha Auto Solver</h2>
+            <label>Checkout Task ID</label>
+            <input id="captcha_task_id" type="number" placeholder="123" />
+            <label>Solver Prefix</label>
+            <input id="captcha_solver_prefix" value="auto-solved-token" />
+            <label>Poll Interval (seconds)</label>
+            <input id="captcha_poll_seconds" type="number" min="3" value="8" />
+            <div class="actions" style="margin-top:10px;">
+              <button type="button" id="captcha_auto_btn" onclick="toggleCaptchaAutoSolve()">Start Auto Solve</button>
+              <button type="button" onclick="runCaptchaAutoSolveOnce()">Solve Pending Now</button>
+            </div>
+            <div id="captcha_auto_status" class="small" style="margin-top:8px;">Idle.</div>
+          </div>
+          <div class="card">
+            <h2 class="section-title">Captcha Activity</h2>
+            <div id="logs" class="logs"></div>
+          </div>
+        </div>
       </section>
     </main>
   </div>
@@ -1259,19 +1414,7 @@
     }
 
     function openMonitorPulse() {
-      const modal = document.getElementById('monitor_modal_overlay');
-      if (!modal) return;
-      modal.classList.add('open');
-      loadMonitors();
-      loadTasks();
-    }
-
-    function closeMonitorModal() {
-      document.getElementById('monitor_modal_overlay')?.classList.remove('open');
-    }
-
-    function dismissMonitorModal(event) {
-      if (event.target?.id === 'monitor_modal_overlay') closeMonitorModal();
+      showToast('Monitor popup is not wired to backend yet; connect restock stream endpoint to enable.');
     }
 
     function importTasksPrompt() {
@@ -1529,7 +1672,7 @@
       loopRunning = !!data.running;
       document.getElementById('loopBtn').textContent = loopRunning ? 'Stop Monitor Loop' : 'Start Monitor Loop';
       await loadOpsMetrics();
-      await loadOpsTrends();
+      await loadCommerceDashboard();
     }
 
     async function loadOpsMetrics() {
@@ -1549,33 +1692,109 @@
       document.getElementById('ops_webhook_failed_total').textContent = webhookFailed;
     }
 
-    async function loadOpsTrends() {
-      const monitorData = await apiFetch('/api/ops/monitor-failure-trends').then(r => r.json()).catch(() => ({trends: []}));
-      const webhookData = await apiFetch('/api/ops/webhook-health-trends').then(r => r.json()).catch(() => ({webhooks: []}));
+    function formatMoney(cents) {
+      return `$${(Number(cents || 0) / 100).toFixed(2)}`;
+    }
 
-      const monitorRows = toArray(monitorData, 'trends');
+    function formatDateTime(value) {
+      const dt = value ? new Date(value) : null;
+      if (!dt || Number.isNaN(dt.getTime())) return '—';
+      return dt.toLocaleString();
+    }
+
+    function renderAmountSpentLine(points) {
+      const polyline = document.getElementById('amount_spent_polyline');
+      if (!polyline) return;
+      const rows = Array.isArray(points) ? points : [];
+      if (!rows.length) {
+        polyline.setAttribute('points', '0,100 100,100 100,100 0,100');
+        return;
+      }
+      const max = Math.max(...rows.map(p => Number(p.spent_cents || 0)), 1);
+      const path = rows.map((point, idx) => {
+        const x = rows.length === 1 ? 0 : (idx / (rows.length - 1)) * 100;
+        const y = 100 - ((Number(point.spent_cents || 0) / max) * 100);
+        return `${x.toFixed(2)},${y.toFixed(2)}`;
+      });
+      polyline.setAttribute('points', `${path.join(' ')} 100,100 0,100`);
+    }
+
+    function renderSiteCheckoutDonut(siteRows) {
+      const rows = Array.isArray(siteRows) ? siteRows : [];
+      const donut = document.getElementById('site_checkout_donut');
+      const legend = document.getElementById('site_checkout_legend');
+      const center = document.getElementById('site_checkout_donut_center');
+      if (!donut || !legend || !center) return;
+      const total = rows.reduce((sum, row) => sum + Number(row.checkouts || 0), 0);
+      center.innerHTML = `${total}<br/>orders`;
+      if (!total) {
+        donut.style.background = 'conic-gradient(#9aa6c5 0 100%)';
+        legend.innerHTML = '<li><span class="dot o"></span>No checkout data yet</li>';
+        return;
+      }
+
+      const colors = ['#f2c84b', '#6d93ff', '#55d7a6', '#d76ae6', '#f28d4b', '#7ee77a'];
+      let cursor = 0;
+      const slices = rows.slice(0, 6).map((row, idx) => {
+        const count = Number(row.checkouts || 0);
+        const pct = (count / total) * 100;
+        const start = cursor;
+        cursor += pct;
+        return {site: row.site, count, pct, color: colors[idx % colors.length], start, end: cursor};
+      });
+      donut.style.background = `conic-gradient(${slices.map(s => `${s.color} ${s.start}% ${s.end}%`).join(', ')})`;
+      legend.innerHTML = slices.map((s, idx) => (
+        `<li><span class="dot ${idx === 0 ? 'w' : idx === 1 ? 't' : idx === 2 ? 'b' : 'o'}" style="background:${s.color};"></span>${String(s.site || 'unknown').toUpperCase()} · ${s.count}</li>`
+      )).join('');
+    }
+
+    async function loadCommerceDashboard() {
+      const commerce = await apiFetch('/api/dashboard/commerce').then(r => r.json()).catch(() => ({}));
+      const checkouts = Number(commerce.checkouts_total || 0);
+      const declines = Number(commerce.declines_total || 0);
+      const spent = Number(commerce.spent_total_cents || 0);
+      document.getElementById('kpi_total_monitors').textContent = checkouts;
+      document.getElementById('ops_checks_failed_total').textContent = declines;
+      document.getElementById('ops_webhook_sent_total').textContent = formatMoney(spent);
+      document.getElementById('dashboard_conversion_rate').textContent = `${Math.round(Number(commerce.success_rate || 0) * 100)}%`;
+      document.getElementById('dashboard_average_order').textContent = formatMoney(commerce.average_order_value_cents || 0);
+
+      const monitorRows = toArray(commerce, 'product_orders');
       const monitorBody = document.getElementById('ops_monitor_failure_trends');
       monitorBody.innerHTML = '';
       if (!monitorRows.length) {
-        monitorBody.innerHTML = '<tr><td colspan="3">No failures recorded.</td></tr>';
+        monitorBody.innerHTML = '<tr><td colspan="6">No successful orders yet. Start tasks to populate Product Orders.</td></tr>';
       }
       for (const row of monitorRows) {
+        const productName = String(row.product_name || 'Product').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const image = `https://logo.clearbit.com/${String(row.site || 'example.com').replace(/[^a-z0-9.-]/gi, '')}.com`;
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${row.monitor_id}</td><td>${row.failures_last_24h || 0}</td><td>${row.failures_last_7d || 0}</td>`;
+        tr.innerHTML = `<td>${String(row.site || '').toUpperCase()}</td>
+          <td><div class="order-product-cell"><img class="order-thumb" src="${image}" alt="${productName}" onerror="this.style.display='none';" /><a href="${row.product_url || '#'}" target="_blank" rel="noopener noreferrer">${productName}</a></div></td>
+          <td>${row.quantity || 1}</td>
+          <td>${formatMoney(row.price_cents || 0)}</td>
+          <td>${formatMoney(row.spent_cents || 0)}</td>
+          <td>${formatDateTime(row.purchased_at)}</td>`;
         monitorBody.appendChild(tr);
       }
 
-      const webhookRows = toArray(webhookData, 'webhooks');
+      const webhookRows = toArray(commerce, 'sites_checkouts');
       const webhookBody = document.getElementById('ops_webhook_health_trends');
       webhookBody.innerHTML = '';
+      const siteTotal = webhookRows.reduce((sum, row) => sum + Number(row.checkouts || 0), 0);
       if (!webhookRows.length) {
-        webhookBody.innerHTML = '<tr><td colspan="4">No webhook health data yet.</td></tr>';
+        webhookBody.innerHTML = '<tr><td colspan="3">No site checkout data yet.</td></tr>';
       }
       for (const row of webhookRows) {
+        const share = siteTotal > 0 ? `${((Number(row.checkouts || 0) / siteTotal) * 100).toFixed(1)}%` : '0%';
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${row.webhook_id}</td><td>${row.fail_streak || 0}</td><td>${row.last_status_code || '-'}</td><td>${row.recent_failures_24h || 0}</td>`;
+        tr.innerHTML = `<td>${String(row.site || 'unknown').toUpperCase()}</td><td>${row.checkouts || 0}</td><td>${share}</td>`;
         webhookBody.appendChild(tr);
       }
+
+      renderSiteCheckoutDonut(webhookRows);
+      renderAmountSpentLine(toArray(commerce, 'amount_spent_daily'));
+      document.getElementById('dashboard_best_site').textContent = webhookRows[0]?.site ? String(webhookRows[0].site).toUpperCase() : 'N/A';
     }
 
     async function savePlan() {
@@ -2302,6 +2521,132 @@
       }
     }
 
+    async function createCaptchaHarvester() {
+      const payload = {
+        name: (document.getElementById('captcha_name')?.value || '').trim() || 'Harvester',
+        proxy_url: (document.getElementById('captcha_proxy')?.value || '').trim() || null,
+        auto_click_enabled: document.getElementById('captcha_auto_click')?.checked ?? true,
+        auto_solve_mode: document.getElementById('captcha_auto_solve_mode')?.value || 'off',
+      };
+      const res = await apiFetch('/api/captcha/harvesters', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken(payload)),
+      });
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Failed to create harvester (HTTP ${res.status})`, true);
+        return;
+      }
+      const nameEl = document.getElementById('captcha_name');
+      const proxyEl = document.getElementById('captcha_proxy');
+      if (nameEl) nameEl.value = '';
+      if (proxyEl) proxyEl.value = '';
+      showToast(`Created captcha harvester #${data.id}.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function loadCaptchaHarvesters() {
+      const rows = await apiFetch('/api/captcha/harvesters').then(r => r.json()).catch(() => []);
+      const tbody = document.getElementById('captcha_harvesters');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+      const records = Array.isArray(rows) ? rows : [];
+      if (!records.length) {
+        tbody.innerHTML = '<tr><td colspan="7">No harvesters yet. Click Add Captcha to create one.</td></tr>';
+        return;
+      }
+      for (const row of records) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${row.id}</td>
+          <td>${row.name || '-'}</td>
+          <td>${row.gmail_email || '-'}</td>
+          <td>${row.proxy_url || '-'}</td>
+          <td>${row.auto_solve_mode || 'off'}<div class="muted">Auto Click: ${row.auto_click_enabled ? 'on' : 'off'}</div></td>
+          <td>${row.session_status || '-'}<div class="muted">Local AI: ${row.local_ai_status || '-'}</div></td>
+          <td class="actions">
+            <button onclick="signinCaptchaHarvester(${row.id})">YouTube</button>
+            <button onclick="saveCaptchaHarvester(${row.id})">💾 Save</button>
+            <button onclick="testCaptchaLocalAi(${row.id})">Test AI</button>
+            <button onclick="clearCaptchaHarvester(${row.id})">🧽 Erase</button>
+            <button onclick="deleteCaptchaHarvester(${row.id})">🗑 Delete</button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function signinCaptchaHarvester(id) {
+      const gmail_email = prompt('Enter Gmail for this harvester:');
+      if (!gmail_email) return;
+      const res = await apiFetch(`/api/captcha/harvesters/${id}/youtube-signin`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken({gmail_email})),
+      });
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Sign-in failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} signed in.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function saveCaptchaHarvester(id) {
+      const auto_solve_mode = document.getElementById('captcha_auto_solve_mode')?.value || 'off';
+      const auto_click_enabled = document.getElementById('captcha_auto_click')?.checked ?? true;
+      const proxy_url = (document.getElementById('captcha_proxy')?.value || '').trim() || null;
+      const res = await apiFetch(`/api/captcha/harvesters/${id}`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken({auto_solve_mode, auto_click_enabled, proxy_url})),
+      });
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Save failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} saved.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function testCaptchaLocalAi(id) {
+      const res = await apiFetch(`/api/captcha/harvesters/${id}/local-ai-test`, {method: 'POST'});
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Local AI test failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} local AI is ready.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function clearCaptchaHarvester(id) {
+      const res = await apiFetch(`/api/captcha/harvesters/${id}/clear`, {method: 'POST'});
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Clear failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} cleared.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function deleteCaptchaHarvester(id) {
+      const confirmed = confirm(`Delete captcha harvester #${id}?`);
+      if (!confirmed) return;
+      const res = await apiFetch(`/api/captcha/harvesters/${id}`, {method: 'DELETE'});
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Delete failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} deleted.`);
+      await loadCaptchaHarvesters();
+    }
+
     async function testWebhook(id) {
       const data = await apiFetch(`/api/webhooks/${id}/test`, {method: 'POST'}).then(r => r.json());
       alert(JSON.stringify(data));
@@ -2426,6 +2771,130 @@
       await loadProfilesPanel();
     }
 
+
+    let captchaAutoSolveTimer = null;
+
+    function logCaptchaTool(message) {
+      const logEl = document.getElementById('logs');
+      if (!logEl) return;
+      const stamp = new Date().toISOString();
+      logEl.textContent = `[${stamp}] ${message}
+` + (logEl.textContent || '');
+    }
+
+    async function importVirtualCardsFromExcel() {
+      const statusEl = document.getElementById('virtual_cc_status');
+      const fileInput = document.getElementById('virtual_cc_file');
+      const explicitProfileIdRaw = (document.getElementById('virtual_cc_profile_id')?.value || '').trim();
+      if (statusEl) statusEl.textContent = '';
+      const file = fileInput?.files?.[0];
+      if (!file) {
+        if (statusEl) statusEl.textContent = 'Please select an Excel file first.';
+        return;
+      }
+      const parsedProfileId = explicitProfileIdRaw ? Number(explicitProfileIdRaw) : null;
+      if (explicitProfileIdRaw && (!Number.isInteger(parsedProfileId) || parsedProfileId <= 0)) {
+        if (statusEl) statusEl.textContent = 'Target Profile ID must be a positive integer.';
+        return;
+      }
+      try {
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf, {type: 'array'});
+        const first = wb.SheetNames[0];
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[first], {defval: ''});
+        if (!Array.isArray(rows) || rows.length === 0) throw new Error('No rows found in spreadsheet.');
+
+        let created = 0;
+        let skipped = 0;
+        const profileId = parsedProfileId || null;
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i] || {};
+          const tokenReference = String(row.token_reference || row.token || row.card || '').trim();
+          if (!tokenReference) {
+            skipped += 1;
+            continue;
+          }
+          const payload = appendCaptchaToken({
+            label: String(row.label || `Virtual Card ${i + 1}`).trim(),
+            provider: String(row.provider || 'virtual_card').trim(),
+            token_reference: tokenReference,
+            billing_profile_id: profileId,
+          });
+          const res = await apiFetch('/api/payments', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload),
+          });
+          if (res.ok) created += 1;
+          else skipped += 1;
+        }
+        if (statusEl) statusEl.textContent = `Import completed: ${created} added, ${skipped} skipped.`;
+        await loadProfilesPanel();
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `Import failed: ${err?.message || err}`;
+      }
+    }
+
+    async function runCaptchaAutoSolveOnce() {
+      const taskId = Number((document.getElementById('captcha_task_id')?.value || '').trim());
+      const statusEl = document.getElementById('captcha_auto_status');
+      const prefix = (document.getElementById('captcha_solver_prefix')?.value || 'auto-solved-token').trim();
+      if (!Number.isInteger(taskId) || taskId <= 0) {
+        if (statusEl) statusEl.textContent = 'Enter a valid checkout task id first.';
+        return;
+      }
+      try {
+        const listRes = await apiFetch(`/api/checkout/tasks/${taskId}/captcha-challenges`);
+        const challenges = await listRes.json();
+        if (!Array.isArray(challenges)) throw new Error('Invalid challenge payload');
+        const pending = challenges.filter((c) => (c.status || '').toLowerCase() === 'pending');
+        if (!pending.length) {
+          if (statusEl) statusEl.textContent = `No pending challenges for task ${taskId}.`;
+          logCaptchaTool(`No pending challenges for task ${taskId}.`);
+          return;
+        }
+        let solvedCount = 0;
+        for (const challenge of pending) {
+          const solvedToken = `${prefix}-${taskId}-${challenge.id}-${Date.now()}`;
+          const solveRes = await apiFetch(`/api/checkout/captcha-challenges/${challenge.id}/manual-solve`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(appendCaptchaToken({
+              solved_token: solvedToken,
+              operator_note: 'Auto-solved from Captcha tab tool',
+            })),
+          });
+          if (solveRes.ok) {
+            solvedCount += 1;
+            logCaptchaTool(`Solved challenge #${challenge.id} for task ${taskId}.`);
+          }
+        }
+        if (statusEl) statusEl.textContent = `Auto-solver processed ${pending.length} pending challenge(s), solved ${solvedCount}.`;
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `Auto-solver error: ${err?.message || err}`;
+        logCaptchaTool(`Auto-solver error: ${err?.message || err}`);
+      }
+    }
+
+    function toggleCaptchaAutoSolve() {
+      const btn = document.getElementById('captcha_auto_btn');
+      const intervalSeconds = Number((document.getElementById('captcha_poll_seconds')?.value || '8').trim()) || 8;
+      if (captchaAutoSolveTimer) {
+        clearInterval(captchaAutoSolveTimer);
+        captchaAutoSolveTimer = null;
+        if (btn) btn.textContent = 'Start Auto Solve';
+        const statusEl = document.getElementById('captcha_auto_status');
+        if (statusEl) statusEl.textContent = 'Auto solve stopped.';
+        return;
+      }
+      captchaAutoSolveTimer = setInterval(() => {
+        runCaptchaAutoSolveOnce();
+      }, Math.max(3000, intervalSeconds * 1000));
+      if (btn) btn.textContent = 'Stop Auto Solve';
+      const statusEl = document.getElementById('captcha_auto_status');
+      if (statusEl) statusEl.textContent = `Auto solve active every ${Math.max(3, intervalSeconds)}s.`;
+      runCaptchaAutoSolveOnce();
+    }
 
     function selectedMonitorIds() {
       return Array.from(document.querySelectorAll('.monitor-select:checked')).map(x => Number(x.value));
@@ -2655,6 +3124,7 @@
     loadWorkspace();
     loadMeta();
     loadWebhooks();
+    loadCaptchaHarvesters();
     loadProfilesPanel();
     loadMonitors();
     updateTaskModeFields();

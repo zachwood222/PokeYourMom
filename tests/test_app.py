@@ -166,6 +166,29 @@ def test_dashboard_template_contains_ops_metric_cards(tmp_path, monkeypatch):
     assert 'id="ops_webhook_failed_total"' in html
 
 
+def test_dashboard_commerce_endpoint_returns_expected_shape(tmp_path, monkeypatch):
+    app_module = _load_app(tmp_path, monkeypatch)
+    client = app_module.app.test_client()
+
+    resp = client.get("/api/dashboard/commerce", headers=_auth_headers())
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert set(payload.keys()) == {
+        "checkouts_total",
+        "declines_total",
+        "spent_total_cents",
+        "average_order_value_cents",
+        "success_rate",
+        "product_orders",
+        "sites_checkouts",
+        "amount_spent_daily",
+    }
+    assert isinstance(payload["product_orders"], list)
+    assert isinstance(payload["sites_checkouts"], list)
+    assert isinstance(payload["amount_spent_daily"], list)
+
+
 def test_workspace_endpoint_requires_auth(tmp_path, monkeypatch):
     app_module = _load_app(tmp_path, monkeypatch)
     client = app_module.app.test_client()
