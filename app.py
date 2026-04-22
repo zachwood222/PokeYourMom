@@ -65,6 +65,7 @@ _api_auth_token_raw = os.getenv("API_AUTH_TOKEN")
 API_AUTH_TOKEN = _api_auth_token_raw.strip() if _api_auth_token_raw is not None else "dev-token"
 SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY", "local-dev-secret-key")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_WEBHOOK_TOLERANCE_SECONDS = int(os.getenv("STRIPE_WEBHOOK_TOLERANCE_SECONDS", "300"))
 UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
 UPDATE_CHECK_TIMEOUT_SECONDS = float(os.getenv("UPDATE_CHECK_TIMEOUT_SECONDS", "2.0"))
 CAPTCHA_PROVIDER = os.getenv("CAPTCHA_PROVIDER", "turnstile")
@@ -308,9 +309,9 @@ def verify_stripe_webhook_signature(payload: bytes, signature_header: str | None
         timestamp = int(timestamp_raw)
     except ValueError as exc:
         raise PermissionError("Invalid Stripe signature timestamp") from exc
-    if abs(time.time() - timestamp) > 300:
+    if abs(time.time() - timestamp) > STRIPE_WEBHOOK_TOLERANCE_SECONDS:
         raise PermissionError("Stripe signature timestamp outside tolerance")
-    signed_payload = f"{timestamp}.{payload.decode('utf-8')}".encode("utf-8")
+    signed_payload = f"{timestamp}.".encode("utf-8") + payload
     expected_signature = hmac.new(
         STRIPE_WEBHOOK_SECRET.encode("utf-8"),
         signed_payload,

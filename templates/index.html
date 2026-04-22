@@ -739,11 +739,31 @@
           <h1>Dashboard</h1>
           <p class="small">Tuesday, <span id="dashboard_now">--:--:--</span></p>
         </div>
-        <div class="dashboard-top-row">
-          <div class="dash-stat mint">
-            <div class="dash-stat-label">Checkouts</div>
-            <div id="kpi_total_monitors" class="dash-stat-value">0</div>
-            <div class="dash-stat-sub">Total Checkouts</div>
+        <div class="kpi-grid" style="margin-top:12px;">
+          <div class="card"><div class="kpi-label">Checks Total</div><div id="ops_checks_total" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Checks Failed</div><div id="ops_checks_failed_total" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Alerts Created</div><div id="ops_alerts_created_total" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Webhook Sent</div><div id="ops_webhook_sent_total" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Webhook Failed</div><div id="ops_webhook_failed_total" class="kpi-value">0</div></div>
+        </div>
+
+        <div class="workspace">
+          <div class="card">
+            <h3 class="section-title">Runtime Controls</h3>
+            <div class="row">
+              <div>
+                <label class="small">Loop State</label>
+                <input id="runtime_running" disabled />
+              </div>
+              <div>
+                <label class="small">Latest Check</label>
+                <input id="runtime_latest_check" disabled />
+              </div>
+            </div>
+            <div class="actions" style="margin-top:10px;">
+              <button onclick="loadDashboardSummary()">Refresh Metrics</button>
+              <button onclick="toggleLoop()" id="loopBtn">Start Monitor Loop</button>
+            </div>
           </div>
           <div class="dash-stat rose">
             <div class="dash-stat-label">Declines</div>
@@ -1672,7 +1692,7 @@
       loopRunning = !!data.running;
       document.getElementById('loopBtn').textContent = loopRunning ? 'Stop Monitor Loop' : 'Start Monitor Loop';
       await loadOpsMetrics();
-      await loadCommerceDashboard();
+      await loadOpsTrends();
     }
 
     async function loadOpsMetrics() {
@@ -1692,61 +1712,9 @@
       document.getElementById('ops_webhook_failed_total').textContent = webhookFailed;
     }
 
-    function formatMoney(cents) {
-      return `$${(Number(cents || 0) / 100).toFixed(2)}`;
-    }
-
-    function formatDateTime(value) {
-      const dt = value ? new Date(value) : null;
-      if (!dt || Number.isNaN(dt.getTime())) return '—';
-      return dt.toLocaleString();
-    }
-
-    function renderAmountSpentLine(points) {
-      const polyline = document.getElementById('amount_spent_polyline');
-      if (!polyline) return;
-      const rows = Array.isArray(points) ? points : [];
-      if (!rows.length) {
-        polyline.setAttribute('points', '0,100 100,100 100,100 0,100');
-        return;
-      }
-      const max = Math.max(...rows.map(p => Number(p.spent_cents || 0)), 1);
-      const path = rows.map((point, idx) => {
-        const x = rows.length === 1 ? 0 : (idx / (rows.length - 1)) * 100;
-        const y = 100 - ((Number(point.spent_cents || 0) / max) * 100);
-        return `${x.toFixed(2)},${y.toFixed(2)}`;
-      });
-      polyline.setAttribute('points', `${path.join(' ')} 100,100 0,100`);
-    }
-
-    function renderSiteCheckoutDonut(siteRows) {
-      const rows = Array.isArray(siteRows) ? siteRows : [];
-      const donut = document.getElementById('site_checkout_donut');
-      const legend = document.getElementById('site_checkout_legend');
-      const center = document.getElementById('site_checkout_donut_center');
-      if (!donut || !legend || !center) return;
-      const total = rows.reduce((sum, row) => sum + Number(row.checkouts || 0), 0);
-      center.innerHTML = `${total}<br/>orders`;
-      if (!total) {
-        donut.style.background = 'conic-gradient(#9aa6c5 0 100%)';
-        legend.innerHTML = '<li><span class="dot o"></span>No checkout data yet</li>';
-        return;
-      }
-
-      const colors = ['#f2c84b', '#6d93ff', '#55d7a6', '#d76ae6', '#f28d4b', '#7ee77a'];
-      let cursor = 0;
-      const slices = rows.slice(0, 6).map((row, idx) => {
-        const count = Number(row.checkouts || 0);
-        const pct = (count / total) * 100;
-        const start = cursor;
-        cursor += pct;
-        return {site: row.site, count, pct, color: colors[idx % colors.length], start, end: cursor};
-      });
-      donut.style.background = `conic-gradient(${slices.map(s => `${s.color} ${s.start}% ${s.end}%`).join(', ')})`;
-      legend.innerHTML = slices.map((s, idx) => (
-        `<li><span class="dot ${idx === 0 ? 'w' : idx === 1 ? 't' : idx === 2 ? 'b' : 'o'}" style="background:${s.color};"></span>${String(s.site || 'unknown').toUpperCase()} · ${s.count}</li>`
-      )).join('');
-    }
+    async function loadOpsTrends() {
+      const monitorData = await apiFetch('/api/ops/monitor-failure-trends').then(r => r.json()).catch(() => ({trends: []}));
+      const webhookData = await apiFetch('/api/ops/webhook-health-trends').then(r => r.json()).catch(() => ({webhooks: []}));
 
     async function loadCommerceDashboard() {
       const commerce = await apiFetch('/api/dashboard/commerce').then(r => r.json()).catch(() => ({}));

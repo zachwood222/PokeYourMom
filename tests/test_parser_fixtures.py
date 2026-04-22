@@ -33,7 +33,8 @@ def test_evaluate_page_matches_fixture_expectations(
     app_module = _load_app(tmp_path, monkeypatch)
     html = load_fixture_html(retailer, fixture_name, category=category)
 
-    result = app_module.evaluate_page(html, retailer=retailer, category=category)
+    result = app_module.evaluate_page(html, retailer=retailer)
+    fixture_id = f"{retailer}/{fixture_name}.html"
 
     assert result.in_stock is expected_in_stock, (
         f"[{fixture_id}] expected in_stock={expected_in_stock}, got {result.in_stock}"

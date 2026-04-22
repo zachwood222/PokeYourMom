@@ -48,35 +48,14 @@ PARSER_FIXTURE_EXPECTATIONS = {
 
 
 PARSER_FIXTURE_CASES = [
-    fixture_case("walmart", "pokemon", "in_stock", True, "in_stock"),
-    fixture_case("walmart", "pokemon", "out_of_stock", False, "out_or_unknown"),
-    fixture_case("walmart", "pokemon", "ambiguous", False, "out_or_unknown"),
-    fixture_case("target", "pokemon", "in_stock", True, "in_stock"),
-    fixture_case("target", "pokemon", "out_of_stock", False, "out_or_unknown"),
-    fixture_case("target", "pokemon", "ambiguous", False, "out_or_unknown"),
-    fixture_case("target", "sports_cards", "in_stock", True, "in_stock"),
-    fixture_case("target", "sports_cards", "out_of_stock", False, "out_or_unknown"),
-    fixture_case("target", "one_piece", "in_stock", True, "in_stock"),
-    fixture_case("target", "one_piece", "out_of_stock", False, "out_or_unknown"),
-    fixture_case("target", "lorcana", "in_stock", True, "in_stock"),
-    fixture_case("target", "lorcana", "out_of_stock", False, "out_or_unknown"),
-    fixture_case("bestbuy", "pokemon", "in_stock", True, "in_stock"),
-    fixture_case("bestbuy", "pokemon", "out_of_stock", False, "out_or_unknown"),
-    fixture_case("bestbuy", "pokemon", "ambiguous", False, "out_or_unknown"),
-    fixture_case("pokemoncenter", "pokemon", "in_stock", True, "in_stock"),
-    fixture_case("pokemoncenter", "pokemon", "out_of_stock", False, "out_or_unknown"),
-    fixture_case("pokemoncenter", "pokemon", "ambiguous", False, "out_or_unknown"),
-    fixture_case("pokemoncenter", "sports_cards", "in_stock", True, "in_stock"),
-    fixture_case("pokemoncenter", "sports_cards", "out_of_stock", False, "out_or_unknown"),
-    fixture_case("pokemoncenter", "one_piece", "in_stock", True, "in_stock"),
-    fixture_case("pokemoncenter", "one_piece", "out_of_stock", False, "out_or_unknown"),
-    fixture_case("pokemoncenter", "lorcana", "in_stock", True, "in_stock"),
-    fixture_case("pokemoncenter", "lorcana", "out_of_stock", False, "out_or_unknown"),
+    fixture_case(retailer, fixture_name, expected_in_stock, expected_status)
+    for retailer, fixtures in PARSER_FIXTURE_EXPECTATIONS.items()
+    for fixture_name, (expected_in_stock, expected_status) in fixtures.items()
 ]
 
 
-def load_fixture_html(retailer: str, fixture_name: str, category: str = "pokemon") -> str:
-    fixture_path = FIXTURES / retailer / category / f"{fixture_name}.html"
+def load_fixture_html(retailer: str, fixture_name: str) -> str:
+    fixture_path = FIXTURES / retailer / f"{fixture_name}.html"
     if not fixture_path.exists():
-        fixture_path = FIXTURES / retailer / f"{fixture_name}.html"
+        raise FileNotFoundError(f"Missing parser fixture: {retailer}/{fixture_name}.html")
     return fixture_path.read_text(encoding="utf-8")

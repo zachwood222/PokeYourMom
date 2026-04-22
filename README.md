@@ -53,6 +53,10 @@ The last two commands are explicit migration-safety checks for:
   - `X-API-Token: <token>`
 - `POST /api/webhooks` to add Discord webhook.
 - `POST /api/monitors` to add product monitor.
+- `POST /api/checkout/tasks` to create a checkout task for an existing monitor.
+- `POST /api/checkout/tasks/:id/start|pause|stop` to manage checkout task lifecycle.
+- `GET /api/checkout/tasks/:id/state` to read canonical task state and last attempt metadata.
+- `POST /api/billing/stripe/webhook` for Stripe subscription lifecycle ingestion (signature-verified and idempotent by `event.id`).
 - `GET /api/monitors/<id>` to fetch a monitor within the current workspace.
 - `PATCH /api/monitors/<id>` to update monitor fields (for example, `enabled`).
 - `DELETE /api/monitors/<id>` to remove a monitor in the current workspace.
@@ -67,6 +71,11 @@ The last two commands are explicit migration-safety checks for:
 - `POST /api/start` to begin background monitor checks.
 - `POST /api/monitors/<id>/check` to run an immediate check.
 - `GET /api/workspace/usage-limits` to retrieve plan limits + current usage snapshot.
+
+Stripe webhook configuration:
+
+- `STRIPE_WEBHOOK_SECRET` (required): signing secret used to verify `Stripe-Signature`.
+- `STRIPE_WEBHOOK_TOLERANCE_SECONDS` (optional, default `300`): max allowed timestamp drift for webhook signatures.
 
 Monitor check response compatibility notes:
 
