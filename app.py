@@ -5634,10 +5634,18 @@ def api_list_alert_events():
     conn = db()
     rows = conn.execute(
         """
-        select ae.*, s.guild_id, s.channel_id, s.source_name
+        select
+            ae.*,
+            s.guild_id,
+            s.channel_id,
+            s.source_name,
+            count(a.id) as action_count,
+            max(a.task_id) as latest_task_id
         from alert_events ae
         join alert_subscriptions s on s.id = ae.subscription_id
+        left join alert_event_actions a on a.event_id = ae.id
         where ae.workspace_id = ?
+        group by ae.id
         order by ae.id desc
         limit 200
         """,

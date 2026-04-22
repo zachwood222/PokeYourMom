@@ -85,6 +85,36 @@
     }
 
     .sidebar { display: grid; gap: 12px; align-content: start; }
+    .discord-alert-feed {
+      max-height: 320px;
+      overflow-y: auto;
+      display: grid;
+      gap: 8px;
+    }
+    .discord-alert-item {
+      border: 1px solid #27344d;
+      border-radius: 8px;
+      padding: 8px;
+      background: #0e1523;
+      font-size: 12px;
+    }
+    .discord-alert-item .meta {
+      color: var(--muted);
+      font-size: 11px;
+      margin-top: 4px;
+    }
+    .discord-alert-item .title {
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .discord-alert-status {
+      font-size: 11px;
+      color: #b9cae6;
+      margin-bottom: 8px;
+    }
+    .compact-input {
+      margin-bottom: 6px;
+    }
 
     .card {
       background: linear-gradient(180deg, rgba(19, 25, 36, 0.95), rgba(13, 17, 25, 0.95));
@@ -724,6 +754,29 @@
           <div><div class="kpi-label">Enabled</div><div id="kpi_enabled_monitors_side" class="kpi-value">0</div></div>
           <div><div class="kpi-label">Events 24h</div><div id="kpi_events_24h_side" class="kpi-value">0</div></div>
           <div><div class="kpi-label">Success</div><div id="kpi_success_rate_side" class="kpi-value">0%</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3 class="section-title">Discord Cook Feed</h3>
+        <div id="discord_alert_widget_status" class="discord-alert-status">Loading subscriptions…</div>
+        <input id="discord_subscription_guild" class="compact-input" placeholder="Guild ID" />
+        <input id="discord_subscription_channel" class="compact-input" placeholder="Channel ID" />
+        <input id="discord_subscription_name" class="compact-input" placeholder="Source Name (e.g. Cook Group)" />
+        <div class="actions" style="margin-bottom:8px;">
+          <button onclick="createDiscordSubscription()">Add Source</button>
+          <button onclick="loadDiscordAlertWidget()">Refresh</button>
+        </div>
+        <select id="discord_subscription_id" class="compact-input"></select>
+        <input id="discord_alert_title" class="compact-input" placeholder="Alert Title" />
+        <input id="discord_alert_url" class="compact-input" placeholder="Product URL" />
+        <input id="discord_alert_sku" class="compact-input" placeholder="SKU (optional)" />
+        <input id="discord_alert_retailer" class="compact-input" placeholder="Retailer (optional)" />
+        <textarea id="discord_alert_message" class="compact-input" placeholder="Alert message body" rows="2"></textarea>
+        <div class="actions" style="margin-bottom:8px;">
+          <button onclick="ingestDiscordAlert()">Ingest Alert + Auto Task</button>
+        </div>
+        <div id="discord_alert_feed" class="discord-alert-feed">
+          <div class="small">No alerts ingested yet.</div>
         </div>
       </div>
       <div class="card">
@@ -1743,6 +1796,114 @@
       if (data.workspace) {
         document.getElementById('plan').value = data.workspace.plan;
       }
+    }
+
+    function alertPreviewText(eventRow) {
+      const title = String(eventRow.title || '').trim();
+      if (title) return title;
+      const message = String(eventRow.message || '').trim();
+      if (!message) return 'Untitled alert';
+      return message.length > 88 ? `${message.slice(0, 88)}…` : message;
+    }
+
+    async function loadDiscordAlertWidget() {
+      const statusEl = document.getElementById('discord_alert_widget_status');
+      const feedEl = document.getElementById('discord_alert_feed');
+      const subscriptionSelect = document.getElementById('discord_subscription_id');
+      try {
+        const [subscriptions, events] = await Promise.all([
+          apiFetch('/api/alert-subscriptions').then((r) => r.json()),
+          apiFetch('/api/alerts/events').then((r) => r.json()),
+        ]);
+        const subRows = Array.isArray(subscriptions) ? subscriptions : [];
+        const eventRows = Array.isArray(events) ? events : [];
+        if (subscriptionSelect) {
+          subscriptionSelect.innerHTML = '';
+          if (!subRows.length) {
+            subscriptionSelect.innerHTML = '<option value="">No sources configured</option>';
+          }
+          for (const row of subRows) {
+            const option = document.createElement('option');
+            option.value = String(row.id);
+            option.textContent = `${row.source_name || row.source || 'discord'} • G:${row.guild_id} C:${row.channel_id}`;
+            subscriptionSelect.appendChild(option);
+          }
+        }
+        if (statusEl) {
+          statusEl.textContent = `${subRows.length} source(s) connected • auto checkout tasks are created on monitor matches.`;
+        }
+        if (feedEl) {
+          feedEl.innerHTML = '';
+          if (!eventRows.length) {
+            feedEl.innerHTML = '<div class="small">No alerts ingested yet.</div>';
+          }
+          for (const row of eventRows.slice(0, 10)) {
+            const card = document.createElement('div');
+            const eventStatus = String(row.parse_status || 'unknown');
+            const actionCount = Number(row.action_count || 0);
+            card.className = 'discord-alert-item';
+            card.innerHTML = `
+              <div class="title">${alertPreviewText(row)}</div>
+              <div>${String(row.retailer || 'unknown')} ${row.sku ? `• SKU ${row.sku}` : ''}</div>
+              <div class="meta">${eventStatus} • ${actionCount} auto task(s) • ${formatDateTime(row.created_at)}</div>
+            `;
+            feedEl.appendChild(card);
+          }
+        }
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `Failed to load Discord alert feed: ${err?.message || err}`;
+      }
+    }
+
+    async function createDiscordSubscription() {
+      const guild_id = (document.getElementById('discord_subscription_guild')?.value || '').trim();
+      const channel_id = (document.getElementById('discord_subscription_channel')?.value || '').trim();
+      const source_name = (document.getElementById('discord_subscription_name')?.value || '').trim();
+      if (!guild_id || !channel_id) {
+        showToast('Guild ID and Channel ID are required.', true);
+        return;
+      }
+      const res = await apiFetch('/api/alert-subscriptions', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken({guild_id, channel_id, source: 'discord', source_name})),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(data.error || `Failed to add source (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Source added: #${data.id}`);
+      await loadDiscordAlertWidget();
+    }
+
+    async function ingestDiscordAlert() {
+      const subscription_id = Number((document.getElementById('discord_subscription_id')?.value || '').trim());
+      if (!Number.isInteger(subscription_id) || subscription_id <= 0) {
+        showToast('Pick a Discord source subscription first.', true);
+        return;
+      }
+      const event = {
+        source_event_id: `manual-${Date.now()}`,
+        event_time: new Date().toISOString(),
+        title: (document.getElementById('discord_alert_title')?.value || '').trim(),
+        product_url: (document.getElementById('discord_alert_url')?.value || '').trim(),
+        sku: (document.getElementById('discord_alert_sku')?.value || '').trim(),
+        retailer: (document.getElementById('discord_alert_retailer')?.value || '').trim(),
+        message: (document.getElementById('discord_alert_message')?.value || '').trim(),
+      };
+      const res = await apiFetch('/api/alerts/discord/ingest', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken({subscription_id, event})),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(data.error || `Failed to ingest alert (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Alert queued (job ${data.job_id}). Auto monitor + checkout will run on matched monitors.`);
+      setTimeout(() => loadDiscordAlertWidget(), 900);
     }
 
     async function loadDashboardSummary() {
@@ -3206,8 +3367,10 @@
     updateTaskModeFields();
     loadTasks();
     loadDashboardSummary();
+    loadDiscordAlertWidget();
     loadAutopilotProfiles();
     startClock();
+    setInterval(loadDiscordAlertWidget, 15000);
   </script>
 </body>
 </html>
