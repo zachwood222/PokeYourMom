@@ -1,8 +1,8 @@
 # Stock Sentinel
 
-Stock Sentinel is a starter Flask app for **retailer stock monitoring + Discord webhook alerts**.
+Stock Sentinel is a Flask app for **retailer stock monitoring + Discord webhook alerts + an experimental checkout workflow**.
 
-> This project intentionally does **not** implement auto-checkout or anti-bot bypass behavior.
+> Checkout support is experimental and workflow-focused; this project does **not** implement anti-bot bypass behavior.
 
 ## Features
 
@@ -48,9 +48,14 @@ The last two commands are explicit migration-safety checks for:
 ## API quick start
 
 - API authentication is required for all `/api/*` routes.
-- Set `API_AUTH_TOKEN` (defaults to `dev-token`) and send either:
+- In production/non-dev environments, set `API_AUTH_TOKEN` and `SECRET_ENCRYPTION_KEY` explicitly before startup.
+- In local development mode (`APP_ENV=development`), safe local defaults are used (`API_AUTH_TOKEN=dev-token`, `SECRET_ENCRYPTION_KEY=local-dev-secret-key`).
+- Send either:
   - `Authorization: Bearer <token>`, or
   - `X-API-Token: <token>`
+- CORS behavior:
+  - Development mode allows `*`.
+  - Production mode requires explicit origins via `ALLOWED_ORIGINS` (comma-separated, for example `https://app.example.com,https://admin.example.com`).
 - `POST /api/webhooks` to add Discord webhook.
 - `POST /api/monitors` to add product monitor.
 - `POST /api/checkout/tasks` to create a checkout task for an existing monitor.
@@ -58,7 +63,12 @@ The last two commands are explicit migration-safety checks for:
 - `GET /api/checkout/tasks/:id/state` to read canonical task state and last attempt metadata.
 - `POST /api/billing/stripe/webhook` (and alias `POST /api/stripe/webhook`) for Stripe subscription lifecycle ingestion (signature-verified and idempotent by `event.id`).
 - `POST /api/start` to begin background checks.
-- `POST /api/monitors/:id/check` to run an immediate check.
+- `POST /api/checkout/tasks` to create a checkout task from an existing monitor.
+- `POST /api/checkout/tasks/:id/start` to transition task into `monitoring`.
+- `POST /api/checkout/tasks/:id/run` to execute the checkout state machine (`monitoring` → `carting` → `shipping` → `payment` → `submitting`).
+- `GET /api/checkout/tasks/:id/attempts` to fetch execution attempts (use `?include_created=1` to include initialization rows).
+- `POST /api/start` to begin background monitor checks.
+- `POST /api/monitors/<id>/check` to run an immediate check.
 - `GET /api/workspace/usage-limits` to retrieve plan limits + current usage snapshot.
 
 Stripe webhook configuration:
@@ -88,13 +98,34 @@ Monitor check response compatibility notes:
 Example:
 
 ```bash
-curl -H "Authorization: Bearer dev-token" http://localhost:5000/api/workspace
+curl -H "Authorization: Bearer ${API_AUTH_TOKEN}" http://localhost:5000/api/workspace
 ```
 
 Usage limits snapshot example:
 
 ```bash
-curl -H "Authorization: Bearer dev-token" http://localhost:5000/api/workspace/usage-limits
+curl -H "Authorization: Bearer ${API_AUTH_TOKEN}" http://localhost:5000/api/workspace/usage-limits
+```
+
+### Environment variables (security-sensitive)
+
+Required in non-dev (`APP_ENV` not set to `development`/`test`):
+
+- `API_AUTH_TOKEN`: bearer token required by `/api/*` routes.
+- `SECRET_ENCRYPTION_KEY`: secret key used for encrypt/decrypt of stored sensitive values.
+
+Recommended in non-dev:
+
+- `ALLOWED_ORIGINS`: comma-separated CORS allowlist for Socket.IO/browser clients.
+
+Safe production example:
+
+```bash
+export APP_ENV=production
+export API_AUTH_TOKEN='replace-with-strong-random-token'
+export SECRET_ENCRYPTION_KEY='replace-with-32+-char-random-secret'
+export ALLOWED_ORIGINS='https://app.example.com,https://admin.example.com'
+python app.py
 ```
 
 ```json

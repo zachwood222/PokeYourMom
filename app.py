@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import random
 import secrets
 import sqlite3
 import threading
@@ -12,6 +13,8 @@ import time
 import traceback
 import hashlib
 import hmac
+
+from cryptography.fernet import Fernet, InvalidToken
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from functools import wraps
@@ -21,6 +24,12 @@ from uuid import uuid4
 import requests
 from flask import Flask, g, has_request_context, jsonify, render_template, request
 from flask_socketio import SocketIO
+from captcha_middleware import CaptchaVerifier
+from checkout_captcha import (
+    CaptchaChallengeService,
+    ManualFallbackSolveProvider,
+    serialize_challenge,
+)
 from retailers import (
     MonitorResult,
     canonical_retailer,
@@ -29,17 +38,51 @@ from retailers import (
     resolve_retailer_adapter,
     run_retailer_flow,
 )
+from tasks.parsers import MonitorInputValidationError, parse_monitor_input
 
 from network.session_manager import RequestResult, SessionManager
+from network.session_manager import RequestBehaviorPolicy
+
+def _current_app_mode() -> str:
+    return (
+        os.getenv("FLASK_ENV")
+        or os.getenv("APP_ENV")
+        or os.getenv("ENV")
+        or os.getenv("PYTHON_ENV")
+        or ""
+    ).strip().lower()
+
+
+def is_dev_environment() -> bool:
+    mode = _current_app_mode()
+    if mode in {"dev", "development", "local", "test", "testing"}:
+        return True
+    return (os.getenv("FLASK_DEBUG", "0") or "").strip() == "1"
+
+
+def _parse_allowed_origins(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+IS_DEV_ENVIRONMENT = is_dev_environment()
+RAW_ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = "*" if IS_DEV_ENVIRONMENT else _parse_allowed_origins(RAW_ALLOWED_ORIGINS)
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS, async_mode="threading")
+session_manager = SessionManager()
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 POLL_LOOP_SECONDS = int(os.getenv("POLL_LOOP_SECONDS", "15"))
 WORKER_IDLE_SLEEP_SECONDS = float(os.getenv("WORKER_IDLE_SLEEP_SECONDS", "2.0"))
+WORKER_IDLE_SLEEP_JITTER_SECONDS = float(os.getenv("WORKER_IDLE_SLEEP_JITTER_SECONDS", "0.75"))
+WORKER_ACTIVE_JITTER_SECONDS = float(os.getenv("WORKER_ACTIVE_JITTER_SECONDS", "0.2"))
 WORKER_LOCK_TIMEOUT_SECONDS = int(os.getenv("WORKER_LOCK_TIMEOUT_SECONDS", "60"))
 WORKER_ID = os.getenv("WORKER_ID", f"worker-{uuid4()}")
+ACCOUNT_START_DELAY_MIN_SECONDS = int(os.getenv("ACCOUNT_START_DELAY_MIN_SECONDS", "1"))
+ACCOUNT_START_DELAY_MAX_SECONDS = int(os.getenv("ACCOUNT_START_DELAY_MAX_SECONDS", "8"))
 APP_ROLE = os.getenv("APP_ROLE", "api").lower()
 ENABLE_EMBEDDED_WORKER = os.getenv("ENABLE_EMBEDDED_WORKER", "0") == "1"
 DEFAULT_PLAN = os.getenv("DEFAULT_PLAN", "basic")
@@ -50,6 +93,9 @@ CORRELATION_ID_HEADER = "X-Correlation-ID"
 _api_auth_token_raw = os.getenv("API_AUTH_TOKEN")
 API_AUTH_TOKEN = _api_auth_token_raw.strip() if _api_auth_token_raw is not None else "dev-token"
 SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY", "local-dev-secret-key")
+SECRET_ENCRYPTION_KEY_VERSION = os.getenv("SECRET_ENCRYPTION_KEY_VERSION", "v1")
+SECRET_ENCRYPTION_KEYS_RAW = os.getenv("SECRET_ENCRYPTION_KEYS", "")
+LEGACY_SECRET_KEY_VERSION = "legacy-v0"
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_WEBHOOK_TOLERANCE_SECONDS = int(os.getenv("STRIPE_WEBHOOK_TOLERANCE_SECONDS", "300"))
 UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
@@ -60,13 +106,16 @@ CAPTCHA_PROVIDER = os.getenv("CAPTCHA_PROVIDER", "turnstile")
 CAPTCHA_SITE_KEY = os.getenv("CAPTCHA_SITE_KEY", "")
 CAPTCHA_SCRIPT_URL = os.getenv("CAPTCHA_SCRIPT_URL", "https://challenges.cloudflare.com/turnstile/v0/api.js")
 CAPTCHA_SECRET_KEY = os.getenv("CAPTCHA_SECRET_KEY", "")
+DEFAULT_CAPTCHA_VERIFY_URL = "https://www.google.com/recaptcha/api/siteverify"
 CAPTCHA_VERIFY_URL = os.getenv(
     "CAPTCHA_VERIFY_URL",
-    "https://www.google.com/recaptcha/api/siteverify",
+    DEFAULT_CAPTCHA_VERIFY_URL,
 )
 CAPTCHA_VERIFY_TIMEOUT_SECONDS = float(os.getenv("CAPTCHA_VERIFY_TIMEOUT_SECONDS", "2.0"))
 TASK_STEP_DELAY_SECONDS = float(os.getenv("TASK_STEP_DELAY_SECONDS", "0.5"))
+QUEUE_ENQUEUE_JITTER_SECONDS = float(os.getenv("QUEUE_ENQUEUE_JITTER_SECONDS", "1.25"))
 STRICT_API_AUTH_TOKEN = (os.getenv("STRICT_API_AUTH_TOKEN", "1") or "").strip().lower() not in {"0", "false", "no", "off"}
+CHECKOUT_CAPTCHA_SOLVE_PROVIDER = os.getenv("CHECKOUT_CAPTCHA_SOLVE_PROVIDER", "manual")
 
 PLAN_LIMITS = {
     "basic": {"max_monitors": 20, "min_poll_seconds": 20},
@@ -84,6 +133,55 @@ STRIPE_SUBSCRIPTION_EVENT_TYPES = {
     "customer.subscription.deleted",
 }
 SUPPORTED_RETAILERS = {"walmart", "target", "bestbuy", "pokemoncenter"}
+SUPPORTED_MONITOR_CATEGORIES = {"pokemon", "sports_cards", "one_piece", "lorcana"}
+RETAILER_CATEGORY_SUPPORT = {
+    "target": SUPPORTED_MONITOR_CATEGORIES,
+    "pokemoncenter": SUPPORTED_MONITOR_CATEGORIES,
+    "walmart": {"pokemon"},
+    "bestbuy": {"pokemon"},
+}
+POKEMON_CENTER_TASK_GROUP_SCHEMA_VERSION = 3
+POKEMON_CENTER_SITES = {"us", "ca", "uk"}
+POKEMON_CENTER_MODES = {"default", "create_account", "newsletter_subscribe"}
+POKEMON_CENTER_MODE_DESCRIPTIONS = {
+    "default": "Standard checkout flow with monitor, queue wait, shipping, and payment.",
+    "create_account": "Create a new account profile and subscribe it to newsletters.",
+    "newsletter_subscribe": "Subscribe an existing account to newsletters only.",
+}
+POKEMON_CENTER_MODE_SITE_SUPPORT = {
+    "default": {"us", "ca", "uk"},
+    "create_account": {"us"},
+    "newsletter_subscribe": {"us"},
+}
+POKEMON_CENTER_REQUIRED_FIELDS_BY_MODE = {
+    "default": set(),
+    "create_account": {"profile_email", "profile_first_name", "profile_last_name", "account_output_target"},
+    "newsletter_subscribe": {"existing_account_source"},
+}
+POKEMON_CENTER_DEFAULT_TASK_FIELDS = {
+    "site": "us",
+    "mode": "default",
+    "monitor_input": "",
+    "product_quantity": 1,
+    "monitor_delay_ms": 3500,
+    "queue_entry_delay_ms": None,
+    "discount_code": None,
+    "wait_for_queue": False,
+    "loop_checkout": False,
+    "group_limits": {
+        "max_retries": None,
+        "antibot_event_threshold": 3,
+        "antibot_cooldown_seconds": 60,
+    },
+}
+
+POKEMON_CENTER_CREATE_ACCOUNT_FIELDS = (
+    "profile_email",
+    "profile_first_name",
+    "profile_last_name",
+    "account_output_target",
+)
+POKEMON_CENTER_NEWSLETTER_FIELDS = ("existing_account_source",)
 DEFAULT_WORKSPACE = {
     "name": "My Workspace",
     "plan": DEFAULT_PLAN if DEFAULT_PLAN in PLAN_LIMITS else "basic",
@@ -103,18 +201,67 @@ worker_thread: threading.Thread | None = None
 worker_lock = threading.Lock()
 
 CHECKOUT_TASK_STATES = {
-    "queued",
-    "monitoring",
-    "carting",
-    "shipping",
-    "payment",
-    "submitting",
+    "idle",
+    "starting",
+    "waiting_for_queue",
+    "solving_hcaptcha",
+    "in_queue",
+    "passed_queue",
+    "waiting_for_monitor_input",
+    "monitoring_product",
+    "adding_to_cart",
+    "checking_out",
     "success",
-    "failed",
+    "decline",
+    "requeued",
+    "antibot_datadome",
+    "antibot_incapsula",
+    "error",
     "paused",
     "stopped",
 }
 
+CHECKOUT_TERMINAL_STATES = {"success", "decline", "error", "stopped"}
+CHECKOUT_ACTIVE_STATES = CHECKOUT_TASK_STATES - CHECKOUT_TERMINAL_STATES - {"paused", "idle"}
+
+CHECKOUT_STEP_SEQUENCE = ["monitoring_product", "adding_to_cart", "checking_out"]
+CHECKOUT_STEP_RETRY_POLICY = {
+    "monitoring_product": {"max_attempts": 3},
+    "adding_to_cart": {"max_attempts": 3},
+    "checking_out": {"max_attempts": 3},
+}
+
+TASK_STATUS_LABELS = {
+    "idle": "Idle",
+    "starting": "Starting",
+    "waiting_for_queue": "Queue Wait",
+    "solving_hcaptcha": "Captcha",
+    "in_queue": "In Queue",
+    "passed_queue": "Queue Passed",
+    "waiting_for_monitor_input": "Input Wait",
+    "monitoring_product": "Monitoring",
+    "adding_to_cart": "Adding to Cart",
+    "checking_out": "Checking Out",
+    "success": "Success",
+    "decline": "Declined",
+    "requeued": "Requeued",
+    "antibot_datadome": "DataDome",
+    "antibot_incapsula": "Incapsula",
+    "error": "Error",
+    "paused": "Paused",
+    "stopped": "Stopped",
+}
+CHECKOUT_RETRY_PRESETS = {
+    "antibot": {"max_attempts": 4, "base_backoff_seconds": 1.5},
+    "network": {"max_attempts": 3, "base_backoff_seconds": 0.5},
+    "decline": {"max_attempts": 1, "base_backoff_seconds": 0.0},
+    "other": {"max_attempts": 2, "base_backoff_seconds": 0.25},
+}
+
+MAILBOX_SECRET_TYPES = {"mailbox_password", "mailbox_oauth_refresh_token", "mailbox_oauth_access_token"}
+OTP_ERROR_TIMEOUT = "OTP_TIMEOUT"
+OTP_ERROR_PROVIDER = "OTP_PROVIDER_ERROR"
+OTP_ERROR_CONFIG = "OTP_CONFIG_ERROR"
 
 
 @dataclass
@@ -128,36 +275,53 @@ class Job:
     locked_by: str | None
     locked_at: str | None
     payload_json: str | None
+    last_error: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass(frozen=True)
+class ProxyLease:
+    lease_id: int
+    proxy_id: int
+    endpoint: str
+    lease_key: str
+    owner_type: str
+    owner_id: int | None
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def is_dev_environment() -> bool:
-    mode = (
-        os.getenv("FLASK_ENV")
-        or os.getenv("APP_ENV")
-        or os.getenv("ENV")
-        or os.getenv("PYTHON_ENV")
-        or ""
-    ).strip().lower()
-    if mode in {"dev", "development", "local", "test", "testing"}:
-        return True
-    return (os.getenv("FLASK_DEBUG", "0") or "").strip() == "1"
+def parse_json_object(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def validate_startup_configuration() -> None:
-    if API_AUTH_TOKEN:
-        return
-    warning_message = (
-        "API_AUTH_TOKEN is empty after normalization. /api/* endpoints will return 401 "
-        "unless requests include a valid bearer token."
-    )
-    log(warning_message, level="error")
-    if STRICT_API_AUTH_TOKEN and not is_dev_environment():
-        raise RuntimeError(
-            f"{warning_message} Set API_AUTH_TOKEN to a non-empty value before startup."
-        )
+    missing_env_vars: list[str] = []
+    if not API_AUTH_TOKEN:
+        missing_env_vars.append("API_AUTH_TOKEN")
+    if not SECRET_ENCRYPTION_KEY:
+        missing_env_vars.append("SECRET_ENCRYPTION_KEY")
+
+    if missing_env_vars:
+        missing_env_text = ", ".join(missing_env_vars)
+        message = f"Missing required environment variables: {missing_env_text}."
+        log(message, level="error")
+        if not is_dev_environment():
+            raise RuntimeError(
+                f"{message} Set explicit values before starting in non-development environments."
+            )
+
+    if not IS_DEV_ENVIRONMENT and (ALLOWED_ORIGINS == "*" or "*" in ALLOWED_ORIGINS):
+        raise RuntimeError("Wildcard CORS is disabled outside development mode.")
 
 
 def verify_stripe_webhook_signature(payload: bytes, signature_header: str | None) -> None:
@@ -200,16 +364,7 @@ def _encryption_keystream(secret_key: str, nonce: bytes, length: int) -> bytes:
     return bytes(stream[:length])
 
 
-def encrypt_secret_value(plaintext: str) -> str:
-    nonce = secrets.token_bytes(16)
-    payload = plaintext.encode("utf-8")
-    keystream = _encryption_keystream(SECRET_ENCRYPTION_KEY, nonce, len(payload))
-    cipher = bytes(a ^ b for a, b in zip(payload, keystream))
-    mac = hmac.new(SECRET_ENCRYPTION_KEY.encode("utf-8"), nonce + cipher, hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(nonce + cipher + mac).decode("ascii")
-
-
-def decrypt_secret_value(ciphertext: str) -> str:
+def _decrypt_legacy_secret_value(ciphertext: str) -> str:
     raw = base64.urlsafe_b64decode(ciphertext.encode("ascii"))
     if len(raw) < 48:
         raise ValueError("Invalid secret payload")
@@ -222,6 +377,94 @@ def decrypt_secret_value(ciphertext: str) -> str:
     keystream = _encryption_keystream(SECRET_ENCRYPTION_KEY, nonce, len(cipher))
     payload = bytes(a ^ b for a, b in zip(cipher, keystream))
     return payload.decode("utf-8")
+
+
+def _normalize_fernet_key(raw_key: str) -> bytes:
+    candidate = (raw_key or "").strip().encode("ascii")
+    try:
+        decoded = base64.urlsafe_b64decode(candidate)
+    except Exception:
+        decoded = b""
+    if len(decoded) == 32:
+        return candidate
+    digest = hashlib.sha256((raw_key or "").encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest)
+
+
+def _load_secret_encryption_keys() -> tuple[str, dict[str, Fernet]]:
+    keys: dict[str, bytes] = {}
+    for entry in (SECRET_ENCRYPTION_KEYS_RAW or "").split(","):
+        item = entry.strip()
+        if not item:
+            continue
+        if ":" in item:
+            version, key_value = item.split(":", 1)
+        elif "=" in item:
+            version, key_value = item.split("=", 1)
+        else:
+            continue
+        version = version.strip()
+        key_value = key_value.strip()
+        if version and key_value:
+            keys[version] = _normalize_fernet_key(key_value)
+
+    active_version = (SECRET_ENCRYPTION_KEY_VERSION or "v1").strip() or "v1"
+    if active_version not in keys:
+        keys[active_version] = _normalize_fernet_key(SECRET_ENCRYPTION_KEY)
+
+    return active_version, {version: Fernet(key) for version, key in keys.items()}
+
+
+ACTIVE_SECRET_KEY_VERSION, SECRET_FERNETS = _load_secret_encryption_keys()
+
+
+def encrypt_secret_value(plaintext: str) -> str:
+    return SECRET_FERNETS[ACTIVE_SECRET_KEY_VERSION].encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+
+def encrypt_secret_value_with_version(plaintext: str) -> tuple[str, str]:
+    return encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION
+
+
+def decrypt_secret_value(ciphertext: str, key_version: str | None = None) -> str:
+    if key_version == LEGACY_SECRET_KEY_VERSION:
+        return _decrypt_legacy_secret_value(ciphertext)
+
+    candidate_versions: list[str]
+    if key_version:
+        candidate_versions = [key_version]
+    else:
+        candidate_versions = list(SECRET_FERNETS.keys())
+
+    for version in candidate_versions:
+        fernet = SECRET_FERNETS.get(version)
+        if not fernet:
+            continue
+        try:
+            return fernet.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+        except (InvalidToken, ValueError):
+            continue
+
+    if key_version is None:
+        return _decrypt_legacy_secret_value(ciphertext)
+    raise ValueError("Secret decryption failed for configured key version")
+
+
+def decrypt_secret_value_with_details(ciphertext: str, key_version: str | None = None) -> tuple[str, str, bool]:
+    if key_version == LEGACY_SECRET_KEY_VERSION:
+        return decrypt_secret_value(ciphertext, key_version=key_version), LEGACY_SECRET_KEY_VERSION, True
+
+    if key_version:
+        return decrypt_secret_value(ciphertext, key_version=key_version), key_version, False
+
+    for version, fernet in SECRET_FERNETS.items():
+        try:
+            value = fernet.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+            return value, version, False
+        except (InvalidToken, ValueError):
+            continue
+
+    return _decrypt_legacy_secret_value(ciphertext), LEGACY_SECRET_KEY_VERSION, True
 
 
 SENSITIVE_FIELD_MARKERS = ("token", "secret", "password", "authorization", "webhook_url")
@@ -240,6 +483,141 @@ def redact_sensitive_payload(value: Any) -> Any:
     if isinstance(value, list):
         return [redact_sensitive_payload(item) for item in value]
     return value
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    normalized_type = (secret_type or "").strip().lower()
+    if not normalized_type:
+        raise ValueError("secret_type is required")
+    ciphertext, key_version = encrypt_secret_value_with_version(plaintext)
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, normalized_type, ciphertext, key_version, now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def get_secret_plaintext(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: int,
+    secret_id: int,
+    allowed_types: set[str] | None = None,
+) -> str:
+    row = conn.execute(
+        "select * from account_secrets where id = ? and workspace_id = ?",
+        (secret_id, workspace_id),
+    ).fetchone()
+    if not row:
+        raise ValueError("Secret not found")
+    if allowed_types and row["secret_type"] not in allowed_types:
+        raise ValueError("Secret type not allowed")
+    plaintext, resolved_version, should_migrate = decrypt_secret_value_with_details(
+        row["ciphertext"],
+        key_version=row["key_version"],
+    )
+    if should_migrate or resolved_version != ACTIVE_SECRET_KEY_VERSION:
+        migrated_ciphertext, migrated_version = encrypt_secret_value_with_version(plaintext)
+        conn.execute(
+            "update account_secrets set ciphertext = ?, key_version = ?, updated_at = ? where id = ?",
+            (migrated_ciphertext, migrated_version, utc_now(), row["id"]),
+        )
+    return plaintext
+
+
+def redact_webhook_url(url: str) -> str:
+    value = (url or "").strip()
+    if len(value) <= 20:
+        return "[redacted]"
+    return f"{value[:18]}...{value[-6:]}"
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook_row: sqlite3.Row) -> str:
+    secret_id = webhook_row["webhook_secret_id"]
+    if not secret_id:
+        return webhook_row["webhook_url"]
+    return get_secret_plaintext(
+        conn,
+        workspace_id=webhook_row["workspace_id"],
+        secret_id=int(secret_id),
+        allowed_types={"webhook_url"},
+    )
+
+
+def resolve_mailbox_credential(conn: sqlite3.Connection, workspace_id: int, credential_id: int) -> dict[str, Any] | None:
+    row = conn.execute(
+        "select * from mailbox_credentials where id = ? and workspace_id = ?",
+        (credential_id, workspace_id),
+    ).fetchone()
+    if not row:
+        return None
+    payload = dict(row)
+    payload["password"] = get_secret_plaintext(
+        conn,
+        workspace_id=workspace_id,
+        secret_id=int(row["secret_id"]),
+        allowed_types=MAILBOX_SECRET_TYPES,
+    )
+    return payload
+
+
+def await_and_consume_checkout_otp(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: int,
+    task_row: sqlite3.Row,
+) -> tuple[dict[str, Any] | None, str | None]:
+    config = json.loads(task_row["task_config"] or "{}")
+    if not config.get("otp_required"):
+        return None, None
+
+    mailbox_credential_id = config.get("mailbox_credential_id")
+    if not mailbox_credential_id:
+        return None, f"{OTP_ERROR_CONFIG}: mailbox_credential_id is required when otp_required=true"
+
+    credential = resolve_mailbox_credential(conn, workspace_id, int(mailbox_credential_id))
+    if credential is None:
+        return None, f"{OTP_ERROR_CONFIG}: mailbox credential not found"
+
+    try:
+        rule = OTPExtractionRule(
+            otp_pattern=config.get("otp_regex") or credential.get("otp_regex") or r"\b(\d{6})\b",
+            allowed_senders=tuple(config.get("otp_allowed_senders") or ((credential.get("sender_filter") or "").split(",") if credential.get("sender_filter") else [])),
+            subject_keywords=tuple(config.get("otp_subject_keywords") or ((credential.get("subject_filter") or "").split(",") if credential.get("subject_filter") else [])),
+        )
+        payload = poll_for_otp_with_provider(
+            provider=credential["provider"],
+            username=credential["email"],
+            password=credential["password"],
+            host=credential.get("imap_host"),
+            port=int(credential.get("imap_port") or 993),
+            use_ssl=bool(credential.get("use_ssl", 1)),
+            rule=rule,
+            timeout_seconds=int(config.get("otp_timeout_seconds") or credential.get("timeout_seconds") or 90),
+            poll_interval_seconds=int(config.get("otp_poll_interval_seconds") or credential.get("poll_interval_seconds") or 5),
+        )
+    except OTPIntegrationError as exc:
+        return None, f"{OTP_ERROR_PROVIDER}:{exc.code}:{exc}"
+
+    if not payload:
+        return None, f"{OTP_ERROR_TIMEOUT}: OTP was not received within timeout"
+
+    config["consumed_otp"] = payload
+    conn.execute(
+        "update checkout_tasks set task_config = ?, updated_at = ? where id = ? and workspace_id = ?",
+        (json.dumps(config), utc_now(), task_row["id"], workspace_id),
+    )
+    return payload, None
 
 
 def _workspace_id_from_subscription_object(subscription: dict[str, Any]) -> int | None:
@@ -427,6 +805,16 @@ def log(
     socketio.emit("log", entry)
 
 
+captcha_verifier = CaptchaVerifier(
+    secret_key=CAPTCHA_SECRET_KEY,
+    verify_url=CAPTCHA_VERIFY_URL,
+    timeout_seconds=CAPTCHA_VERIFY_TIMEOUT_SECONDS,
+    logger=log,
+)
+checkout_captcha_service = CaptchaChallengeService(now_fn=utc_now)
+checkout_solve_provider = ManualFallbackSolveProvider()
+
+
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -439,6 +827,453 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -
         conn.execute(f"alter table {table} add column {column} {ddl}")
 
 
+def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "select 1 from sqlite_master where type = 'table' and name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def normalize_legacy_task_state(raw_state: Any) -> str:
+    state = str(raw_state or "").strip().lower()
+    compat_map = {
+        "queued": "idle",
+        "idle": "idle",
+        "running": "monitoring_product",
+        "monitoring": "monitoring_product",
+        "carting": "adding_to_cart",
+        "shipping": "checking_out",
+        "payment": "checking_out",
+        "submitting": "checking_out",
+        "complete": "success",
+        "completed": "success",
+        "failed": "decline",
+        "cancelled": "stopped",
+        "canceled": "stopped",
+    }
+    state = compat_map.get(state, state or "idle")
+    if state not in CHECKOUT_TASK_STATES:
+        return "idle"
+    return state
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _is_pokemon_center_task_config(task_config: dict[str, Any], monitor_row: sqlite3.Row | None = None) -> bool:
+    monitor_retailer = (monitor_row["retailer"] if monitor_row else "") or ""
+    return (
+        str(task_config.get("retailer") or "").strip().lower() == "pokemoncenter"
+        or str(monitor_retailer).strip().lower() == "pokemoncenter"
+    )
+
+
+def _pokemon_center_mode(config: dict[str, Any]) -> str:
+    mode = str(config.get("mode") or POKEMON_CENTER_DEFAULT_TASK_FIELDS["mode"]).strip().lower()
+    return mode if mode in POKEMON_CENTER_MODES else POKEMON_CENTER_DEFAULT_TASK_FIELDS["mode"]
+
+
+def validate_pokemon_center_mode_site(mode: str, site: str) -> str | None:
+    supported_sites = POKEMON_CENTER_MODE_SITE_SUPPORT.get(mode, POKEMON_CENTER_MODE_SITE_SUPPORT["default"])
+    if site not in supported_sites:
+        return f"Unsupported site '{site}' for mode '{mode}'"
+    return None
+
+
+def validate_pokemon_center_mode_requirements(config: dict[str, Any]) -> str | None:
+    mode = _pokemon_center_mode(config)
+    missing_fields = []
+    for field in sorted(POKEMON_CENTER_REQUIRED_FIELDS_BY_MODE.get(mode, set())):
+        value = config.get(field)
+        if value is None or str(value).strip() == "":
+            missing_fields.append(field)
+    if missing_fields:
+        return f"Missing required fields for mode '{mode}': {', '.join(missing_fields)}"
+    return None
+
+
+def normalize_task_config_for_monitor(
+    task_config: dict[str, Any] | None,
+    *,
+    monitor_row: sqlite3.Row | None = None,
+) -> dict[str, Any]:
+    normalized = dict(task_config or {})
+    if monitor_row and not normalized.get("retailer"):
+        normalized["retailer"] = monitor_row["retailer"]
+    if monitor_row and not normalized.get("product_url"):
+        normalized["product_url"] = monitor_row["product_url"]
+    if not _is_pokemon_center_task_config(normalized, monitor_row):
+        return normalized
+
+    site = str(normalized.get("site") or POKEMON_CENTER_DEFAULT_TASK_FIELDS["site"]).strip().lower()
+    normalized["site"] = site if site in POKEMON_CENTER_SITES else POKEMON_CENTER_DEFAULT_TASK_FIELDS["site"]
+
+    mode = str(normalized.get("mode") or POKEMON_CENTER_DEFAULT_TASK_FIELDS["mode"]).strip().lower()
+    normalized["mode"] = mode if mode in POKEMON_CENTER_MODES else POKEMON_CENTER_DEFAULT_TASK_FIELDS["mode"]
+
+    monitor_input = normalized.get("monitor_input")
+    normalized["monitor_input"] = str(monitor_input).strip() if monitor_input is not None else ""
+
+    quantity = _coerce_optional_int(normalized.get("product_quantity"))
+    normalized["product_quantity"] = quantity if quantity and quantity > 0 else POKEMON_CENTER_DEFAULT_TASK_FIELDS["product_quantity"]
+
+    monitor_delay = _coerce_optional_int(normalized.get("monitor_delay_ms"))
+    normalized["monitor_delay_ms"] = (
+        monitor_delay if monitor_delay is not None else POKEMON_CENTER_DEFAULT_TASK_FIELDS["monitor_delay_ms"]
+    )
+    normalized["queue_entry_delay_ms"] = _coerce_optional_int(normalized.get("queue_entry_delay_ms"))
+
+    discount = normalized.get("discount_code")
+    discount_normalized = str(discount).strip() if discount is not None else ""
+    normalized["discount_code"] = discount_normalized or None
+
+    normalized["wait_for_queue"] = bool(normalized.get("wait_for_queue", POKEMON_CENTER_DEFAULT_TASK_FIELDS["wait_for_queue"]))
+    normalized["loop_checkout"] = bool(normalized.get("loop_checkout", POKEMON_CENTER_DEFAULT_TASK_FIELDS["loop_checkout"]))
+    raw_limits = normalized.get("group_limits") if isinstance(normalized.get("group_limits"), dict) else {}
+    default_limits = POKEMON_CENTER_DEFAULT_TASK_FIELDS["group_limits"]
+    max_retries = _coerce_optional_int(raw_limits.get("max_retries"))
+    antibot_threshold = _coerce_optional_int(raw_limits.get("antibot_event_threshold"))
+    antibot_cooldown_seconds = _coerce_optional_int(raw_limits.get("antibot_cooldown_seconds"))
+    normalized["group_limits"] = {
+        "max_retries": max_retries,
+        "antibot_event_threshold": antibot_threshold if antibot_threshold and antibot_threshold > 0 else default_limits["antibot_event_threshold"],
+        "antibot_cooldown_seconds": (
+            antibot_cooldown_seconds
+            if antibot_cooldown_seconds is not None
+            else default_limits["antibot_cooldown_seconds"]
+        ),
+    }
+
+    for field_name in (*POKEMON_CENTER_CREATE_ACCOUNT_FIELDS, *POKEMON_CENTER_NEWSLETTER_FIELDS):
+        value = normalized.get(field_name)
+        normalized[field_name] = str(value).strip() if value is not None else ""
+
+    mode = normalized["mode"]
+    if mode == "create_account":
+        normalized["existing_account_source"] = ""
+        normalized["profile"] = None
+        normalized["payment"] = None
+    elif mode == "newsletter_subscribe":
+        normalized["profile_email"] = ""
+        normalized["profile_first_name"] = ""
+        normalized["profile_last_name"] = ""
+        normalized["account_output_target"] = ""
+        normalized["profile"] = None
+        normalized["payment"] = None
+
+    products = normalized.get("products")
+    if isinstance(products, list):
+        patched_products = []
+        for product in products:
+            if isinstance(product, dict):
+                copy = dict(product)
+                copy["skip_if_oos"] = bool(copy.get("skip_if_oos", False))
+                patched_products.append(copy)
+            else:
+                patched_products.append(product)
+        normalized["products"] = patched_products
+
+    normalized["task_group_version"] = POKEMON_CENTER_TASK_GROUP_SCHEMA_VERSION
+    return normalized
+
+
+RUNNING_TASK_STATES = {"queued", "monitoring", "carting", "shipping", "payment", "submitting", "paused"}
+
+
+def _is_quick_edit_input(raw_input: str) -> bool:
+    text = (raw_input or "").strip()
+    if not text:
+        return False
+    segments = [segment.strip() for segment in text.split(",")]
+    return len(segments) > 1 or any(":" in segment for segment in segments)
+
+
+def _coerce_product_rows(value: Any) -> list[dict[str, Any]]:
+    rows = value if isinstance(value, list) else []
+    normalized_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pid = str(row.get("pid") or "").strip()
+        if not pid:
+            continue
+        quantity = _coerce_optional_int(row.get("quantity"))
+        normalized_rows.append(
+            {
+                "pid": pid,
+                "quantity": quantity if quantity and quantity > 0 else 1,
+                "skip_if_oos": bool(row.get("skip_if_oos", False)),
+            }
+        )
+    return normalized_rows
+
+
+def apply_product_group_operation(task_config: dict[str, Any], operation: dict[str, Any]) -> dict[str, Any]:
+    config = dict(task_config or {})
+    existing_products = _coerce_product_rows(config.get("products"))
+    op = str(operation.get("mode") or "").strip().lower()
+    if op not in {"edit", "add", "remove"}:
+        raise ValueError("mode must be one of: edit, add, remove")
+
+    updated_products = list(existing_products)
+    if op in {"edit", "add"}:
+        raw_input = str(operation.get("input") or "").strip()
+        if not raw_input:
+            raise ValueError("input is required for edit/add operations")
+        quick_edit = _is_quick_edit_input(raw_input)
+        parsed = parse_monitor_input(
+            raw_input,
+            is_edit_flow=True,
+            existing_product_count=1 if op == "add" else len(existing_products),
+        )
+        if op == "edit":
+            if quick_edit and len(existing_products) != 1:
+                raise ValueError("Quick Edit is only allowed when editing a task with exactly one product.")
+            if not updated_products:
+                updated_products = [parsed[0]]
+            elif quick_edit:
+                updated_products = [parsed[0], *parsed[1:]]
+            else:
+                updated_products[0] = parsed[0]
+        else:
+            updated_products.extend(parsed)
+
+    if op == "remove":
+        indices = operation.get("remove_indices")
+        if not isinstance(indices, list) or not indices:
+            raise ValueError("remove_indices must include at least one row index")
+        valid_indices = {idx for idx in indices if isinstance(idx, int) and idx >= 0}
+        updated_products = [row for idx, row in enumerate(updated_products) if idx not in valid_indices]
+
+    skip_updates = operation.get("skip_updates")
+    if isinstance(skip_updates, list):
+        for patch in skip_updates:
+            if not isinstance(patch, dict):
+                continue
+            idx = patch.get("index")
+            if not isinstance(idx, int) or idx < 0 or idx >= len(updated_products):
+                continue
+            updated_products[idx]["skip_if_oos"] = bool(patch.get("skip_if_oos"))
+
+    config["products"] = updated_products
+    return normalize_task_config_for_monitor(config)
+
+
+def run_pokemon_center_task_group_config_migration(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        create table if not exists schema_migrations (
+            key text primary key,
+            applied_at text not null
+        )
+        """
+    )
+    migration_key = "2026_04_21_checkout_task_group_pokemoncenter_defaults_v3"
+    already_applied = conn.execute(
+        "select 1 from schema_migrations where key = ?",
+        (migration_key,),
+    ).fetchone()
+    if already_applied:
+        return
+
+    rows = conn.execute(
+        """
+        select ct.id, ct.task_config, m.retailer, m.product_url
+        from checkout_tasks ct
+        join monitors m on m.id = ct.monitor_id
+        where m.retailer = 'pokemoncenter'
+        """
+    ).fetchall()
+    for row in rows:
+        raw_config = row["task_config"] or "{}"
+        try:
+            parsed_config = json.loads(raw_config)
+        except (TypeError, json.JSONDecodeError):
+            parsed_config = {}
+        normalized = normalize_task_config_for_monitor(
+            parsed_config if isinstance(parsed_config, dict) else {},
+            monitor_row=row,
+        )
+        conn.execute(
+            "update checkout_tasks set task_config = ?, updated_at = ? where id = ?",
+            (json.dumps(normalized), utc_now(), row["id"]),
+        )
+
+    conn.execute(
+        "insert into schema_migrations(key, applied_at) values (?, ?)",
+        (migration_key, utc_now()),
+    )
+
+
+def run_legacy_tasks_migration(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        create table if not exists schema_migrations (
+            key text primary key,
+            applied_at text not null
+        )
+        """
+    )
+    migration_key = "2026_04_20_legacy_tasks_to_checkout_tasks"
+    already_applied = conn.execute(
+        "select 1 from schema_migrations where key = ?",
+        (migration_key,),
+    ).fetchone()
+    if already_applied:
+        return
+
+    if not table_exists(conn, "tasks"):
+        conn.execute(
+            "insert into schema_migrations(key, applied_at) values (?, ?)",
+            (migration_key, utc_now()),
+        )
+        return
+
+    task_columns = {row["name"] for row in conn.execute("pragma table_info(tasks)").fetchall()}
+    if "id" not in task_columns:
+        conn.execute(
+            "insert into schema_migrations(key, applied_at) values (?, ?)",
+            (migration_key, utc_now()),
+        )
+        return
+
+    ensure_column(conn, "checkout_tasks", "legacy_task_id", "integer")
+    conn.execute(
+        """
+        create unique index if not exists idx_checkout_tasks_legacy_task_id
+        on checkout_tasks(legacy_task_id)
+        where legacy_task_id is not null
+        """
+    )
+
+    legacy_tasks = conn.execute("select * from tasks order by id asc").fetchall()
+    migrated_count = 0
+    for row in legacy_tasks:
+        legacy_task_id = int(row["id"])
+        existing = conn.execute(
+            "select id from checkout_tasks where legacy_task_id = ?",
+            (legacy_task_id,),
+        ).fetchone()
+        if existing:
+            continue
+
+        workspace_id = int(row["workspace_id"]) if "workspace_id" in task_columns and row["workspace_id"] else 1
+        retailer = (row["retailer"] if "retailer" in task_columns else None) or "walmart"
+        product_url = (
+            (row["product_url"] if "product_url" in task_columns else None)
+            or (row["url"] if "url" in task_columns else None)
+            or ""
+        )
+        profile = (row["profile"] if "profile" in task_columns else None) or ""
+        account = (row["account"] if "account" in task_columns else None) or ""
+        payment = (row["payment"] if "payment" in task_columns else None) or ""
+        normalized_state = normalize_legacy_task_state(row["state"] if "state" in task_columns else None)
+        last_error = (row["last_error"] if "last_error" in task_columns else None) or None
+        created_at = (row["created_at"] if "created_at" in task_columns else None) or utc_now()
+        updated_at = (row["updated_at"] if "updated_at" in task_columns else None) or created_at
+        last_step = (row["last_step"] if "last_step" in task_columns else None) or normalized_state
+        retries = int(row["retries"]) if "retries" in task_columns and row["retries"] is not None else 0
+
+        monitor_row = conn.execute(
+            """
+            select id from monitors
+            where workspace_id = ? and retailer = ? and product_url = ?
+            order by id asc
+            limit 1
+            """,
+            (workspace_id, retailer, product_url),
+        ).fetchone()
+        if monitor_row:
+            monitor_id = int(monitor_row["id"])
+        else:
+            cur = conn.execute(
+                """
+                insert into monitors(workspace_id, retailer, product_url, poll_interval_seconds, enabled, created_at)
+                values (?, ?, ?, 20, ?, ?)
+                """,
+                (workspace_id, retailer, product_url, int(normalized_state == "monitoring"), created_at),
+            )
+            monitor_id = int(cur.lastrowid)
+
+        task_config = json.dumps(
+            {
+                "retailer": retailer,
+                "product_url": product_url,
+                "profile": profile,
+                "account": account,
+                "payment": payment,
+            }
+        )
+        enabled = int(normalized_state not in {"stopped", "success", "failed"})
+        is_paused = int(normalized_state == "paused")
+        cur = conn.execute(
+            """
+            insert into checkout_tasks(
+                workspace_id,
+                monitor_id,
+                task_name,
+                task_config,
+                current_state,
+                enabled,
+                is_paused,
+                last_error,
+                created_at,
+                updated_at,
+                last_transition_at,
+                legacy_task_id
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                workspace_id,
+                monitor_id,
+                f"{retailer} task",
+                task_config,
+                normalized_state,
+                enabled,
+                is_paused,
+                last_error,
+                created_at,
+                updated_at,
+                updated_at,
+                legacy_task_id,
+            ),
+        )
+        new_task_id = int(cur.lastrowid)
+        conn.execute(
+            """
+            insert into checkout_attempts(task_id, workspace_id, monitor_id, state, status, details, error_text, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_task_id,
+                workspace_id,
+                monitor_id,
+                normalized_state,
+                "migrated",
+                json.dumps({"legacy_task_id": legacy_task_id, "last_step": last_step, "retries": retries}),
+                last_error,
+                updated_at,
+            ),
+        )
+        migrated_count += 1
+
+    conn.execute(
+        "insert into schema_migrations(key, applied_at) values (?, ?)",
+        (migration_key, utc_now()),
+    )
+    if migrated_count:
+        log(f"✅ Migrated {migrated_count} legacy rows from tasks to checkout_tasks")
+
+
 def init_db() -> None:
     conn = db()
     conn.executescript(
@@ -449,6 +1284,7 @@ def init_db() -> None:
             plan text not null,
             proxy_url text,
             session_metadata text,
+            behavior_metadata text,
             subscription_status text not null default 'inactive',
             subscription_source text not null default 'manual',
             subscription_updated_at text,
@@ -478,6 +1314,7 @@ def init_db() -> None:
             id integer primary key autoincrement,
             workspace_id integer not null,
             retailer text not null,
+            category text not null default 'pokemon',
             product_url text not null,
             keyword text,
             max_price_cents integer,
@@ -487,10 +1324,53 @@ def init_db() -> None:
             last_in_stock integer,
             last_price_cents integer,
             proxy_url text,
+            proxy_type text,
+            proxy_region text,
+            proxy_residential_only integer not null default 0,
+            proxy_sticky_session_seconds integer,
             session_task_key text,
             session_metadata text,
+            behavior_metadata text,
             created_at text not null,
             foreign key(workspace_id) references workspaces(id)
+        );
+
+        create table if not exists proxies (
+            id integer primary key autoincrement,
+            provider text not null,
+            endpoint text not null unique,
+            proxy_type text not null default 'http',
+            status text not null default 'active',
+            cooldown_until text,
+            fail_streak integer not null default 0,
+            request_count integer not null default 0,
+            success_count integer not null default 0,
+            timeout_count integer not null default 0,
+            rate_limited_count integer not null default 0,
+            forbidden_count integer not null default 0,
+            failure_count integer not null default 0,
+            health_score real not null default 1.0,
+            quarantine_reason text,
+            region_code text,
+            is_residential integer not null default 0,
+            sticky_session_seconds integer,
+            last_used_at text,
+            last_success_at text,
+            last_failure_at text,
+            created_at text not null,
+            updated_at text not null
+        );
+
+        create table if not exists proxy_leases (
+            id integer primary key autoincrement,
+            proxy_id integer not null,
+            lease_key text not null,
+            owner_type text not null,
+            owner_id integer,
+            acquired_at text not null,
+            expires_at text not null,
+            released_at text,
+            foreign key(proxy_id) references proxies(id)
         );
 
         create table if not exists webhooks (
@@ -521,6 +1401,7 @@ def init_db() -> None:
             user_id integer,
             secret_type text not null,
             ciphertext text not null,
+            key_version text,
             created_at text not null,
             updated_at text not null,
             foreign key(workspace_id) references workspaces(id),
@@ -594,15 +1475,19 @@ def init_db() -> None:
             monitor_id integer not null,
             task_name text,
             task_config text,
-            current_state text not null default 'queued',
+            active_proxy_id integer,
+            active_proxy_lease_key text,
+            current_state text not null default 'idle',
             enabled integer not null default 0,
             is_paused integer not null default 0,
+            status_timestamps_json text,
             last_error text,
             created_at text not null,
             updated_at text not null,
             last_transition_at text,
             foreign key(workspace_id) references workspaces(id),
-            foreign key(monitor_id) references monitors(id)
+            foreign key(monitor_id) references monitors(id),
+            foreign key(active_proxy_id) references proxies(id)
         );
 
         create table if not exists checkout_attempts (
@@ -610,14 +1495,59 @@ def init_db() -> None:
             task_id integer not null,
             workspace_id integer not null,
             monitor_id integer not null,
+            attempt_number integer,
             state text not null,
+            step text,
+            error text,
             status text not null,
             details text,
             error_text text,
             created_at text not null,
+            updated_at text,
             foreign key(task_id) references checkout_tasks(id),
             foreign key(workspace_id) references workspaces(id),
             foreign key(monitor_id) references monitors(id)
+        );
+
+        create table if not exists captcha_challenges (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            task_id integer not null,
+            retailer_account_id integer,
+            provider text not null,
+            status text not null default 'pending',
+            provider_payload text,
+            manual_payload text,
+            solved_token text,
+            worker_handoff_token_hash text,
+            handoff_issued_at text,
+            handoff_expires_at text,
+            handoff_used_at text,
+            expires_at text,
+            created_at text not null,
+            updated_at text not null,
+            solved_at text,
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(task_id) references checkout_tasks(id),
+            foreign key(retailer_account_id) references retailer_accounts(id)
+        );
+
+        create table if not exists captcha_harvesters (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            name text not null,
+            proxy_url text,
+            gmail_email text,
+            session_status text not null default 'logged_out',
+            auto_click_enabled integer not null default 1,
+            auto_solve_mode text not null default 'off',
+            local_ai_enabled integer not null default 0,
+            local_ai_status text not null default 'not_installed',
+            notes text,
+            last_tested_at text,
+            created_at text not null,
+            updated_at text not null,
+            foreign key(workspace_id) references workspaces(id)
         );
 
         create table if not exists task_logs (
@@ -715,10 +1645,36 @@ def init_db() -> None:
             username text,
             email text,
             encrypted_credential_ref text not null,
+            proxy_url text,
+            proxy_lock_state text not null default 'unlocked',
+            proxy_lock_owner text,
+            proxy_lock_acquired_at text,
+            last_used_at text,
+            next_start_after text,
             session_status text not null default 'logged_out',
             created_at text not null,
             updated_at text not null,
             foreign key(workspace_id) references workspaces(id)
+        );
+
+        create table if not exists mailbox_credentials (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            provider text not null,
+            email text not null,
+            secret_id integer not null,
+            imap_host text,
+            imap_port integer not null default 993,
+            use_ssl integer not null default 1,
+            poll_interval_seconds integer not null default 5,
+            timeout_seconds integer not null default 90,
+            sender_filter text,
+            subject_filter text,
+            otp_regex text,
+            created_at text not null,
+            updated_at text not null,
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(secret_id) references account_secrets(id)
         );
 
         create table if not exists task_profile_bindings (
@@ -737,6 +1693,90 @@ def init_db() -> None:
             foreign key(retailer_account_id) references retailer_accounts(id),
             foreign key(payment_method_id) references payment_methods(id)
         );
+
+        create table if not exists alert_subscriptions (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            guild_id text not null,
+            channel_id text not null,
+            source text not null default 'discord',
+            source_name text,
+            retailer_filter text,
+            url_patterns text not null default '[]',
+            sku_patterns text not null default '[]',
+            keyword_patterns text not null default '[]',
+            enabled integer not null default 1,
+            last_ingested_at text,
+            created_at text not null,
+            updated_at text not null,
+            unique(workspace_id, guild_id, channel_id, source),
+            foreign key(workspace_id) references workspaces(id)
+        );
+
+        create table if not exists alert_events (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            subscription_id integer not null,
+            source_event_id text not null,
+            source text not null,
+            parse_status text not null,
+            event_time text not null,
+            retailer text,
+            product_url text,
+            sku text,
+            title text,
+            message text,
+            payload_json text not null,
+            normalized_json text not null,
+            parse_error text,
+            created_at text not null,
+            unique(subscription_id, source_event_id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(subscription_id) references alert_subscriptions(id)
+        );
+
+        create table if not exists alert_event_actions (
+            id integer primary key autoincrement,
+            event_id integer not null,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            action_type text not null,
+            status text not null,
+            dedupe_key text not null unique,
+            task_id integer,
+            job_id integer,
+            details text,
+            created_at text not null,
+            foreign key(event_id) references alert_events(id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id),
+            foreign key(task_id) references checkout_tasks(id),
+            foreign key(job_id) references jobs(id)
+        );
+
+        create table if not exists monitor_automation_policies (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            monitor_id integer not null,
+            alerts_enabled integer not null default 1,
+            autobuy_enabled integer not null default 0,
+            alert_throttle_seconds integer,
+            autobuy_cooldown_seconds integer,
+            dedupe_window_seconds integer,
+            dedupe_scope text,
+            created_at text not null,
+            updated_at text not null,
+            unique(workspace_id, monitor_id),
+            foreign key(workspace_id) references workspaces(id),
+            foreign key(monitor_id) references monitors(id)
+        );
+
+        create index if not exists idx_alert_subscriptions_workspace_enabled
+            on alert_subscriptions(workspace_id, enabled);
+        create index if not exists idx_alert_events_workspace_created
+            on alert_events(workspace_id, created_at);
+        create index if not exists idx_monitor_automation_policies_workspace_monitor
+            on monitor_automation_policies(workspace_id, monitor_id);
         """
     )
     existing = conn.execute("select id from workspaces limit 1").fetchone()
@@ -791,15 +1831,250 @@ def init_db() -> None:
     ensure_column(conn, "workspaces", "subscription_updated_at", "text")
     ensure_column(conn, "workspaces", "proxy_url", "text")
     ensure_column(conn, "workspaces", "session_metadata", "text")
+    ensure_column(conn, "workspaces", "behavior_metadata", "text")
     ensure_column(conn, "monitors", "proxy_url", "text")
+    ensure_column(conn, "monitors", "proxy_type", "text")
+    ensure_column(conn, "monitors", "proxy_region", "text")
+    ensure_column(conn, "monitors", "proxy_residential_only", "integer not null default 0")
+    ensure_column(conn, "monitors", "proxy_sticky_session_seconds", "integer")
     ensure_column(conn, "monitors", "session_task_key", "text")
     ensure_column(conn, "monitors", "session_metadata", "text")
+    ensure_column(conn, "monitors", "category", "text not null default 'pokemon'")
     ensure_column(conn, "jobs", "job_type", "text not null default 'monitor_check'")
     ensure_column(conn, "jobs", "monitor_id", "integer")
     ensure_column(conn, "jobs", "payload_json", "text")
     ensure_column(conn, "jobs", "last_error", "text")
+    ensure_column(conn, "checkout_attempts", "attempt_number", "integer")
+    ensure_column(conn, "checkout_attempts", "step", "text")
+    ensure_column(conn, "checkout_attempts", "error", "text")
+    ensure_column(conn, "checkout_attempts", "updated_at", "text")
+    ensure_column(conn, "checkout_tasks", "status_timestamps_json", "text")
+    ensure_column(conn, "captcha_harvesters", "notes", "text")
+    ensure_column(conn, "captcha_harvesters", "last_tested_at", "text")
+    ensure_column(conn, "account_secrets", "key_version", "text")
+    run_legacy_tasks_migration(conn)
+    run_pokemon_center_task_group_config_migration(conn)
     conn.commit()
     conn.close()
+
+
+def normalize_proxy_policy(policy: dict[str, Any] | None) -> dict[str, Any]:
+    policy = policy or {}
+    normalized: dict[str, Any] = {
+        "residential_only": bool(policy.get("residential_only")),
+    }
+    region = (policy.get("region") or "").strip().upper()
+    if region:
+        normalized["region"] = region
+    proxy_type = (policy.get("type") or "").strip().lower()
+    if proxy_type:
+        normalized["type"] = proxy_type
+    sticky_raw = policy.get("sticky_session_seconds")
+    if sticky_raw is not None:
+        sticky = int(sticky_raw)
+        if sticky < 0:
+            raise ValueError("sticky_session_seconds must be >= 0")
+        normalized["sticky_session_seconds"] = sticky
+    return normalized
+
+
+class ProxyAllocator:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+
+    def acquire_lease(
+        self,
+        *,
+        owner_type: str,
+        owner_id: int | None,
+        lease_key: str,
+        policy: dict[str, Any] | None = None,
+        lease_seconds: int = 60,
+    ) -> ProxyLease | None:
+        now_iso = utc_now()
+        expires_iso = datetime.fromisoformat(now_iso).timestamp() + max(1, lease_seconds)
+        expires_at = datetime.fromtimestamp(expires_iso, tz=timezone.utc).isoformat()
+        normalized = normalize_proxy_policy(policy)
+        filters = ["p.status = 'active'", "(p.cooldown_until is null or datetime(p.cooldown_until) <= datetime(?))"]
+        params: list[Any] = [now_iso]
+        if normalized.get("residential_only"):
+            filters.append("p.is_residential = 1")
+        if normalized.get("region"):
+            filters.append("upper(p.region_code) = ?")
+            params.append(normalized["region"])
+        if normalized.get("type"):
+            filters.append("p.proxy_type = ?")
+            params.append(normalized["type"])
+        if normalized.get("sticky_session_seconds"):
+            filters.append("(p.sticky_session_seconds is null or p.sticky_session_seconds >= ?)")
+            params.append(int(normalized["sticky_session_seconds"]))
+
+        self.conn.execute("begin immediate")
+        try:
+            self.conn.execute(
+                "update proxy_leases set released_at = ? where released_at is null and datetime(expires_at) <= datetime(?)",
+                (now_iso, now_iso),
+            )
+            existing = self.conn.execute(
+                """
+                select pl.id as lease_id, p.id as proxy_id, p.endpoint
+                from proxy_leases pl
+                join proxies p on p.id = pl.proxy_id
+                where pl.released_at is null
+                  and pl.owner_type = ?
+                  and pl.owner_id is ?
+                  and pl.lease_key = ?
+                  and datetime(pl.expires_at) > datetime(?)
+                limit 1
+                """,
+                (owner_type, owner_id, lease_key, now_iso),
+            ).fetchone()
+            if existing:
+                self.conn.commit()
+                return ProxyLease(
+                    lease_id=existing["lease_id"],
+                    proxy_id=existing["proxy_id"],
+                    endpoint=existing["endpoint"],
+                    lease_key=lease_key,
+                    owner_type=owner_type,
+                    owner_id=owner_id,
+                )
+            candidate = self.conn.execute(
+                f"""
+                select p.*
+                from proxies p
+                where {' and '.join(filters)}
+                  and not exists (
+                    select 1
+                    from proxy_leases pl
+                    where pl.proxy_id = p.id
+                      and pl.released_at is null
+                      and datetime(pl.expires_at) > datetime(?)
+                  )
+                order by p.health_score desc, p.fail_streak asc, coalesce(p.last_used_at, '1970-01-01T00:00:00+00:00') asc
+                limit 1
+                """,
+                (*params, now_iso),
+            ).fetchone()
+            if not candidate:
+                self.conn.commit()
+                return None
+            cur = self.conn.execute(
+                """
+                insert into proxy_leases(proxy_id, lease_key, owner_type, owner_id, acquired_at, expires_at)
+                values (?, ?, ?, ?, ?, ?)
+                """,
+                (candidate["id"], lease_key, owner_type, owner_id, now_iso, expires_at),
+            )
+            self.conn.execute(
+                "update proxies set last_used_at = ?, updated_at = ? where id = ?",
+                (now_iso, now_iso, candidate["id"]),
+            )
+            self.conn.commit()
+            return ProxyLease(
+                lease_id=int(cur.lastrowid),
+                proxy_id=candidate["id"],
+                endpoint=candidate["endpoint"],
+                lease_key=lease_key,
+                owner_type=owner_type,
+                owner_id=owner_id,
+            )
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def release_lease(self, *, lease_id: int) -> None:
+        now_iso = utc_now()
+        self.conn.execute("begin immediate")
+        try:
+            self.conn.execute(
+                "update proxy_leases set released_at = coalesce(released_at, ?) where id = ?",
+                (now_iso, lease_id),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def record_telemetry(self, *, lease: ProxyLease, request_result: RequestResult) -> None:
+        telemetry = request_result.telemetry
+        status = telemetry.status_code
+        is_timeout = telemetry.error_class in {"Timeout", "ReadTimeout", "ConnectTimeout"}
+        is_429 = status == 429
+        is_403 = status == 403
+        ok = telemetry.ok and not request_result.error
+        now_iso = utc_now()
+        self.conn.execute(
+            """
+            update proxies
+            set request_count = request_count + 1,
+                success_count = success_count + ?,
+                timeout_count = timeout_count + ?,
+                rate_limited_count = rate_limited_count + ?,
+                forbidden_count = forbidden_count + ?,
+                failure_count = failure_count + ?,
+                fail_streak = case when ? then 0 else fail_streak + 1 end,
+                last_success_at = case when ? then ? else last_success_at end,
+                last_failure_at = case when ? then last_failure_at else ? end,
+                updated_at = ?
+            where id = ?
+            """,
+            (
+                int(ok),
+                int(is_timeout),
+                int(is_429),
+                int(is_403),
+                int(not ok),
+                int(ok),
+                int(ok),
+                now_iso,
+                int(ok),
+                now_iso,
+                now_iso,
+                lease.proxy_id,
+            ),
+        )
+        self.conn.execute(
+            """
+            update proxies
+            set health_score = (
+                (cast(success_count as real) / nullif(request_count, 0))
+                - ((cast(timeout_count as real) / nullif(request_count, 0)) * 0.45)
+                - ((cast(rate_limited_count as real) / nullif(request_count, 0)) * 0.30)
+                - ((cast(forbidden_count as real) / nullif(request_count, 0)) * 0.60)
+                - min(0.30, fail_streak * 0.04)
+            )
+            where id = ? and request_count > 0
+            """,
+            (lease.proxy_id,),
+        )
+        row = self.conn.execute(
+            """
+            select request_count, fail_streak, health_score,
+                   (cast(timeout_count + rate_limited_count + forbidden_count as real) / nullif(request_count, 0)) as severe_failure_rate
+            from proxies
+            where id = ?
+            """,
+            (lease.proxy_id,),
+        ).fetchone()
+        if row and (
+            row["fail_streak"] >= 5
+            or (row["request_count"] >= 8 and (row["health_score"] or 0) < 0.30)
+            or (row["request_count"] >= 10 and (row["severe_failure_rate"] or 0) > 0.45)
+        ):
+            cooldown_at = datetime.now(timezone.utc).timestamp() + 15 * 60
+            cooldown_until = datetime.fromtimestamp(cooldown_at, tz=timezone.utc).isoformat()
+            self.conn.execute(
+                """
+                update proxies
+                set status = 'quarantined',
+                    cooldown_until = ?,
+                    quarantine_reason = 'auto_health_quarantine',
+                    updated_at = ?
+                where id = ?
+                """,
+                (cooldown_until, now_iso, lease.proxy_id),
+            )
 
 
 def perform_request(
@@ -809,9 +2084,14 @@ def perform_request(
     url: str,
     workspace_id: int | None,
     proxy_url: str | None,
+    behavior_policy: RequestBehaviorPolicy | None = None,
+    pacing_key: str | None = None,
+    throttle_signal: bool = False,
+    throttle_reason: str | None = None,
     timeout: float,
     retry_total: int,
     backoff_factor: float,
+    proxy_lease: ProxyLease | None = None,
     **kwargs: Any,
 ) -> RequestResult:
     result = session_manager.request(
@@ -820,6 +2100,10 @@ def perform_request(
         url=url,
         workspace_id=workspace_id,
         proxy_url=proxy_url,
+        behavior_policy=behavior_policy,
+        pacing_key=pacing_key,
+        throttle_signal=throttle_signal,
+        throttle_reason=throttle_reason,
         timeout=timeout,
         retry_total=retry_total,
         backoff_factor=backoff_factor,
@@ -829,10 +2113,21 @@ def perform_request(
     level = "warning" if not telemetry.ok else "info"
     log(
         f"http_request task={telemetry.task_key} method={method.upper()} status={telemetry.status_code} "
-        f"latency_ms={telemetry.latency_ms} error_class={telemetry.error_class}",
+        f"latency_ms={telemetry.latency_ms} error_class={telemetry.error_class} "
+        f"pacing_profile={telemetry.pacing_profile} planned_delay_ms={telemetry.planned_delay_ms} "
+        f"applied_delay_ms={telemetry.applied_delay_ms} adaptive_level={telemetry.adaptive_backoff_level} "
+        f"throttled={int(telemetry.throttled)} throttle_reason={telemetry.throttle_reason}",
         level=level,
         workspace_id=workspace_id,
     )
+    if proxy_lease:
+        conn = db()
+        try:
+            allocator = ProxyAllocator(conn)
+            allocator.record_telemetry(lease=proxy_lease, request_result=result)
+            conn.commit()
+        finally:
+            conn.close()
     return result
 
 
@@ -941,52 +2236,12 @@ def _set_auth_context(user: sqlite3.Row | dict[str, Any], workspace: sqlite3.Row
 
 
 def _extract_captcha_token() -> str | None:
-    header_token = (request.headers.get("X-Captcha-Token") or "").strip()
-    if header_token:
-        return header_token
-    body = request.get_json(silent=True)
-    if isinstance(body, dict):
-        for key in ("captcha_token", "cf-turnstile-response", "g-recaptcha-response"):
-            token = body.get(key)
-            if isinstance(token, str) and token.strip():
-                return token.strip()
-    for key in ("captcha_token", "cf-turnstile-response", "g-recaptcha-response"):
-        token = (request.form.get(key) or "").strip()
-        if token:
-            return token
-    return None
+    token = captcha_verifier.extract_token(request)
+    return token or None
 
 
 def verify_captcha_token(token: str) -> tuple[bool, str | None]:
-    if not CAPTCHA_SECRET_KEY or not CAPTCHA_VERIFY_URL:
-        return True, None
-    if not token:
-        return False, "missing_token"
-    payload = {"secret": CAPTCHA_SECRET_KEY, "response": token}
-    remote_ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()
-    if remote_ip:
-        payload["remoteip"] = remote_ip
-    try:
-        response = requests.post(CAPTCHA_VERIFY_URL, data=payload, timeout=CAPTCHA_TIMEOUT_SECONDS)
-    except Exception as exc:  # noqa: BLE001
-        log(f"CAPTCHA verification request failed: {exc}", level="warning")
-        return False, "provider_unreachable"
-    if response.status_code >= 500:
-        log(
-            f"CAPTCHA verification provider returned {response.status_code}",
-            level="warning",
-        )
-        return False, "provider_error"
-    if response.status_code >= 400:
-        return False, "provider_rejected"
-    try:
-        result = response.json()
-    except ValueError:
-        log("CAPTCHA verification provider returned non-JSON response", level="warning")
-        return False, "provider_invalid_response"
-    if not bool(result.get("success")):
-        return False, "invalid_token"
-    return True, None
+    return captcha_verifier.verify_token(token, request)
 
 
 def _is_captcha_protected_request() -> bool:
@@ -998,48 +2253,7 @@ def _is_captcha_protected_request() -> bool:
 
 
 def _captcha_token_from_request() -> str:
-    header_token = (request.headers.get("X-CAPTCHA-Token") or "").strip()
-    if header_token:
-        return header_token
-    payload = request.get_json(silent=True)
-    if isinstance(payload, dict):
-        for key in ("captcha_token", "captchaToken", "captcha-response", "captchaResponse"):
-            candidate = payload.get(key)
-            if isinstance(candidate, str) and candidate.strip():
-                return candidate.strip()
-    form_token = (request.form.get("captcha_token") or "").strip()
-    if form_token:
-        return form_token
-    return ""
-
-
-def verify_captcha_token(token: str) -> tuple[bool, str]:
-    if not CAPTCHA_SECRET_KEY:
-        return True, "skipped_not_configured"
-    if not token:
-        return False, "missing_token"
-    try:
-        response = requests.post(
-            CAPTCHA_VERIFY_URL,
-            data={
-                "secret": CAPTCHA_SECRET_KEY,
-                "response": token,
-                "remoteip": request.remote_addr,
-            },
-            timeout=CAPTCHA_VERIFY_TIMEOUT_SECONDS,
-        )
-    except requests.RequestException:
-        return False, "provider_request_failed"
-    if response.status_code != 200:
-        return False, "provider_http_error"
-    try:
-        payload = response.json()
-    except ValueError:
-        return False, "provider_invalid_json"
-    success = bool(payload.get("success"))
-    if success:
-        return True, "ok"
-    return False, "provider_rejected"
+    return captcha_verifier.extract_token(request)
 
 
 @app.before_request
@@ -1063,28 +2277,23 @@ def require_api_auth() -> tuple[dict[str, str], int] | None:
         else:
             return jsonify({"error": "Unauthorized"}), 401
 
-    if _is_captcha_protected_request():
-        captcha_token = _captcha_token_from_request()
-        is_valid, failure_reason = verify_captcha_token(captcha_token)
-        if not is_valid:
-            log(
-                "captcha_verification_failed",
-                level="warning",
-                workspace_id=getattr(g, "workspace_id", None),
-            )
-            return (
-                jsonify({"error": "CAPTCHA verification failed", "reason": failure_reason}),
-                403,
-            )
-    if request.method in {"POST", "PATCH", "PUT", "DELETE"}:
-        captcha_token = _extract_captcha_token()
-        captcha_ok, reason = verify_captcha_token(captcha_token or "")
-        if not captcha_ok:
-            log(
-                f"Blocked request due to failed CAPTCHA verification ({reason})",
-                level="warning",
-            )
-            return jsonify({"error": "CAPTCHA verification failed", "reason": reason}), 400
+    captcha_ok, reason = captcha_verifier.enforce_or_error(request)
+    if not captcha_ok:
+        header_token_present = bool((request.headers.get("X-CAPTCHA-Token") or "").strip())
+        reason_out = reason
+        if header_token_present:
+            if reason == "invalid_token":
+                reason_out = "provider_rejected"
+            elif reason == "provider_unreachable":
+                reason_out = "provider_request_failed"
+        log(
+            f"Blocked request due to failed CAPTCHA verification ({reason_out})",
+            level="warning",
+            workspace_id=getattr(g, "workspace_id", None),
+        )
+        strict_status = CAPTCHA_VERIFY_URL == DEFAULT_CAPTCHA_VERIFY_URL
+        status_code = 403 if (header_token_present or strict_status) else 400
+        return jsonify({"error": "CAPTCHA verification failed", "reason": reason_out}), status_code
     return None
 
 
@@ -1147,6 +2356,32 @@ def enforce_plan_limits(workspace_id: int, poll_interval_seconds: int) -> None:
         raise ValueError(
             f"Plan {workspace['plan']} minimum poll interval is {limits['min_poll_seconds']} seconds"
         )
+
+
+def _resolve_monitor_input(
+    raw_input: str,
+    *,
+    is_edit_flow: bool = False,
+    existing_product_count: int | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    parsed_products = parse_monitor_input(
+        raw_input,
+        is_edit_flow=is_edit_flow,
+        existing_product_count=existing_product_count,
+    )
+    first_product = parsed_products[0]
+    pid = str(first_product["pid"])
+    if pid == "placeholder":
+        return "placeholder", parsed_products
+    canonical_url = f"https://www.pokemoncenter.com/product/{pid}"
+    return canonical_url, parsed_products
+
+
+def normalize_monitor_assist_pid(raw_pid: str) -> str:
+    digits = re.sub(r"\D+", "", str(raw_pid or ""))
+    if len(digits) != 10:
+        raise ValueError("PID must contain exactly 10 digits")
+    return f"{digits[:2]}-{digits[2:7]}-{digits[7:]}"
 
 
 def _normalize_plan_hint(value: str | None) -> str:
@@ -1331,7 +2566,10 @@ def get_adapter_for_retailer(retailer: str | None):
 
 
 def evaluate_page(
-    html: str, keyword: str | None = None, retailer: str | None = None
+    html: str,
+    keyword: str | None = None,
+    retailer: str | None = None,
+    category: str | None = None,
 ) -> MonitorResult:
     return parse_monitor_html(html=html, keyword=keyword, retailer=retailer)
 
@@ -1342,19 +2580,46 @@ def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
         "Accept-Language": "en-US,en;q=0.9",
     }
     conn = db()
-    workspace = conn.execute("select proxy_url from workspaces where id = ?", (monitor["workspace_id"],)).fetchone()
-    conn.close()
-    proxy_url = monitor["proxy_url"] or (workspace["proxy_url"] if workspace else None)
+    allocator = ProxyAllocator(conn)
+    try:
+        workspace = conn.execute(
+            "select proxy_url, behavior_metadata from workspaces where id = ?",
+            (monitor["workspace_id"],),
+        ).fetchone()
+        proxy_url = monitor["proxy_url"] or (workspace["proxy_url"] if workspace else None)
+        lease: ProxyLease | None = None
+        if not proxy_url:
+            policy = {
+                "residential_only": bool(monitor["proxy_residential_only"]),
+                "region": monitor["proxy_region"],
+                "type": monitor["proxy_type"],
+                "sticky_session_seconds": monitor["proxy_sticky_session_seconds"],
+            }
+            lease = allocator.acquire_lease(
+                owner_type="monitor",
+                owner_id=monitor["id"],
+                lease_key=monitor["session_task_key"] or f"monitor-{monitor['id']}",
+                policy=policy,
+                lease_seconds=int(monitor["proxy_sticky_session_seconds"] or 60),
+            )
+            if lease:
+                proxy_url = lease.endpoint
+    finally:
+        conn.close()
     task_key = monitor["session_task_key"] or f"monitor-{monitor['id']}"
+    behavior_policy = _build_request_behavior_policy(monitor, workspace)
     req = perform_request(
         task_key=task_key,
         method="GET",
         url=monitor["product_url"],
         workspace_id=monitor["workspace_id"],
         proxy_url=proxy_url,
+        behavior_policy=behavior_policy,
+        pacing_key=f"{monitor['retailer']}:{monitor['id']}",
         timeout=15,
         retry_total=2,
         backoff_factor=0.35,
+        proxy_lease=lease,
         headers=headers,
     )
     if req.error:
@@ -1363,7 +2628,8 @@ def fetch_monitor(monitor: sqlite3.Row) -> MonitorResult:
     r = req.response
     r.raise_for_status()
     keyword = (monitor["keyword"] or "").strip() or None
-    return evaluate_page(r.text, keyword=keyword, retailer=monitor["retailer"])
+    category = (monitor["category"] or "").strip() or "pokemon"
+    return evaluate_page(r.text, keyword=keyword, retailer=monitor["retailer"], category=category)
 
 
 def alert_eligibility(monitor: sqlite3.Row, result: MonitorResult) -> bool:
@@ -1401,22 +2667,110 @@ def dedupe_key(monitor: sqlite3.Row, result: MonitorResult) -> str:
     return f"{monitor['id']}:{result.in_stock}:{bucket}:{minute}"
 
 
+def action_dedupe_key(
+    *,
+    workspace_id: int,
+    monitor_id: int,
+    action_type: str,
+    event_id: int | None = None,
+    source_key: str | None = None,
+) -> str:
+    event_token = str(event_id) if event_id is not None else "no-event"
+    source_token = (source_key or "").strip() or "none"
+    raw = f"{workspace_id}:{monitor_id}:{action_type}:{event_token}:{source_token}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _normalize_policy_bool(value: Any, *, field_name: str) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(bool(value))
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return 1
+        if normalized in {"0", "false", "no", "off"}:
+            return 0
+    raise ValueError(f"{field_name} must be a boolean")
+
+
+def _normalize_policy_optional_int(value: Any, *, field_name: str) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must be an integer or null") from None
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be >= 0")
+    return parsed
+
+
+def serialize_monitor_automation_policy(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "workspace_id": row["workspace_id"],
+        "monitor_id": row["monitor_id"],
+        "alerts_enabled": bool(row["alerts_enabled"]),
+        "autobuy_enabled": bool(row["autobuy_enabled"]),
+        "alert_throttle_seconds": row["alert_throttle_seconds"],
+        "autobuy_cooldown_seconds": row["autobuy_cooldown_seconds"],
+        "dedupe_window_seconds": row["dedupe_window_seconds"],
+        "dedupe_scope": row["dedupe_scope"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_or_create_monitor_automation_policy(
+    conn: sqlite3.Connection, *, workspace_id: int, monitor_id: int
+) -> sqlite3.Row:
+    policy = conn.execute(
+        """
+        select * from monitor_automation_policies
+        where workspace_id = ? and monitor_id = ?
+        """,
+        (workspace_id, monitor_id),
+    ).fetchone()
+    if policy:
+        return policy
+    now_iso = utc_now()
+    conn.execute(
+        """
+        insert into monitor_automation_policies(
+            workspace_id, monitor_id, alerts_enabled, autobuy_enabled, created_at, updated_at
+        ) values (?, ?, 1, 0, ?, ?)
+        """,
+        (workspace_id, monitor_id, now_iso, now_iso),
+    )
+    return conn.execute(
+        """
+        select * from monitor_automation_policies
+        where workspace_id = ? and monitor_id = ?
+        """,
+        (workspace_id, monitor_id),
+    ).fetchone()
+
+
 def create_event_and_deliver(
     monitor: sqlite3.Row,
     result: MonitorResult,
     eligible: bool | None = None,
-) -> None:
+    *,
+    dispatch_alerts: bool = True,
+) -> int | None:
     if eligible is None:
         eligible = alert_eligibility(monitor, result)
     if not eligible:
-        return
+        return None
 
     key = dedupe_key(monitor, result)
     conn = db()
     existing = conn.execute("select id from events where dedupe_key = ?", (key,)).fetchone()
     if existing:
         conn.close()
-        return
+        return int(existing["id"])
 
     ev = (
         monitor["id"],
@@ -1442,63 +2796,63 @@ def create_event_and_deliver(
         (monitor["workspace_id"],),
     ).fetchall()
 
-    payload = {
-        "username": "Stock Sentinel",
-        "content": "@here In-stock alert",
-        "embeds": [
-            {
-                "title": f"In Stock: {result.title}",
-                "url": monitor["product_url"],
-                "description": f"Retailer: {monitor['retailer']}",
-                "color": 5763719,
-                "fields": [
-                    {"name": "Price", "value": cents_to_dollars(result.price_cents), "inline": True},
-                    {"name": "Status", "value": "IN STOCK", "inline": True},
-                    {"name": "Detected", "value": utc_now(), "inline": False},
-                ],
-                "footer": {"text": f"Monitor ID: {monitor['id']}"},
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-        ],
-    }
+    if dispatch_alerts:
+        payload = {
+            "username": "Stock Sentinel",
+            "content": "@here In-stock alert",
+            "embeds": [
+                {
+                    "title": f"In Stock: {result.title}",
+                    "url": monitor["product_url"],
+                    "description": f"Retailer: {monitor['retailer']}",
+                    "color": 5763719,
+                    "fields": [
+                        {"name": "Price", "value": cents_to_dollars(result.price_cents), "inline": True},
+                        {"name": "Status", "value": "IN STOCK", "inline": True},
+                        {"name": "Detected", "value": utc_now(), "inline": False},
+                    ],
+                    "footer": {"text": f"Monitor ID: {monitor['id']}"},
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            ],
+        }
 
-    for hook in webhooks:
-        if not should_send_to_webhook(monitor, hook, eligible):
-            continue
-        status, code, body = "queued", None, ""
-        try:
-            req = perform_request(
-                task_key=f"webhook-{hook['id']}",
-                method="POST",
-                url=hook["webhook_url"],
-                workspace_id=monitor["workspace_id"],
-                proxy_url=None,
-                timeout=8,
-                retry_total=1,
-                backoff_factor=0.2,
-                json=payload,
+        for hook in webhooks:
+            if not should_send_to_webhook(monitor, hook, eligible):
+                continue
+            status, code, body = "queued", None, ""
+            try:
+                target_url = resolve_webhook_url(conn, hook)
+                req = perform_request(
+                    task_key=f"webhook-{hook['id']}",
+                    method="POST",
+                    url=target_url,
+                    workspace_id=monitor["workspace_id"],
+                    proxy_url=None,
+                    timeout=8,
+                    retry_total=1,
+                    backoff_factor=0.2,
+                    json=payload,
+                )
+                if req.error:
+                    raise req.error
+                assert req.response is not None
+                resp = req.response
+                code = resp.status_code
+                body = (resp.text or "")[:1000]
+                status = "sent" if 200 <= resp.status_code < 300 else "failed"
+            except Exception as exc:  # noqa: BLE001
+                status = "failed"
+                body = str(exc)
+
+            conn.execute(
+                """
+                insert into deliveries(event_id, webhook_id, status, response_code, response_body, delivered_at)
+                values (?, ?, ?, ?, ?, ?)
+                """,
+                (event_id, hook["id"], status, code, body, utc_now()),
             )
-            if req.error:
-                raise req.error
-            assert req.response is not None
-            resp = req.response
-            webhook_target = resolve_webhook_url(conn, hook)
-            resp = requests.post(webhook_target, json=payload, timeout=8)
-            code = resp.status_code
-            body = (resp.text or "")[:1000]
-            status = "sent" if 200 <= resp.status_code < 300 else "failed"
-        except Exception as exc:  # noqa: BLE001
-            status = "failed"
-            body = str(exc)
-
-        conn.execute(
-            """
-            insert into deliveries(event_id, webhook_id, status, response_code, response_body, delivered_at)
-            values (?, ?, ?, ?, ?, ?)
-            """,
-            (event_id, hook["id"], status, code, body, utc_now()),
-        )
-        update_webhook_health(conn, hook["id"], status=status, status_code=code, error_text=body)
+            update_webhook_health(conn, hook["id"], status=status, status_code=code, error_text=body)
 
     conn.commit()
     conn.close()
@@ -1508,15 +2862,25 @@ def create_event_and_deliver(
         workspace_id=monitor["workspace_id"],
         monitor_id=monitor["id"],
     )
+    return int(event_id)
 
 
 def normalize_checkout_state(raw_state: Any, *, allow_control_states: bool = True) -> str:
     state = str(raw_state or "").strip().lower()
+    compatibility = {
+        "queued": "idle",
+        "monitoring": "monitoring_product",
+        "carting": "adding_to_cart",
+        "shipping": "checking_out",
+        "payment": "checking_out",
+        "submitting": "checking_out",
+        "failed": "decline",
+    }
+    state = compatibility.get(state, state)
     valid_states = CHECKOUT_TASK_STATES if allow_control_states else CHECKOUT_TASK_STATES - {"paused", "stopped"}
     if state not in valid_states:
-        raise ValueError(
-            "Invalid checkout state. Expected one of: queued, monitoring, carting, shipping, payment, submitting, success, failed"
-        )
+        expected = ", ".join(sorted(valid_states))
+        raise ValueError(f"Invalid checkout state. Expected one of: {expected}")
     return state
 
 
@@ -1531,20 +2895,47 @@ def record_checkout_attempt(
     details: dict[str, Any] | None = None,
     error_text: str | None = None,
 ) -> None:
+    now_iso = utc_now()
+    next_attempt_number = conn.execute(
+        """
+        select coalesce(max(attempt_number), 0) + 1 as next_attempt_number
+        from checkout_attempts
+        where task_id = ? and workspace_id = ?
+        """,
+        (task_id, workspace_id),
+    ).fetchone()["next_attempt_number"]
+    truncated_error = (error_text or "")[:500] if error_text else None
     conn.execute(
         """
-        insert into checkout_attempts(task_id, workspace_id, monitor_id, state, status, details, error_text, created_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?)
+        insert into checkout_attempts(
+            task_id,
+            workspace_id,
+            monitor_id,
+            attempt_number,
+            state,
+            step,
+            error,
+            status,
+            details,
+            error_text,
+            created_at,
+            updated_at
+        )
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id,
             workspace_id,
             monitor_id,
+            next_attempt_number,
             state,
             status,
+            truncated_error,
+            status,
             json.dumps(details or {}),
-            (error_text or "")[:500] if error_text else None,
-            utc_now(),
+            truncated_error,
+            now_iso,
+            now_iso,
         ),
     )
 
@@ -1578,6 +2969,197 @@ def record_task_log(
     )
 
 
+def _json_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            return [value.strip()]
+    return []
+
+
+def enqueue_alert_monitor_check_job(
+    conn: sqlite3.Connection,
+    *,
+    monitor_id: int,
+    reason: str,
+    source_event_id: str,
+    now_iso: str,
+) -> int:
+    payload = json.dumps({"step_attempts": {}, "reason": reason, "source_event_id": source_event_id})
+    cur = conn.execute(
+        """
+        insert into jobs(job_type, monitor_id, status, attempt_count, next_run_at, payload_json, created_at, updated_at)
+        values ('monitor_check', ?, 'queued', 0, ?, ?, ?, ?)
+        """,
+        (monitor_id, now_iso, payload, now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def create_checkout_task_for_alert(
+    conn: sqlite3.Connection,
+    *,
+    monitor: sqlite3.Row,
+    event_payload: dict[str, Any],
+    reason: str,
+) -> int:
+    task = create_checkout_task(
+        conn,
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+        task_name=f"Alert event checkout for monitor {monitor['id']}",
+        task_config={
+            "retailer": monitor["retailer"],
+            "product_url": monitor["product_url"],
+            "reason": reason,
+            "alert_event": event_payload,
+        },
+        initial_state="queued",
+    )
+    record_task_log(
+        conn,
+        task_id=task["id"],
+        workspace_id=monitor["workspace_id"],
+        monitor_id=monitor["id"],
+        level="info",
+        event_type="discord_alert_match",
+        message=f"Discord alert matched monitor {monitor['id']}",
+        payload={"reason": reason, "source_event_id": event_payload.get("source_event_id")},
+    )
+    return int(task["id"])
+
+
+def process_discord_alert_job(queue: SQLiteJobQueue, job: Job, *, now_iso: str) -> None:
+    payload = json.loads(job.payload_json or "{}")
+    subscription_id = int(payload.get("subscription_id") or 0)
+    raw_event = payload.get("raw_event") if isinstance(payload.get("raw_event"), dict) else {}
+    source_name = str(payload.get("source_name") or "discord").strip() or "discord"
+    subscription = queue.conn.execute(
+        "select * from alert_subscriptions where id = ? and enabled = 1",
+        (subscription_id,),
+    ).fetchone()
+    if not subscription:
+        queue.fail_job(
+            job.id,
+            now_iso=now_iso,
+            status="failed",
+            next_run_at=now_iso,
+            payload_json=job.payload_json or "{}",
+            error_text=f"subscription_not_found:{subscription_id}",
+        )
+        return
+    workspace_id = int(subscription["workspace_id"])
+    try:
+        event = normalize_discord_alert_event(raw_event, fallback_source=source_name)
+        accepted = subscription_accepts_event(
+            event,
+            retailer_filter=subscription["retailer_filter"],
+            url_patterns=_json_list(subscription["url_patterns"]),
+            sku_patterns=_json_list(subscription["sku_patterns"]),
+            keyword_patterns=_json_list(subscription["keyword_patterns"]),
+        )
+        parse_status = "accepted" if accepted else "filtered"
+        parse_error = None
+    except Exception as exc:  # noqa: BLE001
+        parse_status = "parse_failed"
+        parse_error = str(exc)[:500]
+        event = normalize_discord_alert_event({}, fallback_source=source_name)
+        accepted = False
+
+    event_cur = queue.conn.execute(
+        """
+        insert into alert_events(
+            workspace_id, subscription_id, source_event_id, source, parse_status, event_time,
+            retailer, product_url, sku, title, message, payload_json, normalized_json, parse_error, created_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(subscription_id, source_event_id) do update set
+            parse_status = excluded.parse_status,
+            parse_error = excluded.parse_error
+        """,
+        (
+            workspace_id,
+            subscription_id,
+            event.source_event_id,
+            event.source,
+            parse_status,
+            event.event_time,
+            event.retailer,
+            event.product_url,
+            event.sku,
+            event.title,
+            event.message,
+            json.dumps(raw_event),
+            json.dumps(
+                {
+                    "retailer": event.retailer,
+                    "product_url": event.product_url,
+                    "sku": event.sku,
+                    "title": event.title,
+                    "message": event.message,
+                }
+            ),
+            parse_error,
+            now_iso,
+        ),
+    )
+    event_id = int(event_cur.lastrowid) if event_cur.lastrowid else int(
+        queue.conn.execute(
+            "select id from alert_events where subscription_id = ? and source_event_id = ?",
+            (subscription_id, event.source_event_id),
+        ).fetchone()["id"]
+    )
+    queue.conn.execute(
+        "update alert_subscriptions set last_ingested_at = ?, updated_at = ? where id = ?",
+        (now_iso, now_iso, subscription_id),
+    )
+    if not accepted:
+        queue.complete_job(job.id, now_iso=now_iso)
+        return
+
+    monitors = queue.conn.execute(
+        "select * from monitors where workspace_id = ? and enabled = 1",
+        (workspace_id,),
+    ).fetchall()
+    matched = [monitor for monitor in monitors if monitor_matches_alert(dict(monitor), event)]
+    for monitor in matched:
+        monitor_id = int(monitor["id"])
+        task_key = action_dedupe_key(
+            workspace_id=workspace_id, monitor_id=monitor_id, event_id=event_id, action_type="checkout"
+        )
+        existing_action = queue.conn.execute(
+            "select id from alert_event_actions where dedupe_key = ?",
+            (task_key,),
+        ).fetchone()
+        if existing_action:
+            continue
+        task_id = create_checkout_task_for_alert(
+            queue.conn,
+            monitor=monitor,
+            event_payload={"source_event_id": event.source_event_id, "title": event.title},
+            reason="discord_ingestion_match",
+        )
+        job_id = enqueue_alert_monitor_check_job(
+            queue.conn,
+            monitor_id=monitor_id,
+            reason="discord_ingestion_match",
+            source_event_id=event.source_event_id,
+            now_iso=now_iso,
+        )
+        queue.conn.execute(
+            """
+            insert into alert_event_actions(
+                event_id, workspace_id, monitor_id, action_type, status, dedupe_key, task_id, job_id, details, created_at
+            ) values (?, ?, ?, 'checkout_and_monitor', 'enqueued', ?, ?, ?, ?, ?)
+            """,
+            (event_id, workspace_id, monitor_id, task_key, task_id, job_id, json.dumps({"title": event.title}), now_iso),
+        )
+    queue.complete_job(job.id, now_iso=now_iso)
+
 def create_checkout_task(
     conn: sqlite3.Connection,
     *,
@@ -1585,8 +3167,16 @@ def create_checkout_task(
     monitor_id: int,
     task_name: str | None = None,
     task_config: dict[str, Any] | None = None,
-    initial_state: str = "queued",
+    initial_state: str = "idle",
 ) -> sqlite3.Row:
+    task_config = dict(task_config or {})
+    monitor_row = conn.execute(
+        "select retailer, product_url from monitors where id = ? and workspace_id = ?",
+        (monitor_id, workspace_id),
+    ).fetchone()
+    task_config = normalize_task_config_for_monitor(task_config, monitor_row=monitor_row)
+    if "proxy_policy" in task_config:
+        task_config["proxy_policy"] = normalize_proxy_policy(task_config.get("proxy_policy"))
     normalized_state = normalize_checkout_state(initial_state, allow_control_states=False)
     now_iso = utc_now()
     cur = conn.execute(
@@ -1599,13 +3189,24 @@ def create_checkout_task(
             current_state,
             enabled,
             is_paused,
+            status_timestamps_json,
             created_at,
             updated_at,
             last_transition_at
         )
-        values (?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+        values (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
         """,
-        (workspace_id, monitor_id, task_name, json.dumps(task_config or {}), normalized_state, now_iso, now_iso, now_iso),
+        (
+            workspace_id,
+            monitor_id,
+            task_name,
+            json.dumps(task_config or {}),
+            normalized_state,
+            json.dumps({normalized_state: now_iso}),
+            now_iso,
+            now_iso,
+            now_iso,
+        ),
     )
     task_id = cur.lastrowid
     record_checkout_attempt(
@@ -1639,6 +3240,34 @@ def get_checkout_task_for_workspace(
     ).fetchone()
 
 
+def _build_transition_timestamp_map(row: sqlite3.Row, next_state: str, now_iso: str) -> dict[str, str]:
+    raw_map = row["status_timestamps_json"] if "status_timestamps_json" in row.keys() else None
+    existing = parse_json_object(raw_map)
+    timeline = {str(key): str(value) for key, value in existing.items() if str(key) and str(value)}
+    timeline[next_state] = now_iso
+    return timeline
+
+
+def serialize_checkout_task_summary(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    payload = serialize_checkout_task(row)
+    if payload is None:
+        return None
+    state = str(payload.get("current_state") or "idle")
+    timestamps = parse_json_object(payload.get("status_timestamps_json"))
+    return {
+        "id": payload["id"],
+        "workspace_id": payload["workspace_id"],
+        "monitor_id": payload["monitor_id"],
+        "task_name": payload.get("task_name"),
+        "retailer": (payload.get("task_config") or {}).get("retailer"),
+        "current_state": state,
+        "status_label": TASK_STATUS_LABELS.get(state, state.replace("_", " ").title()),
+        "status_timestamps": timestamps,
+        "last_transition_at": payload.get("last_transition_at"),
+        "last_error": payload.get("last_error"),
+    }
+
+
 def transition_checkout_task(
     conn: sqlite3.Connection,
     *,
@@ -1653,15 +3282,46 @@ def transition_checkout_task(
         return None
 
     normalized_state = normalize_checkout_state(requested_state)
-    enabled = int(normalized_state not in {"stopped", "success", "failed"})
+    task_config = parse_json_object(row["task_config"])
+    active_lease_key = row["active_proxy_lease_key"]
+    active_proxy_id = row["active_proxy_id"]
+    allocator = ProxyAllocator(conn)
+    if normalized_state == "monitoring_product" and not active_lease_key:
+        policy = task_config.get("proxy_policy") if isinstance(task_config.get("proxy_policy"), dict) else {}
+        sticky = int(policy.get("sticky_session_seconds") or 300)
+        lease = allocator.acquire_lease(
+            owner_type="checkout_task",
+            owner_id=task_id,
+            lease_key=f"checkout-task-{task_id}",
+            policy=policy,
+            lease_seconds=sticky,
+        )
+        if lease:
+            active_lease_key = lease.lease_key
+            active_proxy_id = lease.proxy_id
+    if normalized_state in CHECKOUT_TERMINAL_STATES.union({"paused"}) and active_lease_key:
+        lease_row = conn.execute(
+            "select id from proxy_leases where owner_type = 'checkout_task' and owner_id = ? and lease_key = ? and released_at is null",
+            (task_id, active_lease_key),
+        ).fetchone()
+        if lease_row:
+            allocator.release_lease(lease_id=lease_row["id"])
+        active_lease_key = None
+        active_proxy_id = None
+    enabled = int(normalized_state in CHECKOUT_ACTIVE_STATES)
     is_paused = int(normalized_state == "paused")
     now_iso = utc_now()
+    timestamp_map = _build_transition_timestamp_map(row, normalized_state, now_iso)
+    transition_error = (error_text or "")[:500] if error_text else None
     conn.execute(
         """
         update checkout_tasks
         set current_state = ?,
             enabled = ?,
             is_paused = ?,
+            active_proxy_id = ?,
+            active_proxy_lease_key = ?,
+            status_timestamps_json = ?,
             last_error = ?,
             updated_at = ?,
             last_transition_at = ?
@@ -1671,7 +3331,10 @@ def transition_checkout_task(
             normalized_state,
             enabled,
             is_paused,
-            (error_text or "")[:500] if error_text else None,
+            active_proxy_id,
+            active_lease_key,
+            json.dumps(timestamp_map),
+            transition_error,
             now_iso,
             now_iso,
             task_id,
@@ -1701,77 +3364,194 @@ def transition_checkout_task(
     return get_checkout_task_for_workspace(conn, task_id, workspace_id)
 
 
-def enqueue_checkout_for_monitor(
-    monitor: sqlite3.Row, result: MonitorResult, *, reason: str = "in_stock_detected"
-) -> int | None:
-    if not result.in_stock:
-        return None
-    conn = db()
-    existing = conn.execute(
+class CheckoutRetryableError(RuntimeError):
+    pass
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
         """
-        select * from checkout_tasks
-        where workspace_id = ? and monitor_id = ?
-          and current_state not in ('success', 'failed', 'stopped')
-        order by id desc
-        limit 1
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (monitor["workspace_id"], monitor["id"]),
-    ).fetchone()
-    if existing:
-        record_task_log(
-            conn,
-            task_id=existing["id"],
-            workspace_id=monitor["workspace_id"],
-            monitor_id=monitor["id"],
-            level="info",
-            event_type="enqueue_skipped_existing",
-            message=f"Existing active checkout task {existing['id']} detected",
-            payload={"reason": reason},
-        )
-        conn.commit()
-        conn.close()
-        return existing["id"]
-
-    task = create_checkout_task(
-        conn,
-        workspace_id=monitor["workspace_id"],
-        monitor_id=monitor["id"],
-        task_name=f"Monitor {monitor['id']} checkout",
-        task_config={"retailer": monitor["retailer"], "product_url": monitor["product_url"]},
-        initial_state="queued",
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
-    record_checkout_attempt(
-        conn,
-        task_id=task["id"],
-        workspace_id=monitor["workspace_id"],
-        monitor_id=monitor["id"],
-        state="queued",
-        status="enqueued",
-        details={
-            "reason": reason,
-            "title": result.title,
-            "price_cents": result.price_cents,
-        },
-    )
-    record_task_log(
-        conn,
-        task_id=task["id"],
-        workspace_id=monitor["workspace_id"],
-        monitor_id=monitor["id"],
-        level="warning",
-        event_type="task_enqueued",
-        message=f"Checkout task {task['id']} enqueued from monitor {monitor['id']}",
-        payload={"price_cents": result.price_cents, "title": result.title},
-    )
-    conn.commit()
-    conn.close()
-    return int(task["id"])
+    return int(cur.lastrowid)
 
 
-def cents_to_dollars(cents: int | None) -> str:
-    if cents is None:
-        return "unknown"
-    return f"${cents / 100:.2f}"
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
+def normalize_parser_confidence(value: Any) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    confidence = float(value)
+    if math.isnan(confidence) or math.isinf(confidence):
+        return None
+    return min(1.0, max(0.0, confidence))
+
+
+def parser_metadata_payload(result: MonitorResult) -> dict[str, Any]:
+    return {
+        "availability_reason": result.availability_reason,
+        "parser_confidence": normalize_parser_confidence(result.parser_confidence),
+    }
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
+def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    confidence = float(value)
+    if math.isnan(confidence) or math.isinf(confidence):
+        return None
+    return min(1.0, max(0.0, confidence))
+
+
+def parser_metadata_payload(result: MonitorResult) -> dict[str, Any]:
+    return {
+        "availability_reason": result.availability_reason,
+        "parser_confidence": normalize_parser_confidence(result.parser_confidence),
+    }
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
+def normalize_parser_confidence(value: Any) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    confidence = float(value)
+    if math.isnan(confidence) or math.isinf(confidence):
+        return None
+    return min(1.0, max(0.0, confidence))
+
+
+def parser_metadata_payload(result: MonitorResult) -> dict[str, Any]:
+    return {
+        "availability_reason": result.availability_reason,
+        "parser_confidence": normalize_parser_confidence(result.parser_confidence),
+    }
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
 
 
 def normalize_parser_confidence(value: Any) -> float | None:
@@ -1854,115 +3634,187 @@ def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return payload
 
 
-def serialize_checkout_profile(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    if row is None:
-        return None
-    payload = dict(row)
-    payload["shipping_address"] = json.loads(payload.pop("shipping_address_json"))
-    payload["billing_address"] = json.loads(payload.pop("billing_address_json"))
-    return payload
-
-
-def serialize_payment_method(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    if row is None:
-        return None
-    return dict(row)
-
-
-def serialize_retailer_account(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    if row is None:
-        return None
-    return dict(row)
-
-
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-PHONE_RE = re.compile(r"^[0-9+\-().\s]{7,24}$")
-SESSION_STATUSES = {"active", "expired", "locked", "logged_out"}
-
-
-def _validate_email(email: str) -> str:
-    normalized = email.strip().lower()
-    if not EMAIL_RE.match(normalized):
-        raise ValueError("Invalid email")
-    return normalized
-
-
-def _validate_phone(phone: str | None) -> str | None:
-    if phone is None:
-        return None
-    normalized = phone.strip()
-    if not normalized:
-        return None
-    if not PHONE_RE.match(normalized):
-        raise ValueError("Invalid phone")
-    return normalized
-
-
-def _validate_address(value: Any, field_name: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ValueError(f"{field_name} must be an object")
-    required = ("line1", "city", "state", "postal_code", "country")
-    for key in required:
-        raw = value.get(key)
-        if not isinstance(raw, str) or not raw.strip():
-            raise ValueError(f"{field_name}.{key} is required")
-    return {k: (v.strip() if isinstance(v, str) else v) for k, v in value.items()}
-
-
-def should_send_to_webhook(monitor: sqlite3.Row, hook: sqlite3.Row, eligible: bool) -> bool:
-    if not hook["enabled"]:
-        return False
-    if eligible and not hook["notify_success"]:
-        return False
-    if not eligible and not hook["notify_failures"]:
-        return False
-    if hook["notify_restock_only"] and monitor["last_in_stock"]:
-        return False
-    return True
-
-
-def update_webhook_health(
+def create_secret(
     conn: sqlite3.Connection,
-    webhook_id: int,
-    status: str,
-    status_code: int | None = None,
-    error_text: str | None = None,
-    tested: bool = False,
-) -> None:
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
     now_iso = utc_now()
-    tested_at = now_iso if tested else None
-    conn.execute(
+    cur = conn.execute(
         """
-        update webhooks
-        set last_tested_at = coalesce(?, last_tested_at),
-            last_test_status = coalesce(?, last_test_status),
-            last_delivery_status = ?,
-            last_delivery_at = ?,
-            fail_streak = case when ? = 'failed' then fail_streak + 1 else 0 end,
-            last_error = ?,
-            last_status_code = ?
-        where id = ?
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (
-            tested_at,
-            status if tested else None,
-            status,
-            now_iso,
-            status,
-            (error_text or "")[:500] if error_text else None,
-            status_code,
-            webhook_id,
-        ),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
+    return int(cur.lastrowid)
 
 
-def create_monitor_error_events(monitor: sqlite3.Row, error_text: str) -> None:
-    log(
-        f"Monitor {monitor['id']} error event: {error_text[:200]}",
-        level="warning",
-        workspace_id=monitor["workspace_id"],
-        monitor_id=monitor["id"],
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
+
+
+def normalize_parser_confidence(value: Any) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    confidence = float(value)
+    if math.isnan(confidence) or math.isinf(confidence):
+        return None
+    return min(1.0, max(0.0, confidence))
+
+
+def parser_metadata_payload(result: MonitorResult) -> dict[str, Any]:
+    return {
+        "availability_reason": result.availability_reason,
+        "parser_confidence": normalize_parser_confidence(result.parser_confidence),
+    }
+
+
+def create_secret(
+    conn: sqlite3.Connection,
+    workspace_id: int,
+    secret_type: str,
+    plaintext: str,
+    user_id: int | None = None,
+) -> int:
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def resolve_webhook_url(conn: sqlite3.Connection, webhook: sqlite3.Row) -> str:
+    secret_id = webhook["webhook_secret_id"]
+    if secret_id:
+        row = conn.execute(
+            "select ciphertext from account_secrets where id = ? and workspace_id = ?",
+            (secret_id, webhook["workspace_id"]),
+        ).fetchone()
+        if row and row["ciphertext"]:
+            try:
+                return decrypt_secret_value(row["ciphertext"])
+            except ValueError:
+                pass
+    return str(webhook["webhook_url"] or "")
 
 
 def emit_monitor_events(monitor: sqlite3.Row, result: MonitorResult, eligible: bool) -> None:
@@ -1985,53 +3837,111 @@ def emit_monitor_events(monitor: sqlite3.Row, result: MonitorResult, eligible: b
         # Best-effort telemetry; never fail monitor execution because of socket emit issues.
         print(json.dumps(format_log_entry("warning", f"monitor_update_emit_failed: {exc}", workspace_id=monitor["workspace_id"], monitor_id=monitor["id"])))
     try:
-        log(
-            f"Monitor {monitor['id']} telemetry emitted ({result.status_text}, eligible={int(bool(eligible))})",
-            level="info",
-            workspace_id=monitor["workspace_id"],
-            monitor_id=monitor["id"],
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(json.dumps(format_log_entry("warning", f"monitor_telemetry_log_failed: {exc}", workspace_id=monitor["workspace_id"], monitor_id=monitor["id"])))
-
-
-STEP_RETRY_POLICY = {
-    "fetch": {"max_attempts": 5, "base_seconds": 5},
-    "persist": {"max_attempts": 4, "base_seconds": 2},
-    "notify": {"max_attempts": 4, "base_seconds": 3},
-}
-RETRYABLE_EXCEPTIONS = (requests.RequestException, TimeoutError, ConnectionError, sqlite3.OperationalError)
-
-
-def _exponential_backoff_seconds(base_seconds: int, attempt_count: int) -> int:
-    return base_seconds * (2 ** max(attempt_count - 1, 0))
-
-
-def _classify_step_failure(step: str, exc: Exception, step_attempts: int) -> tuple[bool, str]:
-    if isinstance(exc, (PermissionError, ValueError)):
-        return False, "terminal_non_retryable_error"
-    policy = STEP_RETRY_POLICY[step]
-    if step_attempts >= policy["max_attempts"]:
-        return False, "terminal_max_attempts_exceeded"
-    return isinstance(exc, RETRYABLE_EXCEPTIONS), "retryable_exception" if isinstance(exc, RETRYABLE_EXCEPTIONS) else "terminal_unclassified"
-
-
-def persist_monitor_state(monitor: sqlite3.Row, result: MonitorResult, eligible: bool) -> None:
-    conn = db()
-    conn.execute(
-        """
-        update monitors
-        set last_checked_at = ?, last_in_stock = ?, last_price_cents = ?, failure_streak = 0, last_error = NULL
-        where id = ?
-        """,
-        (utc_now(), int(eligible), result.price_cents, monitor["id"]),
+        parsed_config = json.loads(config_raw) if config_raw else {}
+    except (TypeError, json.JSONDecodeError):
+        parsed_config = {}
+    payload["task_config"] = normalize_task_config_for_monitor(
+        parsed_config if isinstance(parsed_config, dict) else {},
     )
-    conn.commit()
-    conn.close()
+    return payload
 
-    if eligible:
-        enqueue_checkout_for_monitor(monitor, result)
-    create_event_and_deliver(monitor, result, eligible)
+
+def serialize_checkout_task_summary(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    return serialize_checkout_task(row)
+
+
+def redact_webhook_url(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 12:
+        return "***"
+    return f"{value[:8]}...{value[-4:]}"
+
+
+def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    payload["webhook_url"] = redact_webhook_url(payload.get("webhook_url") or "")
+    payload = redact_sensitive_payload(payload)
+    return payload
+def _classify_checkout_step_failure(step: str, exc: Exception, attempt_number: int) -> tuple[bool, str]:
+    policy = CHECKOUT_STEP_RETRY_POLICY[step]
+    if isinstance(exc, (ValueError, PermissionError)):
+        return False, "terminal_validation_error"
+    if attempt_number >= policy["max_attempts"]:
+        return False, "terminal_max_attempts_exceeded"
+    if isinstance(exc, (CheckoutRetryableError, requests.RequestException, TimeoutError, ConnectionError, sqlite3.OperationalError)):
+        return True, "retryable_exception"
+    return False, "terminal_unclassified"
+
+
+def _derive_status_signal(exc: Exception) -> str:
+    message = str(exc).strip().lower()
+    if "datadome" in message:
+        return "antibot_datadome_challenge"
+    if "incapsula" in message:
+        return "antibot_incapsula_challenge"
+    if "queue_reentry" in message or "session_ip_change" in message:
+        return "queue_reentry_session_or_ip_change"
+    if "decline" in message or "payment_declined" in message:
+        return "decline"
+    return "generic_failure"
+
+
+def _failure_class_from_signal(signal: str, retryable: bool) -> str:
+    if signal.startswith("antibot_") or signal == "queue_reentry_session_or_ip_change":
+        return "antibot"
+    if signal == "decline":
+        return "decline"
+    if retryable:
+        return "network"
+    return "other"
+
+
+def _status_hint_for_signal(signal: str) -> str | None:
+    if signal.startswith("antibot_"):
+        return "likely proxy reputation issue"
+    if signal == "queue_reentry_session_or_ip_change":
+        return "session expired, task requeued"
+    return None
+
+
+def _compute_retry_preset(
+    *,
+    step: str,
+    failure_class: str,
+    task_config: dict[str, Any],
+) -> dict[str, float | int]:
+    step_policy = CHECKOUT_STEP_RETRY_POLICY[step]
+    preset = dict(CHECKOUT_RETRY_PRESETS.get(failure_class, CHECKOUT_RETRY_PRESETS["other"]))
+    max_attempts = min(int(step_policy["max_attempts"]), int(preset["max_attempts"]))
+    group_limits = task_config.get("group_limits") if isinstance(task_config.get("group_limits"), dict) else {}
+    group_max = _coerce_optional_int(group_limits.get("max_retries"))
+    if group_max is not None and group_max > 0:
+        max_attempts = min(max_attempts, group_max)
+    return {"max_attempts": max(1, max_attempts), "base_backoff_seconds": float(preset["base_backoff_seconds"])}
+
+
+def _checkout_step_monitoring(
+    _conn: sqlite3.Connection,
+    _task: sqlite3.Row,
+    monitor: sqlite3.Row | None,
+    _config: dict[str, Any],
+    _attempt_number: int,
+) -> None:
+    if monitor is None:
+        raise ValueError("monitor_missing")
+
+
+def _checkout_step_carting(
+    _conn: sqlite3.Connection,
+    _task: sqlite3.Row,
+    _monitor: sqlite3.Row | None,
+    _config: dict[str, Any],
+    _attempt_number: int,
+) -> None:
+    return None
 
 
 def run_monitor_pipeline_once(monitor: sqlite3.Row) -> dict[str, Any]:
@@ -2137,13 +4047,25 @@ class SQLiteJobQueue:
         ).fetchone()
         if exists:
             return
-        payload = json.dumps({"step_attempts": {}})
+        enqueue_jitter = random.uniform(0.0, max(QUEUE_ENQUEUE_JITTER_SECONDS, 0.0))
+        scheduled_ts = now_ts + enqueue_jitter
+        scheduled_iso = datetime.fromtimestamp(scheduled_ts, tz=timezone.utc).isoformat()
+        payload = json.dumps(
+            {
+                "step_attempts": {},
+                "pacing": {
+                    "enqueue_jitter_ms": int(enqueue_jitter * 1000),
+                    "scheduled_from_iso": now_iso,
+                    "scheduled_for_iso": scheduled_iso,
+                },
+            }
+        )
         self.conn.execute(
             """
             insert into jobs(job_type, monitor_id, status, attempt_count, next_run_at, payload_json, created_at, updated_at)
             values ('monitor_check', ?, 'queued', 0, ?, ?, ?, ?)
             """,
-            (monitor["id"], now_iso, payload, now_iso, now_iso),
+            (monitor["id"], scheduled_iso, payload, now_iso, now_iso),
         )
 
     def claim_due_job(self, *, now_iso: str) -> Job | None:
@@ -2280,7 +4202,7 @@ def execute_monitor_job(queue: SQLiteJobQueue, job: Job, *, now_iso: str) -> Non
         )
         return
     try:
-        emit_monitor_events(monitor, result, eligible)
+        process_post_persist_actions(monitor, result, eligible, strict=True)
         log(
             f"Checked monitor {monitor['id']} | {monitor['retailer']} | {result.status_text} | {cents_to_dollars(result.price_cents)}",
             workspace_id=monitor["workspace_id"],
@@ -2313,6 +4235,157 @@ def execute_monitor_job(queue: SQLiteJobQueue, job: Job, *, now_iso: str) -> Non
         )
 
 
+def _active_checkout_states() -> tuple[str, ...]:
+    return tuple(sorted(CHECKOUT_ACTIVE_STATES))
+
+
+def _release_proxy_lock_if_owned(conn: sqlite3.Connection, account_id: int) -> None:
+    conn.execute(
+        """
+        update retailer_accounts
+        set proxy_lock_state = 'unlocked',
+            proxy_lock_owner = null,
+            proxy_lock_acquired_at = null,
+            updated_at = ?
+        where id = ?
+        """,
+        (utc_now(), account_id),
+    )
+
+
+def _try_acquire_proxy_lock(conn: sqlite3.Connection, account: sqlite3.Row, *, now_iso: str) -> bool:
+    proxy_url = (account["proxy_url"] or "").strip()
+    if not proxy_url:
+        conn.execute(
+            """
+            update retailer_accounts
+            set proxy_lock_state = 'unlocked',
+                proxy_lock_owner = null,
+                proxy_lock_acquired_at = null,
+                updated_at = ?
+            where id = ?
+            """,
+            (now_iso, account["id"]),
+        )
+        return True
+    lock_owner = f"account:{account['id']}"
+    conflict = conn.execute(
+        """
+        select id
+        from retailer_accounts
+        where workspace_id = ?
+          and proxy_url = ?
+          and id != ?
+          and proxy_lock_state = 'locked'
+        limit 1
+        """,
+        (account["workspace_id"], proxy_url, account["id"]),
+    ).fetchone()
+    if conflict:
+        return False
+    conn.execute(
+        """
+        update retailer_accounts
+        set proxy_lock_state = 'locked',
+            proxy_lock_owner = ?,
+            proxy_lock_acquired_at = coalesce(proxy_lock_acquired_at, ?),
+            last_used_at = ?,
+            updated_at = ?
+        where id = ?
+        """,
+        (lock_owner, now_iso, now_iso, now_iso, account["id"]),
+    )
+    return True
+
+
+def _deterministic_account_delay_seconds(account_id: int) -> int:
+    floor = min(ACCOUNT_START_DELAY_MIN_SECONDS, ACCOUNT_START_DELAY_MAX_SECONDS)
+    ceiling = max(ACCOUNT_START_DELAY_MIN_SECONDS, ACCOUNT_START_DELAY_MAX_SECONDS)
+    if floor == ceiling:
+        return floor
+    span = ceiling - floor + 1
+    bucket = int(datetime.now(timezone.utc).timestamp() // 60)
+    digest = hashlib.sha256(f"{account_id}:{bucket}".encode("utf-8")).hexdigest()
+    return floor + (int(digest[:8], 16) % span)
+
+
+def run_checkout_account_scheduler(conn: sqlite3.Connection, *, now_iso: str) -> None:
+    rows = conn.execute(
+        """
+        select
+            a.*,
+            t.id as task_id,
+            t.current_state as task_state,
+            t.created_at as task_created_at
+        from retailer_accounts a
+        left join task_profile_bindings b
+          on b.workspace_id = a.workspace_id
+         and b.retailer_account_id = a.id
+        left join checkout_tasks t
+          on t.workspace_id = a.workspace_id
+         and t.monitor_id = b.monitor_id
+         and t.is_paused = 0
+         and t.current_state in ('starting', 'waiting_for_queue', 'solving_hcaptcha', 'in_queue', 'passed_queue', 'waiting_for_monitor_input', 'monitoring_product', 'adding_to_cart', 'checking_out', 'requeued')
+        order by a.id asc, t.id asc
+        """
+    ).fetchall()
+    if not rows:
+        return
+    by_account: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        payload = by_account.setdefault(
+            row["id"],
+            {"account": row, "tasks": []},
+        )
+        if row["task_id"] is not None:
+            payload["tasks"].append(row)
+
+    for account_id, payload in by_account.items():
+        account = payload["account"]
+        tasks = payload["tasks"]
+        if not tasks:
+            _release_proxy_lock_if_owned(conn, account_id)
+            continue
+
+        lock_ok = _try_acquire_proxy_lock(conn, account, now_iso=now_iso)
+        if not lock_ok:
+            continue
+        active_now = next((t for t in tasks if t["task_state"] != "queued"), None)
+        if active_now:
+            continue
+
+        next_start_after = account["next_start_after"]
+        if next_start_after:
+            try:
+                if datetime.fromisoformat(next_start_after) > datetime.fromisoformat(now_iso):
+                    continue
+            except ValueError:
+                pass
+        next_task = tasks[0]
+        transition_checkout_task(
+            conn,
+            task_id=next_task["task_id"],
+            workspace_id=account["workspace_id"],
+            requested_state="monitoring",
+            reason="account_scheduler_start",
+        )
+        delay_seconds = _deterministic_account_delay_seconds(account_id)
+        next_start_ts = datetime.now(timezone.utc).timestamp() + delay_seconds
+        conn.execute(
+            """
+            update retailer_accounts
+            set next_start_after = ?, last_used_at = ?, updated_at = ?
+            where id = ?
+            """,
+            (
+                datetime.fromtimestamp(next_start_ts, tz=timezone.utc).isoformat(),
+                now_iso,
+                now_iso,
+                account_id,
+            ),
+        )
+
+
 def worker_loop() -> None:
     log(f"Worker loop started ({WORKER_ID})")
     while worker_running:
@@ -2320,136 +4393,37 @@ def worker_loop() -> None:
             conn = db()
             now_iso = utc_now()
             queue = SQLiteJobQueue(conn, worker_id=WORKER_ID)
+            run_checkout_account_scheduler(conn, now_iso=now_iso)
             apply_due_schedules(conn)
             monitors = conn.execute("select * from monitors where enabled = 1").fetchall()
             for monitor in monitors:
                 queue.enqueue_monitor_check_if_due(monitor, now_iso=now_iso)
             job = queue.claim_due_job(now_iso=now_iso)
             if job:
-                execute_monitor_job(queue, job, now_iso=now_iso)
+                if job.job_type == "monitor_check":
+                    execute_monitor_job(queue, job, now_iso=now_iso)
+                elif job.job_type == "discord_ingest_event":
+                    process_discord_alert_job(queue, job, now_iso=now_iso)
+                else:
+                    queue.fail_job(
+                        job.id,
+                        now_iso=now_iso,
+                        status="failed",
+                        next_run_at=now_iso,
+                        payload_json=job.payload_json or "{}",
+                        error_text=f"unsupported_job_type:{job.job_type}",
+                    )
             conn.commit()
             conn.close()
         if not job:
             time.sleep(WORKER_IDLE_SLEEP_SECONDS)
-    log(f"Worker loop stopped ({WORKER_ID})")
-
-
-def run_task_worker(task_id: int, workspace_id: int, stop_event: threading.Event) -> None:
-    steps = ["session_init", "profile_submit", "account_submit", "payment_submit"]
-    max_attempts = 4
-    try:
-        for attempt_number in range(1, max_attempts + 1):
-            if stop_event.is_set():
-                break
-
-            conn = db()
-            set_task_state(
-                conn,
-                task_id,
-                state="running",
-                retries=attempt_number - 1,
-                last_step="session_init",
-                last_error=None,
-                started_at=utc_now(),
-                stopped_at=None,
-            )
-            conn.commit()
-            conn.close()
-            emit_task_update(task_id)
-            log(f"Task {task_id}: started attempt {attempt_number}", workspace_id=workspace_id)
-
-            attempt_failed = False
-            attempt_error = None
-            for step in steps:
-                if stop_event.is_set():
-                    break
-                conn = db()
-                set_task_state(conn, task_id, state="running", retries=attempt_number - 1, last_step=step, last_error=None)
-                conn.commit()
-                conn.close()
-                emit_task_update(task_id)
-                time.sleep(TASK_STEP_DELAY_SECONDS)
-
-            if stop_event.is_set():
-                break
-
-            if attempt_number < 3:
-                attempt_failed = True
-                attempt_error = f"Transient checkout failure at attempt {attempt_number}"
-
-            conn = db()
-            if attempt_failed:
-                set_task_state(
-                    conn,
-                    task_id,
-                    state="retrying",
-                    retries=attempt_number,
-                    last_step="retry_backoff",
-                    last_error=attempt_error,
-                )
-                attempt_id = insert_task_attempt(
-                    conn,
-                    task_id=task_id,
-                    workspace_id=workspace_id,
-                    attempt_number=attempt_number,
-                    state="failed",
-                    step="payment_submit",
-                    error=attempt_error,
-                )
-                conn.commit()
-                conn.close()
-                emit_task_attempt(task_id, attempt_id)
-                emit_task_update(task_id)
-                log(f"Task {task_id}: attempt {attempt_number} failed ({attempt_error})", level="warning", workspace_id=workspace_id)
-                time.sleep(TASK_STEP_DELAY_SECONDS)
-                continue
-
-            set_task_state(
-                conn,
-                task_id,
-                state="completed",
-                retries=attempt_number - 1,
-                last_step="completed",
-                last_error=None,
-            )
-            attempt_id = insert_task_attempt(
-                conn,
-                task_id=task_id,
-                workspace_id=workspace_id,
-                attempt_number=attempt_number,
-                state="success",
-                step="completed",
-                error=None,
-            )
-            conn.commit()
-            conn.close()
-            emit_task_attempt(task_id, attempt_id)
-            emit_task_update(task_id)
-            log(f"Task {task_id}: completed successfully on attempt {attempt_number}", workspace_id=workspace_id)
-            return
-
-        conn = db()
-        stop_reason = "stopped" if stop_event.is_set() else "failed"
-        stop_error = None if stop_event.is_set() else "Max retries exhausted"
-        set_task_state(
-            conn,
-            task_id,
-            state=stop_reason,
-            last_step="stopped" if stop_event.is_set() else "failed",
-            last_error=stop_error,
-            stopped_at=utc_now() if stop_event.is_set() else None,
-        )
-        conn.commit()
-        conn.close()
-        emit_task_update(task_id)
-        if stop_event.is_set():
-            log(f"Task {task_id}: stopped", workspace_id=workspace_id)
+            idle_jitter = random.uniform(0.0, max(WORKER_IDLE_SLEEP_JITTER_SECONDS, 0.0))
+            time.sleep(WORKER_IDLE_SLEEP_SECONDS + idle_jitter)
         else:
-            log(f"Task {task_id}: max retries exhausted", level="error", workspace_id=workspace_id)
-    finally:
-        with task_runtime_lock:
-            task_threads.pop(task_id, None)
-            task_stop_events.pop(task_id, None)
+            active_jitter = random.uniform(0.0, max(WORKER_ACTIVE_JITTER_SECONDS, 0.0))
+            if active_jitter > 0:
+                time.sleep(active_jitter)
+    log(f"Worker loop stopped ({WORKER_ID})")
 
 
 @app.route("/")
@@ -2832,50 +4806,114 @@ def api_dashboard_summary():
     )
 
 
-@app.get("/api/ops/metrics")
+@app.get("/api/dashboard/commerce")
 @require_auth
-def api_ops_metrics():
-    role_error = ensure_workspace_role("owner", "admin")
-    if role_error:
-        return role_error
+def api_dashboard_commerce():
     workspace_id = get_workspace_id_for_request()
     conn = db()
-    metrics = {
-        "checks_total": conn.execute(
-            "select count(*) as c from monitors where workspace_id = ? and last_checked_at is not null",
-            (workspace_id,),
-        ).fetchone()["c"],
-        "checks_failed_total": conn.execute(
-            "select count(*) as c from monitors where workspace_id = ? and failure_streak > 0",
-            (workspace_id,),
-        ).fetchone()["c"],
-        "alerts_created_total": conn.execute(
-            """
-            select count(*) as c from events e
-            join monitors m on m.id = e.monitor_id
-            where m.workspace_id = ?
-            """,
-            (workspace_id,),
-        ).fetchone()["c"],
-        "webhook_sent_total": conn.execute(
-            """
-            select count(*) as c from deliveries d
-            join webhooks w on w.id = d.webhook_id
-            where w.workspace_id = ? and d.status = 'sent'
-            """,
-            (workspace_id,),
-        ).fetchone()["c"],
-        "webhook_failed_total": conn.execute(
-            """
-            select count(*) as c from deliveries d
-            join webhooks w on w.id = d.webhook_id
-            where w.workspace_id = ? and d.status = 'failed'
-            """,
-            (workspace_id,),
-        ).fetchone()["c"],
-    }
+    rows = conn.execute(
+        """
+        select
+            ct.id as checkout_task_id,
+            ct.task_name,
+            ct.task_config,
+            ct.current_state,
+            ct.updated_at,
+            m.retailer,
+            m.product_url,
+            m.last_price_cents
+        from checkout_tasks ct
+        join monitors m on m.id = ct.monitor_id
+        where ct.workspace_id = ?
+        order by datetime(ct.updated_at) desc, ct.id desc
+        """,
+        (workspace_id,),
+    ).fetchall()
     conn.close()
-    return jsonify(metrics)
+
+    successful = [row for row in rows if str(row["current_state"] or "").strip().lower() == "success"]
+    declines = [row for row in rows if str(row["current_state"] or "").strip().lower() == "decline"]
+
+    spent_total_cents = sum(int(row["last_price_cents"] or 0) for row in successful)
+    checkout_count = len(successful)
+    average_order_value_cents = 0 if checkout_count == 0 else int(round(spent_total_cents / checkout_count))
+    success_rate = 0.0 if (checkout_count + decline_count) == 0 else checkout_count / (checkout_count + decline_count)
+
+    return jsonify(
+        {
+            "checkout_count": checkout_count,
+            "decline_count": len(declines),
+            "spent_total_cents": spent_total_cents,
+            "average_order_value_cents": average_order_value_cents,
+            "recent_tasks": [
+                {
+                    "checkout_task_id": row["checkout_task_id"],
+                    "task_name": row["task_name"],
+                    "current_state": row["current_state"],
+                    "updated_at": row["updated_at"],
+                    "retailer": row["retailer"],
+                    "product_url": row["product_url"],
+                    "last_price_cents": row["last_price_cents"],
+                }
+                for row in rows[:25]
+            ],
+        }
+    )
+
+
+@app.post("/api/billing/stripe/webhook")
+def api_billing_stripe_webhook():
+    return _handle_stripe_webhook_request()
+
+
+@app.post("/api/stripe/webhook")
+def api_stripe_webhook():
+    return _handle_stripe_webhook_request()
+
+
+@app.get("/api/workspace/usage-limits")
+@require_auth
+def api_workspace_usage_limits():
+    workspace_id = get_workspace_id_for_request()
+    workspace = get_workspace(workspace_id)
+    limits = PLAN_LIMITS[workspace["plan"]]
+    conn = db()
+    usage = conn.execute(
+        """
+        select count(*) as monitor_count, min(poll_interval_seconds) as min_poll_interval_seconds
+        from monitors
+        where workspace_id = ?
+        """,
+        (workspace_id,),
+    ).fetchone()
+    conn.close()
+
+    monitor_count = int(usage["monitor_count"] or 0)
+    min_poll_interval_seconds = usage["min_poll_interval_seconds"]
+    monitor_slots_remaining = max(0, limits["max_monitors"] - monitor_count)
+
+    return jsonify(
+        {
+            "plan": workspace["plan"],
+            "usage": {
+                "monitor_count": monitor_count,
+                "min_poll_interval_seconds": min_poll_interval_seconds,
+            },
+            "limits": {
+                "max_monitors": limits["max_monitors"],
+                "min_poll_seconds": limits["min_poll_seconds"],
+            },
+            "derived": {
+                "monitor_slots_remaining": monitor_slots_remaining,
+                "monitor_limit_reached": monitor_count >= limits["max_monitors"],
+                "poll_minimum_satisfied": (
+                    True
+                    if min_poll_interval_seconds is None
+                    else min_poll_interval_seconds >= limits["min_poll_seconds"]
+                ),
+            },
+        }
+    )
 
 
 @app.get("/api/ops/monitor-failure-trends")
@@ -2938,7 +4976,9 @@ def api_create_monitor():
     body = request.json or {}
     try:
         retailer = canonical_retailer(body["retailer"])
+        category = (body.get("category") or "pokemon").strip().lower()
         url = body["product_url"].strip()
+        normalized_products: list[dict[str, Any]] | None = None
         poll_interval = int(body.get("poll_interval_seconds", 20))
         keyword = (body.get("keyword") or "").strip() or None
         max_price_cents = body.get("max_price_cents")
@@ -2947,28 +4987,55 @@ def api_create_monitor():
         msrp_cents = body.get("msrp_cents")
         if msrp_cents is not None:
             msrp_cents = int(msrp_cents)
+        proxy_url = (body.get("proxy_url") or "").strip() or None
+        session_task_key = (body.get("session_task_key") or "").strip() or None
+        session_metadata = _validate_json_object(body.get("session_metadata"), field_name="session_metadata")
+        behavior_metadata = _validate_behavior_policy(body.get("behavior_metadata"))
         if retailer not in SUPPORTED_RETAILERS:
             raise ValueError(f"Unsupported retailer '{retailer}'")
-        if not (url.startswith("http://") or url.startswith("https://")):
+        if category not in SUPPORTED_MONITOR_CATEGORIES:
+            raise ValueError(f"Unsupported category '{category}'")
+        if category not in RETAILER_CATEGORY_SUPPORT.get(retailer, set()):
+            raise ValueError(f"Retailer '{retailer}' does not support category '{category}'")
+        if retailer == "pokemoncenter":
+            url, normalized_products = _resolve_monitor_input(url)
+            if url == "placeholder":
+                raise ValueError("placeholder is not allowed when creating monitors")
+        elif not (url.startswith("http://") or url.startswith("https://")):
             raise ValueError("product_url must be http(s)")
+        if session_task_key and len(session_task_key) > 80:
+            raise ValueError("session_task_key must be <= 80 chars")
 
         enforce_plan_limits(current_workspace_id(), poll_interval)
-    except (KeyError, ValueError) as exc:
+    except (KeyError, ValueError, MonitorInputValidationError) as exc:
         return jsonify({"error": str(exc)}), 400
 
     conn = db()
     cur = conn.execute(
         """
-        insert into monitors(workspace_id, retailer, product_url, keyword, max_price_cents, msrp_cents, poll_interval_seconds, created_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?)
+        insert into monitors(workspace_id, retailer, category, product_url, keyword, max_price_cents, msrp_cents, poll_interval_seconds, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (current_workspace_id(), retailer, url, keyword, max_price_cents, msrp_cents, poll_interval, utc_now()),
+        (
+            current_workspace_id(),
+            retailer,
+            category,
+            url,
+            keyword,
+            max_price_cents,
+            msrp_cents,
+            poll_interval,
+            utc_now(),
+        ),
     )
     conn.commit()
     monitor_id = cur.lastrowid
     row = conn.execute("select * from monitors where id = ?", (monitor_id,)).fetchone()
     conn.close()
-    return jsonify(dict(row)), 201
+    payload = dict(row)
+    if normalized_products is not None:
+        payload["products"] = normalized_products
+    return jsonify(payload), 201
 
 
 @app.patch("/api/monitors/<int:monitor_id>")
@@ -3007,142 +5074,91 @@ def api_delete_monitor(monitor_id: int):
     conn.execute("delete from monitors where id = ? and workspace_id = ?", (monitor_id, workspace_id))
     conn.commit()
     conn.close()
-    return jsonify({"ok": True})
+    assert challenge is not None
+    emit_captcha_challenge_update(challenge)
+    return jsonify(serialize_challenge(challenge)), 201
 
 
-@app.post("/api/monitors/<int:monitor_id>/check")
+@app.post("/api/checkout/captcha-challenges/<int:challenge_id>/manual-solve")
 @require_auth
-def api_check_monitor(monitor_id: int):
-    workspace_id = get_workspace_id_for_request()
+def api_submit_manual_captcha_solution(challenge_id: int):
+    body = request.json or {}
+    solved_token = (body.get("solved_token") or "").strip()
+    if not solved_token:
+        return jsonify({"error": "solved_token is required"}), 400
+
     conn = db()
     row = get_monitor_for_workspace(conn, monitor_id, workspace_id)
     conn.close()
     if not row:
-        return jsonify({"error": "Monitor not found"}), 404
-    return jsonify(check_monitor_once(row))
-
-
-@app.post("/api/checkout/tasks")
-@require_auth
-def api_create_checkout_task():
-    body = request.json or {}
-    monitor_id = body.get("monitor_id")
-    if monitor_id is None:
-        return jsonify({"error": "monitor_id is required"}), 400
-
-    workspace_id = current_workspace_id()
-    conn = db()
-    monitor = conn.execute(
-        "select * from monitors where id = ? and workspace_id = ?",
-        (int(monitor_id), workspace_id),
-    ).fetchone()
-    if not monitor:
         conn.close()
-        return jsonify({"error": "Monitor not found"}), 404
+        return jsonify({"error": "Captcha challenge not found"}), 404
+    checkout_captcha_service.mark_manual_solution(
+        conn,
+        challenge_id=challenge_id,
+        solved_token=solved_token,
+        operator_note=(body.get("operator_note") or "").strip() or None,
+    )
+    updated = conn.execute("select * from captcha_challenges where id = ?", (challenge_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    assert updated is not None
+    emit_captcha_challenge_update(updated)
+    return jsonify({"ok": True, "challenge": serialize_challenge(updated)})
 
-    initial_state = body.get("initial_state", "queued")
+
+@app.post("/api/checkout/captcha-challenges/<int:challenge_id>/handoff-token")
+@require_auth
+def api_issue_captcha_handoff_token(challenge_id: int):
+    body = request.json or {}
+    ttl_seconds = body.get("ttl_seconds", 90)
     try:
-        task = create_checkout_task(
-            conn,
-            workspace_id=workspace_id,
-            monitor_id=int(monitor_id),
-            task_name=(body.get("task_name") or "").strip() or None,
-            task_config=body.get("task_config") if isinstance(body.get("task_config"), dict) else None,
-            initial_state=initial_state,
-        )
+        ttl_seconds = int(ttl_seconds)
+    except (TypeError, ValueError):
+        return jsonify({"error": "ttl_seconds must be an integer"}), 400
+    if ttl_seconds <= 0:
+        return jsonify({"error": "ttl_seconds must be greater than 0"}), 400
+
+    conn = db()
+    row = conn.execute(
+        "select * from captcha_challenges where id = ? and workspace_id = ?",
+        (challenge_id, current_workspace_id()),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "Captcha challenge not found"}), 404
+    try:
+        token = checkout_captcha_service.issue_worker_handoff_token(conn, challenge_id=challenge_id)
     except ValueError as exc:
         conn.close()
         return jsonify({"error": str(exc)}), 400
-
+    updated = conn.execute("select * from captcha_challenges where id = ?", (challenge_id,)).fetchone()
     conn.commit()
     conn.close()
-    return jsonify(serialize_checkout_task(task)), 201
+    if updated:
+        emit_captcha_challenge_update(updated)
+    return jsonify({"ok": True, "challenge_id": challenge_id, "handoff_token": token})
 
 
-@app.post("/api/checkout/tasks/<int:task_id>/start")
+@app.post("/api/internal/checkout/captcha-handoffs/consume")
 @require_auth
-def api_start_checkout_task(task_id: int):
+def api_consume_captcha_handoff_token():
+    body = request.json or {}
+    token = (body.get("handoff_token") or "").strip()
+    if not token:
+        return jsonify({"error": "handoff_token is required"}), 400
     conn = db()
-    row = transition_checkout_task(
-        conn,
-        task_id=task_id,
-        workspace_id=current_workspace_id(),
-        requested_state="monitoring",
-        reason="api_start",
-    )
-    if not row:
+    try:
+        payload = checkout_captcha_service.consume_worker_handoff_token(conn, token=token)
+    except ValueError as exc:
         conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
+        return jsonify({"error": str(exc)}), 400
+    updated = conn.execute("select * from captcha_challenges where id = ?", (payload["challenge_id"],)).fetchone()
     conn.commit()
     conn.close()
-    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/pause")
-@require_auth
-def api_pause_checkout_task(task_id: int):
-    conn = db()
-    row = transition_checkout_task(
-        conn,
-        task_id=task_id,
-        workspace_id=current_workspace_id(),
-        requested_state="paused",
-        reason="api_pause",
-    )
-    if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
-
-
-@app.post("/api/checkout/tasks/<int:task_id>/stop")
-@require_auth
-def api_stop_checkout_task(task_id: int):
-    conn = db()
-    row = transition_checkout_task(
-        conn,
-        task_id=task_id,
-        workspace_id=current_workspace_id(),
-        requested_state="stopped",
-        reason="api_stop",
-    )
-    if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
-
-
-@app.get("/api/checkout/tasks/<int:task_id>/state")
-@require_auth
-def api_checkout_task_state(task_id: int):
-    conn = db()
-    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
-    if not row:
-        conn.close()
-        return jsonify({"error": "Checkout task not found"}), 404
-    last_attempt = conn.execute(
-        """
-        select * from checkout_attempts
-        where task_id = ?
-        order by id desc
-        limit 1
-        """,
-        (task_id,),
-    ).fetchone()
-    conn.close()
-    return jsonify(
-        {
-            "task_id": task_id,
-            "current_state": row["current_state"],
-            "last_error": row["last_error"],
-            "last_transition_at": row["last_transition_at"],
-            "last_attempt": dict(last_attempt) if last_attempt else None,
-        }
-    )
+    if updated:
+        emit_captcha_challenge_update(updated)
+    return jsonify({"ok": True, **payload})
 
 
 @app.get("/api/events")
@@ -3162,6 +5178,116 @@ def api_events():
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@app.get("/api/alert-subscriptions")
+@require_auth
+def api_list_alert_subscriptions():
+    conn = db()
+    rows = conn.execute(
+        "select * from alert_subscriptions where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(row) for row in rows])
+
+
+@app.post("/api/alert-subscriptions")
+@require_auth
+def api_create_alert_subscription():
+    body = request.get_json(force=True) or {}
+    guild_id = str(body.get("guild_id") or "").strip()
+    channel_id = str(body.get("channel_id") or "").strip()
+    source = str(body.get("source") or "discord").strip().lower() or "discord"
+    if not guild_id or not channel_id:
+        return jsonify({"error": "guild_id and channel_id are required"}), 400
+    now_iso = utc_now()
+    conn = db()
+    cur = conn.execute(
+        """
+        insert into alert_subscriptions(
+            workspace_id, guild_id, channel_id, source, source_name, retailer_filter,
+            url_patterns, sku_patterns, keyword_patterns, enabled, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            current_workspace_id(),
+            guild_id,
+            channel_id,
+            source,
+            body.get("source_name"),
+            body.get("retailer_filter"),
+            json.dumps(_json_list(body.get("url_patterns"))),
+            json.dumps(_json_list(body.get("sku_patterns"))),
+            json.dumps(_json_list(body.get("keyword_patterns"))),
+            int(bool(body.get("enabled", True))),
+            now_iso,
+            now_iso,
+        ),
+    )
+    row = conn.execute("select * from alert_subscriptions where id = ?", (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(dict(row)), 201
+
+
+@app.post("/api/alerts/discord/ingest")
+@require_auth
+def api_ingest_discord_alert():
+    body = request.get_json(force=True) or {}
+    subscription_id = int(body.get("subscription_id") or 0)
+    raw_event = body.get("event") if isinstance(body.get("event"), dict) else {}
+    if not subscription_id or not raw_event:
+        return jsonify({"error": "subscription_id and event object are required"}), 400
+    conn = db()
+    subscription = conn.execute(
+        "select * from alert_subscriptions where id = ? and workspace_id = ?",
+        (subscription_id, current_workspace_id()),
+    ).fetchone()
+    if not subscription:
+        conn.close()
+        return jsonify({"error": "subscription not found"}), 404
+    now_iso = utc_now()
+    cur = conn.execute(
+        """
+        insert into jobs(job_type, monitor_id, status, attempt_count, next_run_at, payload_json, created_at, updated_at)
+        values ('discord_ingest_event', null, 'queued', 0, ?, ?, ?, ?)
+        """,
+        (
+            now_iso,
+            json.dumps(
+                {
+                    "subscription_id": subscription_id,
+                    "source_name": subscription["source_name"] or subscription["source"],
+                    "raw_event": raw_event,
+                }
+            ),
+            now_iso,
+            now_iso,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "job_id": cur.lastrowid}), 202
+
+
+@app.get("/api/alerts/events")
+@require_auth
+def api_list_alert_events():
+    conn = db()
+    rows = conn.execute(
+        """
+        select ae.*, s.guild_id, s.channel_id, s.source_name
+        from alert_events ae
+        join alert_subscriptions s on s.id = ae.subscription_id
+        where ae.workspace_id = ?
+        order by ae.id desc
+        limit 200
+        """,
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(row) for row in rows])
 
 
 @app.post("/api/webhooks")
@@ -3249,6 +5375,7 @@ def api_test_webhook(webhook_id: int):
     started = time.perf_counter()
     conn = db()
     try:
+        target_url = resolve_webhook_url(conn, hook)
         req = perform_request(
             task_key=f"webhook-test-{webhook_id}",
             method="POST",
@@ -3264,8 +5391,6 @@ def api_test_webhook(webhook_id: int):
             raise req.error
         assert req.response is not None
         resp = req.response
-        webhook_target = resolve_webhook_url(conn, hook)
-        resp = requests.post(webhook_target, json=payload, timeout=8)
         ok = 200 <= resp.status_code < 300
         status = "sent" if ok else "failed"
         body = (resp.text or "")[:500]
@@ -3457,6 +5582,7 @@ def api_create_account():
         credential_ref = (body.get("encrypted_credential_ref") or "").strip()
         if not credential_ref:
             raise ValueError("encrypted_credential_ref is required")
+        proxy_url = (body.get("proxy_url") or "").strip() or None
         session_status = (body.get("session_status") or "logged_out").strip().lower()
         if session_status not in SESSION_STATUSES:
             raise ValueError("Invalid session_status")
@@ -3468,10 +5594,10 @@ def api_create_account():
     cur = conn.execute(
         """
         insert into retailer_accounts(
-            workspace_id, retailer, username, email, encrypted_credential_ref, session_status, created_at, updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?)
+            workspace_id, retailer, username, email, encrypted_credential_ref, proxy_url, session_status, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (current_workspace_id(), retailer, username, email, credential_ref, session_status, now_iso, now_iso),
+        (current_workspace_id(), retailer, username, email, credential_ref, proxy_url, session_status, now_iso, now_iso),
     )
     conn.commit()
     row = conn.execute(
@@ -3515,6 +5641,8 @@ def api_update_account(account_id: int):
             if not credential_ref:
                 raise ValueError("encrypted_credential_ref cannot be empty")
             fields.append(("encrypted_credential_ref", credential_ref))
+        if "proxy_url" in body:
+            fields.append(("proxy_url", (body.get("proxy_url") or "").strip() or None))
         if "session_status" in body:
             session_status = (body.get("session_status") or "").strip().lower()
             if session_status not in SESSION_STATUSES:
@@ -3555,6 +5683,159 @@ def api_delete_account(account_id: int):
     if cur.rowcount == 0:
         return jsonify({"error": "Account not found"}), 404
     return jsonify({"ok": True})
+
+
+@app.post("/api/task-profile-bindings")
+@require_auth
+def api_upsert_task_profile_binding():
+    body = request.json or {}
+    try:
+        monitor_id = int(body.get("monitor_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "monitor_id is required"}), 400
+    workspace_id = current_workspace_id()
+    checkout_profile_id = body.get("checkout_profile_id")
+    payment_method_id = body.get("payment_method_id")
+    retailer_account_id = body.get("retailer_account_id")
+    if retailer_account_id is None:
+        return jsonify({"error": "retailer_account_id is required for checkout-capable task bindings"}), 400
+    try:
+        retailer_account_id = int(retailer_account_id)
+        checkout_profile_id = int(checkout_profile_id) if checkout_profile_id is not None else None
+        payment_method_id = int(payment_method_id) if payment_method_id is not None else None
+    except ValueError:
+        return jsonify({"error": "Invalid numeric identifier in binding payload"}), 400
+
+    now_iso = utc_now()
+    conn = db()
+    monitor = conn.execute(
+        "select id from monitors where id = ? and workspace_id = ?",
+        (monitor_id, workspace_id),
+    ).fetchone()
+    if not monitor:
+        conn.close()
+        return jsonify({"error": "Monitor not found"}), 404
+    account = conn.execute(
+        "select id from retailer_accounts where id = ? and workspace_id = ?",
+        (retailer_account_id, workspace_id),
+    ).fetchone()
+    if not account:
+        conn.close()
+        return jsonify({"error": "retailer_account_id not found"}), 400
+    if checkout_profile_id is not None:
+        profile = conn.execute(
+            "select id from checkout_profiles where id = ? and workspace_id = ?",
+            (checkout_profile_id, workspace_id),
+        ).fetchone()
+        if not profile:
+            conn.close()
+            return jsonify({"error": "checkout_profile_id not found"}), 400
+    if payment_method_id is not None:
+        payment = conn.execute(
+            "select id from payment_methods where id = ? and workspace_id = ?",
+            (payment_method_id, workspace_id),
+        ).fetchone()
+        if not payment:
+            conn.close()
+            return jsonify({"error": "payment_method_id not found"}), 400
+    conn.execute(
+        """
+        insert into task_profile_bindings(
+            workspace_id, monitor_id, checkout_profile_id, retailer_account_id, payment_method_id, created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?)
+        on conflict(workspace_id, monitor_id) do update set
+            checkout_profile_id = excluded.checkout_profile_id,
+            retailer_account_id = excluded.retailer_account_id,
+            payment_method_id = excluded.payment_method_id,
+            updated_at = excluded.updated_at
+        """,
+        (workspace_id, monitor_id, checkout_profile_id, retailer_account_id, payment_method_id, now_iso, now_iso),
+    )
+    conn.commit()
+    row = conn.execute(
+        "select * from task_profile_bindings where workspace_id = ? and monitor_id = ?",
+        (workspace_id, monitor_id),
+    ).fetchone()
+    conn.close()
+    return jsonify(serialize_task_profile_binding(row)), 201
+
+
+@app.get("/api/task-profile-bindings")
+@require_auth
+def api_list_task_profile_bindings():
+    conn = db()
+    rows = conn.execute(
+        "select * from task_profile_bindings where workspace_id = ? order by id desc",
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_task_profile_binding(r) for r in rows])
+
+
+def _account_execution_read_model(conn: sqlite3.Connection, workspace_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        select
+            a.*,
+            count(t.id) as queue_depth,
+            min(case when t.current_state != 'idle' then t.id end) as active_task_id,
+            min(case when t.current_state != 'idle' then t.current_state end) as active_task_state
+        from retailer_accounts a
+        left join task_profile_bindings b
+          on b.workspace_id = a.workspace_id
+         and b.retailer_account_id = a.id
+        left join checkout_tasks t
+          on t.workspace_id = a.workspace_id
+         and t.monitor_id = b.monitor_id
+         and t.is_paused = 0
+         and t.current_state in ('starting', 'waiting_for_queue', 'solving_hcaptcha', 'in_queue', 'passed_queue', 'waiting_for_monitor_input', 'monitoring_product', 'adding_to_cart', 'checking_out', 'requeued')
+        where a.workspace_id = ?
+        group by a.id
+        order by a.id asc
+        """,
+        (workspace_id,),
+    ).fetchall()
+    payload: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        queue_depth = int(item["queue_depth"] or 0)
+        if queue_depth == 0:
+            execution_status = "idle"
+        elif item["proxy_lock_state"] == "locked":
+            execution_status = "running" if item["active_task_id"] else "queued_waiting_for_stagger"
+        else:
+            execution_status = "queued_waiting_for_proxy"
+        item["execution_status"] = execution_status
+        payload.append(item)
+    return payload
+
+
+@app.get("/api/accounts/execution")
+@require_auth
+def api_account_execution_status():
+    workspace_id = current_workspace_id()
+    conn = db()
+    payload = _account_execution_read_model(conn, workspace_id)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.get("/api/accounts/proxy-locks")
+@require_auth
+def api_account_proxy_locks():
+    workspace_id = current_workspace_id()
+    conn = db()
+    rows = conn.execute(
+        """
+        select id as account_id, retailer, proxy_url, proxy_lock_state, proxy_lock_owner, proxy_lock_acquired_at, last_used_at
+        from retailer_accounts
+        where workspace_id = ?
+        order by id asc
+        """,
+        (workspace_id,),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
 
 
 @app.post("/api/payments")
@@ -3815,9 +6096,10 @@ if __name__ == "__main__":
     init_db()
     validate_startup_configuration()
     log(
-        "Legal/ethical note: this project provides stock monitoring + alerts only. Auto-checkout is intentionally not implemented.",
+        "Legal/ethical note: this project provides stock monitoring + alerts and an experimental checkout workflow.",
         level="warning",
     )
+    listen_port = int(os.getenv("PORT", "5000"))
     if APP_ROLE == "worker":
         worker_running = True
         worker_loop()
@@ -3826,6 +6108,6 @@ if __name__ == "__main__":
             worker_running = True
             worker_thread = threading.Thread(target=worker_loop, daemon=True)
             worker_thread.start()
-        socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
+        socketio.run(app, host="0.0.0.0", port=listen_port, allow_unsafe_werkzeug=True)
     else:
-        socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
+        socketio.run(app, host="0.0.0.0", port=listen_port, allow_unsafe_werkzeug=True)

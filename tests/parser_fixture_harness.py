@@ -6,13 +6,20 @@ FIXTURES = Path(__file__).parent / "fixtures"
 REQUIRED_FIXTURE_NAMES = ("in_stock", "out_of_stock", "ambiguous")
 
 
-def fixture_case(retailer: str, fixture_name: str, expected_in_stock: bool, expected_status: str):
+def fixture_case(
+    retailer: str,
+    category: str,
+    fixture_name: str,
+    expected_in_stock: bool,
+    expected_status: str,
+):
     return pytest.param(
         retailer,
+        category,
         fixture_name,
         expected_in_stock,
         expected_status,
-        id=f"{retailer}:{fixture_name}",
+        id=f"{retailer}:{category}:{fixture_name}",
     )
 
 
