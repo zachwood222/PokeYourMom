@@ -120,6 +120,26 @@ Best practice: after a drop, filter to **Checkout Details** to identify where ti
     - plan mapping fields: `plan_code`, `plan_interval`, `plan_lookup_key`
     - `created_at`, `updated_at`
 
+
+## Secret encryption and key management
+
+Stored credentials in `account_secrets` are encrypted with Fernet (AEAD-style authenticated encryption) and include a `key_version` metadata field.
+
+Expected environment configuration:
+
+- `SECRET_ENCRYPTION_KEY_VERSION`: active key version used for all new writes (for example, `v2`).
+- `SECRET_ENCRYPTION_KEYS`: comma-separated version map such as `v1:<key>,v2:<key>`.
+- `SECRET_ENCRYPTION_KEY`: compatibility fallback for the active version when `SECRET_ENCRYPTION_KEYS` is not set.
+
+Rotation expectations:
+
+1. Add the new key/version to `SECRET_ENCRYPTION_KEYS`.
+2. Flip `SECRET_ENCRYPTION_KEY_VERSION` to the new version.
+3. Keep older versions configured until all secrets have been read at least once and transparently re-encrypted.
+4. Remove retired keys only after migration is complete and validated.
+
+Legacy ciphertext (pre-migration custom crypto) is still readable and is automatically re-encrypted into the active Fernet key/version on successful read.
+
 ## Runtime flow
 
 1. Operator adds monitors and webhooks in the dashboard.

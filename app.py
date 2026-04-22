@@ -13,6 +13,8 @@ import time
 import traceback
 import hashlib
 import hmac
+
+from cryptography.fernet import Fernet, InvalidToken
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from functools import wraps
@@ -89,14 +91,11 @@ APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
 RELEASE_CHANNEL = os.getenv("RELEASE_CHANNEL", "stable")
 CORRELATION_ID_HEADER = "X-Correlation-ID"
 _api_auth_token_raw = os.getenv("API_AUTH_TOKEN")
-API_AUTH_TOKEN = (
-    _api_auth_token_raw.strip()
-    if _api_auth_token_raw is not None
-    else ("dev-token" if IS_DEV_ENVIRONMENT else "")
-)
-SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY") or (
-    "local-dev-secret-key" if IS_DEV_ENVIRONMENT else ""
-)
+API_AUTH_TOKEN = _api_auth_token_raw.strip() if _api_auth_token_raw is not None else "dev-token"
+SECRET_ENCRYPTION_KEY = os.getenv("SECRET_ENCRYPTION_KEY", "local-dev-secret-key")
+SECRET_ENCRYPTION_KEY_VERSION = os.getenv("SECRET_ENCRYPTION_KEY_VERSION", "v1")
+SECRET_ENCRYPTION_KEYS_RAW = os.getenv("SECRET_ENCRYPTION_KEYS", "")
+LEGACY_SECRET_KEY_VERSION = "legacy-v0"
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_WEBHOOK_TOLERANCE_SECONDS = int(os.getenv("STRIPE_WEBHOOK_TOLERANCE_SECONDS", "300"))
 UPDATE_CHECK_URL = os.getenv("UPDATE_CHECK_URL", "")
@@ -363,16 +362,7 @@ def _encryption_keystream(secret_key: str, nonce: bytes, length: int) -> bytes:
     return bytes(stream[:length])
 
 
-def encrypt_secret_value(plaintext: str) -> str:
-    nonce = secrets.token_bytes(16)
-    payload = plaintext.encode("utf-8")
-    keystream = _encryption_keystream(SECRET_ENCRYPTION_KEY, nonce, len(payload))
-    cipher = bytes(a ^ b for a, b in zip(payload, keystream))
-    mac = hmac.new(SECRET_ENCRYPTION_KEY.encode("utf-8"), nonce + cipher, hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(nonce + cipher + mac).decode("ascii")
-
-
-def decrypt_secret_value(ciphertext: str) -> str:
+def _decrypt_legacy_secret_value(ciphertext: str) -> str:
     raw = base64.urlsafe_b64decode(ciphertext.encode("ascii"))
     if len(raw) < 48:
         raise ValueError("Invalid secret payload")
@@ -385,6 +375,94 @@ def decrypt_secret_value(ciphertext: str) -> str:
     keystream = _encryption_keystream(SECRET_ENCRYPTION_KEY, nonce, len(cipher))
     payload = bytes(a ^ b for a, b in zip(cipher, keystream))
     return payload.decode("utf-8")
+
+
+def _normalize_fernet_key(raw_key: str) -> bytes:
+    candidate = (raw_key or "").strip().encode("ascii")
+    try:
+        decoded = base64.urlsafe_b64decode(candidate)
+    except Exception:
+        decoded = b""
+    if len(decoded) == 32:
+        return candidate
+    digest = hashlib.sha256((raw_key or "").encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest)
+
+
+def _load_secret_encryption_keys() -> tuple[str, dict[str, Fernet]]:
+    keys: dict[str, bytes] = {}
+    for entry in (SECRET_ENCRYPTION_KEYS_RAW or "").split(","):
+        item = entry.strip()
+        if not item:
+            continue
+        if ":" in item:
+            version, key_value = item.split(":", 1)
+        elif "=" in item:
+            version, key_value = item.split("=", 1)
+        else:
+            continue
+        version = version.strip()
+        key_value = key_value.strip()
+        if version and key_value:
+            keys[version] = _normalize_fernet_key(key_value)
+
+    active_version = (SECRET_ENCRYPTION_KEY_VERSION or "v1").strip() or "v1"
+    if active_version not in keys:
+        keys[active_version] = _normalize_fernet_key(SECRET_ENCRYPTION_KEY)
+
+    return active_version, {version: Fernet(key) for version, key in keys.items()}
+
+
+ACTIVE_SECRET_KEY_VERSION, SECRET_FERNETS = _load_secret_encryption_keys()
+
+
+def encrypt_secret_value(plaintext: str) -> str:
+    return SECRET_FERNETS[ACTIVE_SECRET_KEY_VERSION].encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+
+def encrypt_secret_value_with_version(plaintext: str) -> tuple[str, str]:
+    return encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION
+
+
+def decrypt_secret_value(ciphertext: str, key_version: str | None = None) -> str:
+    if key_version == LEGACY_SECRET_KEY_VERSION:
+        return _decrypt_legacy_secret_value(ciphertext)
+
+    candidate_versions: list[str]
+    if key_version:
+        candidate_versions = [key_version]
+    else:
+        candidate_versions = list(SECRET_FERNETS.keys())
+
+    for version in candidate_versions:
+        fernet = SECRET_FERNETS.get(version)
+        if not fernet:
+            continue
+        try:
+            return fernet.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+        except (InvalidToken, ValueError):
+            continue
+
+    if key_version is None:
+        return _decrypt_legacy_secret_value(ciphertext)
+    raise ValueError("Secret decryption failed for configured key version")
+
+
+def decrypt_secret_value_with_details(ciphertext: str, key_version: str | None = None) -> tuple[str, str, bool]:
+    if key_version == LEGACY_SECRET_KEY_VERSION:
+        return decrypt_secret_value(ciphertext, key_version=key_version), LEGACY_SECRET_KEY_VERSION, True
+
+    if key_version:
+        return decrypt_secret_value(ciphertext, key_version=key_version), key_version, False
+
+    for version, fernet in SECRET_FERNETS.items():
+        try:
+            value = fernet.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+            return value, version, False
+        except (InvalidToken, ValueError):
+            continue
+
+    return _decrypt_legacy_secret_value(ciphertext), LEGACY_SECRET_KEY_VERSION, True
 
 
 SENSITIVE_FIELD_MARKERS = ("token", "secret", "password", "authorization", "webhook_url")
@@ -415,14 +493,14 @@ def create_secret(
     normalized_type = (secret_type or "").strip().lower()
     if not normalized_type:
         raise ValueError("secret_type is required")
-    ciphertext = encrypt_secret_value(plaintext)
+    ciphertext, key_version = encrypt_secret_value_with_version(plaintext)
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, normalized_type, ciphertext, now_iso, now_iso),
+        (workspace_id, user_id, normalized_type, ciphertext, key_version, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -442,7 +520,17 @@ def get_secret_plaintext(
         raise ValueError("Secret not found")
     if allowed_types and row["secret_type"] not in allowed_types:
         raise ValueError("Secret type not allowed")
-    return decrypt_secret_value(row["ciphertext"])
+    plaintext, resolved_version, should_migrate = decrypt_secret_value_with_details(
+        row["ciphertext"],
+        key_version=row["key_version"],
+    )
+    if should_migrate or resolved_version != ACTIVE_SECRET_KEY_VERSION:
+        migrated_ciphertext, migrated_version = encrypt_secret_value_with_version(plaintext)
+        conn.execute(
+            "update account_secrets set ciphertext = ?, key_version = ?, updated_at = ? where id = ?",
+            (migrated_ciphertext, migrated_version, utc_now(), row["id"]),
+        )
+    return plaintext
 
 
 def redact_webhook_url(url: str) -> str:
@@ -1311,6 +1399,7 @@ def init_db() -> None:
             user_id integer,
             secret_type text not null,
             ciphertext text not null,
+            key_version text,
             created_at text not null,
             updated_at text not null,
             foreign key(workspace_id) references workspaces(id),
@@ -1760,6 +1849,7 @@ def init_db() -> None:
     ensure_column(conn, "checkout_tasks", "status_timestamps_json", "text")
     ensure_column(conn, "captcha_harvesters", "notes", "text")
     ensure_column(conn, "captcha_harvesters", "last_tested_at", "text")
+    ensure_column(conn, "account_secrets", "key_version", "text")
     run_legacy_tasks_migration(conn)
     run_pokemon_center_task_group_config_migration(conn)
     conn.commit()
@@ -3286,10 +3376,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3337,10 +3427,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3388,10 +3478,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3439,10 +3529,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3501,10 +3591,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3534,10 +3624,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3567,10 +3657,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3600,10 +3690,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
@@ -3651,10 +3741,10 @@ def create_secret(
     now_iso = utc_now()
     cur = conn.execute(
         """
-        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?)
+        insert into account_secrets(workspace_id, user_id, secret_type, ciphertext, key_version, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
         """,
-        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), now_iso, now_iso),
+        (workspace_id, user_id, secret_type, encrypt_secret_value(plaintext), ACTIVE_SECRET_KEY_VERSION, now_iso, now_iso),
     )
     return int(cur.lastrowid)
 
