@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Stock Sentinel</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   {% if captcha_site_key %}<script src="{{ captcha_script_url }}" async defer></script>{% endif %}
   <style>
     :root {
@@ -13,6 +14,7 @@
       --surface: #10151f;
       --surface-soft: #151b27;
       --surface-border: #1d2634;
+      --radius-md: 10px;
       --text: #e9edf5;
       --muted: #8d9bb0;
       --accent: #5d7cff;
@@ -87,9 +89,9 @@
     .card {
       background: linear-gradient(180deg, rgba(19, 25, 36, 0.95), rgba(13, 17, 25, 0.95));
       border: 1px solid var(--surface-border);
-      border-radius: 12px;
-      padding: 14px;
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
+      border-radius: var(--radius-md);
+      padding: 12px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 4px 12px rgba(4, 8, 16, 0.24);
     }
 
     .header-card {
@@ -98,50 +100,106 @@
     }
 
     .section-title {
-      margin: 0 0 10px;
+      margin: 0 0 8px;
       font-size: 13px;
       text-transform: uppercase;
       letter-spacing: 0.1em;
-      color: #d4def1;
+      color: #dbe5f7;
+      background: linear-gradient(180deg, rgba(42, 54, 82, 0.35), rgba(30, 40, 62, 0.24));
+      border: 1px solid rgba(83, 105, 147, 0.55);
+      border-radius: var(--radius-md);
+      display: inline-flex;
+      align-items: center;
+      min-height: 26px;
+      padding: 0 10px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
     }
 
     .hero-title { margin: 0; font-size: 24px; }
-    .subtitle, .small { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+    .subtitle, .small { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
 
     .tab { display: none; }
     .tab.active { display: block; }
 
     .content { min-width: 0; }
     .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-    .kpi-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-    .kpi-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 8px; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .kpi-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 6px; }
     .kpi-value { font-size: 22px; font-weight: 700; }
     .status-value { color: var(--ok); font-size: 24px; font-weight: 700; letter-spacing: 0.05em; }
 
-    h1, h2, h3 { margin: 0 0 10px; }
+    h1, h2, h3 { margin: 0 0 8px; }
     h1 { font-size: 21px; }
     h2 { font-size: 16px; color: #e5ecf8; }
     h3 { font-size: 14px; color: #dce5f7; }
 
-    label { display: block; margin: 8px 0 4px; font-size: 12px; color: #9fb0c7; }
+    label { display: block; margin: 6px 0 4px; font-size: 12px; color: #9fb0c7; }
     input, select, button {
       width: 100%;
-      padding: 9px 10px;
-      border-radius: 8px;
+      padding: 8px 10px;
+      border-radius: var(--radius-md);
       border: 1px solid #233049;
       background: var(--surface-soft);
       color: var(--text);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
     }
     button { cursor: pointer; font-weight: 600; }
     button:hover { border-color: #4f689b; }
 
-    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .actions { display: flex; gap: 6px; flex-wrap: wrap; }
     .actions button { width: auto; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .quick-setup-steps {
+      margin: 0 0 10px;
+      padding-left: 20px;
+      color: #d8e2f4;
+      font-size: 13px;
+    }
+    .quick-setup-steps li { margin-bottom: 4px; }
+    .legacy-path {
+      opacity: 0.72;
+      border-style: dashed;
+    }
+    .legacy-path h2::after {
+      content: " (Legacy)";
+      color: var(--muted);
+      font-weight: 500;
+    }
+    details.quick-advanced {
+      margin-top: 10px;
+      border: 1px solid #27334d;
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #0f1728;
+    }
+    details.quick-advanced summary {
+      cursor: pointer;
+      color: #c8d5ec;
+      font-size: 12px;
+      user-select: none;
+    }
 
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { padding: 8px; border-bottom: 1px solid #222e44; text-align: left; }
+    th, td { padding: 7px 8px; border-bottom: 1px solid #222e44; text-align: left; }
     thead th { color: #b1bfd5; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .task-table-scroller { max-height: 560px; overflow: auto; border: 1px solid #222e44; border-radius: 10px; }
+    .task-table-scroller table { margin: 0; }
+    .task-table-scroller thead th { position: sticky; top: 0; background: #111827; z-index: 3; }
+    .task-table-scroller td { min-height: 48px; vertical-align: middle; }
+    .status-chip-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 10px; }
+    .status-chip {
+      width: auto;
+      padding: 5px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      text-transform: lowercase;
+      letter-spacing: 0.02em;
+    }
+    .status-chip.active { border-color: #4f689b; background: #1b2741; color: #eef2ff; }
+    .task-table-toolbar { display: grid; grid-template-columns: 1fr 200px; gap: 10px; align-items: center; }
+    .task-bulk-actions { margin: 10px 0; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .task-bulk-actions > * { width: auto; }
+    .task-checkbox-col { width: 36px; }
 
     .logs {
       height: 400px;
@@ -149,10 +207,11 @@
       white-space: pre-wrap;
       background: #0a0f17;
       border: 1px solid #222e44;
-      border-radius: 8px;
-      padding: 10px;
+      border-radius: var(--radius-md);
+      padding: 9px;
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 12px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
     }
     .task-log-panel { height: 280px; }
     .pill {
@@ -164,31 +223,466 @@
       font-size: 11px;
       margin-right: 6px;
     }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      border: 1px solid #2a3856;
+      background: #162036;
+      color: #c6d3eb;
+      text-transform: capitalize;
+      white-space: nowrap;
+    }
+    .status-badge::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+      opacity: 0.9;
+    }
+    .status-badge.info {
+      background: rgba(54, 94, 214, 0.2);
+      border-color: #2f4da1;
+      color: #8fb3ff;
+    }
+    .status-badge.success {
+      background: rgba(38, 117, 76, 0.24);
+      border-color: #226345;
+      color: #6ff2bc;
+    }
+    .status-badge.warning {
+      background: rgba(122, 92, 31, 0.25);
+      border-color: #77581f;
+      color: #f7c661;
+    }
+    .status-badge.danger {
+      background: rgba(128, 49, 49, 0.26);
+      border-color: #804242;
+      color: #ff8b8b;
+    }
+    .status-badge.neutral {
+      background: rgba(56, 72, 103, 0.26);
+      border-color: #354563;
+      color: #b7c4dc;
+    }
+    .metric-row {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .metric-tile {
+      background: #10192b;
+      border: 1px solid #27334d;
+      border-radius: 10px;
+      padding: 10px;
+      text-align: center;
+    }
+    .metric-tile .value {
+      display: block;
+      font-size: 24px;
+      font-weight: 700;
+      line-height: 1.1;
+      margin-bottom: 4px;
+    }
+    .metric-tile .label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+    .metric-tile.info .value { color: #80a7ff; }
+    .metric-tile.success .value { color: #6ff2bc; }
+    .metric-tile.warning .value { color: #f7c661; }
+    .inline-action-group {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .inline-action-group button {
+      width: auto;
+      min-width: 96px;
+      font-size: 12px;
+      padding-inline: 14px;
+    }
+    .btn-primary {
+      background: linear-gradient(180deg, #f7be39, #e0a319);
+      border-color: #d69a16;
+      color: #19150b;
+    }
+    .btn-danger {
+      background: linear-gradient(180deg, #72313a, #5f232b);
+      border-color: #8f3f49;
+      color: #ffd8dc;
+    }
+    .dense-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 8px;
+    }
+    .dense-form-row {
+      background: #0f1729;
+      border: 1px solid #263652;
+      border-radius: 10px;
+      padding: 10px;
+    }
+    .dense-form-row label {
+      margin-top: 0;
+      margin-bottom: 6px;
+    }
+    .dense-form-row .helper {
+      margin-top: 5px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .image-strip {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .image-strip figure {
+      margin: 0;
+      border-radius: 10px;
+      overflow: hidden;
+      border: 1px solid #2a3856;
+      background: #0d1422;
+    }
+    .image-strip img {
+      width: 100%;
+      height: 120px;
+      display: block;
+      object-fit: cover;
+      opacity: 0.88;
+    }
+    .image-strip figcaption {
+      font-size: 11px;
+      color: #c3d0e7;
+      padding: 7px 9px;
+    }
+    .profiles-layout {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      gap: 14px;
+    }
+    .profiles-stack {
+      display: grid;
+      gap: 12px;
+      align-content: start;
+    }
+    .table-shell {
+      max-height: 280px;
+      overflow: auto;
+      border: 1px solid #22314c;
+      border-radius: 10px;
+      margin-top: 10px;
+    }
+    .task-card {
+      margin-top: 14px;
+      padding: 0;
+      overflow: hidden;
+    }
+    .task-card-header,
+    .task-card-body {
+      padding: 12px 14px;
+    }
+    .task-card-header {
+      border-bottom: 1px solid #1f2a3d;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .task-card-title {
+      margin: 0;
+      font-size: 14px;
+    }
+    .task-card-tags {
+      margin-top: 6px;
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
 
     .warn { color: #f7b955; font-size: 13px; }
+    .helper-text { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.35; }
+    .inline-error { color: #ff8e8e; font-size: 12px; margin-top: 8px; }
+    .inline-warn { color: #f7b955; font-size: 12px; margin-top: 8px; }
+    .summary-panel {
+      margin-top: 10px;
+      border: 1px solid #2a3856;
+      border-radius: 10px;
+      background: rgba(14, 19, 30, 0.75);
+      padding: 10px;
+    }
+    .summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .summary-item { font-size: 12px; color: #cbd6ea; }
+    .summary-item strong { display: block; font-size: 11px; text-transform: uppercase; color: var(--muted); letter-spacing: .04em; margin-bottom: 4px; }
+    .stepper { display: flex; align-items: center; gap: 6px; }
+    .stepper button { width: 38px; padding: 8px; }
+    .modal-footer {
+      position: sticky;
+      bottom: -14px;
+      margin: 14px -14px -14px;
+      padding: 12px 14px;
+      border-top: 1px solid #2a3856;
+      border-bottom-left-radius: 12px;
+      border-bottom-right-radius: 12px;
+      background: linear-gradient(180deg, rgba(18,24,35,.96), rgba(12,16,24,.98));
+    }
     .config-warn {
       display: none;
       margin: 16px;
       padding: 12px 14px;
-      border-radius: 10px;
+      border-radius: var(--radius-md);
       border: 1px solid #7a3f2b;
       background: rgba(152, 67, 42, 0.2);
       color: #ffd9cb;
       font-size: 13px;
       line-height: 1.45;
     }
+    .state-pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: var(--radius-md);
+      border: 1px solid transparent;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .state-running, .state-monitoring, .state-submitting { background: rgba(93,124,255,0.15); border-color: rgba(93,124,255,0.35); color: #bcd0ff; }
+    .state-queued, .state-idle, .state-paused, .state-stopped { background: rgba(121,136,164,0.12); border-color: rgba(121,136,164,0.28); color: #c9d3e6; }
+    .state-success { background: rgba(111,242,188,0.14); border-color: rgba(111,242,188,0.3); color: #9ff6d2; }
+    .state-failed { background: rgba(248,111,111,0.14); border-color: rgba(248,111,111,0.35); color: #ffc0c0; }
+    .task-summary-grid { margin-top: 12px; }
+    .detail-section { margin-top: 12px; }
     .config-warn.show { display: block; }
+
+
+    .topbar {
+      background: #131734;
+      border-bottom: 1px solid #273167;
+      padding: 0 22px;
+    }
+    .layout {
+      grid-template-columns: 280px 1fr;
+      gap: 18px;
+      padding: 18px;
+    }
+    .sidebar-themed {
+      background: linear-gradient(180deg, #1a1f42 0%, #151934 100%);
+      border: 1px solid #2b356a;
+      border-radius: 16px;
+      padding: 14px;
+    }
+    .sidebar-brand {
+      padding: 14px;
+      border-radius: 12px;
+      background: linear-gradient(120deg, #4b4fd3, #b14ca4);
+      margin-bottom: 12px;
+    }
+    .dashboard-shell h1 { font-size: 30px; }
+    .dashboard-headline { display:flex; align-items:baseline; gap:10px; margin-bottom:12px; }
+    .dashboard-top-row { display:grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap:12px; }
+    .dash-stat { border-radius: 12px; padding: 14px; color:#131734; font-weight:600; }
+    .dash-stat.mint { background:#7cd9bc; }
+    .dash-stat.rose { background:#d98995; }
+    .dash-stat.blue { background:#7090f2; }
+    .dash-stat-value { font-size: 36px; font-weight: 800; margin: 8px 0 4px; }
+    .dash-stat-label { font-size:13px; opacity:.9; }
+    .dash-stat-sub { font-size:12px; opacity:.75; }
+    .dash-welcome { background:#252949; border-color:#343c6f; }
+    .dashboard-chart-row { display:grid; grid-template-columns: 1.3fr 1fr; gap:12px; margin-top:12px; }
+    .chart-card, .donut-card { min-height:220px; }
+    .line-graph { height:170px; border-radius: 10px; background: linear-gradient(180deg, rgba(109,224,185,0.28), rgba(20,27,47,0.2)); position: relative; overflow:hidden; }
+    .line-graph span { position:absolute; inset: 18px; border-left:1px solid rgba(132,149,200,.3); border-bottom:1px solid rgba(132,149,200,.3); }
+    .line-graph svg { position:absolute; inset:18px; width: calc(100% - 36px); height: calc(100% - 36px); overflow: visible; }
+    .line-graph polyline { fill: rgba(119,234,198,.28); stroke: #77eac6; stroke-width: 2; }
+    .donut-wrap { display:flex; align-items:center; gap:18px; margin-top:20px; }
+    .donut { width:120px; height:120px; border-radius:50%; background: conic-gradient(#f2c84b 0 35%, #6d93ff 35% 55%, #55d7a6 55% 73%, #d76ae6 73% 85%, #9aa6c5 85% 100%); position:relative; }
+    .donut::after { content:""; position:absolute; inset:28px; background:#161a35; border-radius:50%; }
+    .donut-legend { list-style:none; margin:0; padding:0; color:#c9d4ef; font-size:12px; }
+    .donut-legend li { margin-bottom:8px; display:flex; align-items:center; gap:8px; }
+    .donut-center-label { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; color: #dce5f7; z-index: 2; text-align: center; padding-top: 4px; }
+    .dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+    .dot.w { background:#f2c84b; } .dot.t { background:#6d93ff; } .dot.b { background:#55d7a6; } .dot.o { background:#d76ae6; }
+    .order-product-cell { display:flex; align-items:center; gap:10px; min-width: 220px; }
+    .order-thumb { width:36px; height:36px; border-radius:8px; border:1px solid #2a3856; object-fit:cover; background:#121a2f; }
+    .insight-grid { margin-top: 12px; display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:10px; }
+    .insight-card { background:#161c36; border:1px solid #303b72; border-radius:10px; padding:10px; }
+    .insight-card strong { font-size:12px; color:#c2d0f0; display:block; margin-bottom:4px; }
+    .insight-card span { font-size:20px; font-weight:700; color:#f4f8ff; }
+
+
+    .tasks-clone-shell {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+    .tasks-clone-groups { position: sticky; top: 80px; }
+    .tasks-groups-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; gap:8px; }
+    .tasks-groups-head button { width:auto; padding:6px 10px; }
+    .task-group-list { max-height: 460px; overflow:auto; border:1px solid #243353; border-radius:10px; padding:6px; margin:10px 0; background:#0b1222; }
+    .task-group-item { border:1px solid #25314d; border-radius:8px; padding:8px; margin-bottom:6px; cursor:pointer; }
+    .task-group-item.active { border-color:#516bb0; background:#182442; }
+    .tasks-clone-main { padding: 12px; }
+    .tasks-clone-header { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px; }
+    .task-toolbar-actions { display:flex; gap:6px; flex-wrap:wrap; }
+    .task-toolbar-actions button { width:auto; font-size:12px; padding:7px 10px; }
+    .clone-toolbar { margin-bottom: 8px; }
+    .clone-table-scroller { max-height: 520px; }
+    .clone-table-scroller table { font-size:12px; }
+    .clone-table-scroller th, .clone-table-scroller td { white-space: nowrap; }
+    .task-group-item {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 8px;
+      text-align: left;
+      background: #10182d;
+      color: #d8e2f7;
+    }
+    .task-group-meta { display:flex; flex-direction:column; gap:2px; min-width:0; }
+    .task-group-name { font-size: 13px; font-weight: 600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .task-group-site { font-size: 11px; color:#9cb0d8; text-transform: uppercase; letter-spacing: .06em; }
+    .task-group-menu-wrap { position: relative; }
+    .task-group-menu-btn { width:auto; padding:2px 7px; background:#0c1221; border:1px solid #2a3a60; border-radius: 6px; }
+    .task-group-menu {
+      position: absolute;
+      right: 0;
+      top: 28px;
+      display: none;
+      min-width: 100px;
+      z-index: 25;
+      background: #0d1528;
+      border: 1px solid #2f4068;
+      border-radius: 8px;
+      padding: 5px;
+    }
+    .task-group-menu button { width: 100%; text-align:left; background: transparent; border: 0; padding: 7px; }
+    .task-group-menu.open { display: block; }
+    .task-icon-btn { width:auto; min-width:30px; padding:5px 7px; font-size:11px; }
+    .task-modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 6, 14, 0.72);
+      z-index: 180;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .task-modal-overlay.open { display: flex; }
+    .task-modal {
+      width: min(980px, 95vw);
+      max-height: 90vh;
+      overflow: auto;
+      background: #0d1222;
+      border: 1px solid #2b3b62;
+      border-radius: 12px;
+      padding: 14px;
+    }
+    .task-modal-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+
+
+    .tasks-clone-shell {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+    .tasks-clone-groups { position: sticky; top: 80px; }
+    .tasks-groups-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; gap:8px; }
+    .tasks-groups-head button { width:auto; padding:6px 10px; }
+    .task-group-list { max-height: 460px; overflow:auto; border:1px solid #243353; border-radius:10px; padding:6px; margin:10px 0; background:#0b1222; }
+    .task-group-item { border:1px solid #25314d; border-radius:8px; padding:8px; margin-bottom:6px; cursor:pointer; }
+    .task-group-item.active { border-color:#516bb0; background:#182442; }
+    .tasks-clone-main { padding: 12px; }
+    .tasks-clone-header { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px; }
+    .task-toolbar-actions { display:flex; gap:6px; flex-wrap:wrap; }
+    .task-toolbar-actions button { width:auto; font-size:12px; padding:7px 10px; }
+    .clone-toolbar { margin-bottom: 8px; }
+    .clone-table-scroller { max-height: 520px; }
+    .clone-table-scroller table { font-size:12px; }
+    .clone-table-scroller th, .clone-table-scroller td { white-space: nowrap; }
+    .task-group-item {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 8px;
+      text-align: left;
+      background: #10182d;
+      color: #d8e2f7;
+    }
+    .task-group-meta { display:flex; flex-direction:column; gap:2px; min-width:0; }
+    .task-group-name { font-size: 13px; font-weight: 600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .task-group-site { font-size: 11px; color:#9cb0d8; text-transform: uppercase; letter-spacing: .06em; }
+    .task-group-menu-wrap { position: relative; }
+    .task-group-menu-btn { width:auto; padding:2px 7px; background:#0c1221; border:1px solid #2a3a60; border-radius: 6px; }
+    .task-group-menu {
+      position: absolute;
+      right: 0;
+      top: 28px;
+      display: none;
+      min-width: 100px;
+      z-index: 25;
+      background: #0d1528;
+      border: 1px solid #2f4068;
+      border-radius: 8px;
+      padding: 5px;
+    }
+    .task-group-menu button { width: 100%; text-align:left; background: transparent; border: 0; padding: 7px; }
+    .task-group-menu.open { display: block; }
+    .task-icon-btn { width:auto; min-width:30px; padding:5px 7px; font-size:11px; }
+    .task-modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 6, 14, 0.72);
+      z-index: 180;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .task-modal-overlay.open { display: flex; }
+    .task-modal {
+      width: min(980px, 95vw);
+      max-height: 90vh;
+      overflow: auto;
+      background: #0d1222;
+      border: 1px solid #2b3b62;
+      border-radius: 12px;
+      padding: 14px;
+    }
+    .task-modal-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
 
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
+      .tasks-clone-shell { grid-template-columns: 1fr; }
+      .tasks-clone-groups { position: static; }
       .sidebar { order: 2; }
       .content { order: 1; }
       .topbar { height: auto; min-height: 62px; padding: 10px 14px; flex-wrap: wrap; gap: 8px; }
+      .insight-grid { grid-template-columns: 1fr; }
     }
 
     @media (max-width: 740px) {
       .row, .grid, .kpi-grid { grid-template-columns: 1fr; }
+      .metric-row, .dense-grid { grid-template-columns: 1fr; }
+      .image-strip, .profiles-layout { grid-template-columns: 1fr; }
       .top-nav { width: 100%; overflow-x: auto; padding-bottom: 4px; }
+      .inline-action-group { justify-content: flex-start; }
     }
   </style>
 </head>
@@ -197,11 +691,12 @@
     <div class="topbar-left">
       <div class="app-mark"></div>
       <nav class="top-nav">
-        <button class="active" data-tab="home" onclick="setTab('home')">Analytics</button>
-        <button data-tab="monitors" onclick="setTab('monitors')">Tasks</button>
-        <button data-tab="webhooks" onclick="setTab('webhooks')">Proxies</button>
-        <button data-tab="settings" onclick="setTab('settings')">Settings</button>
-        <button data-tab="logs" onclick="setTab('logs')">Automation</button>
+        <button type="button" class="active" data-tab="home">Dashboard</button>
+        <button type="button" data-tab="monitors">Tasks</button>
+        <button type="button" data-tab="profiles">Profiles</button>
+        <button type="button" data-tab="webhooks">Proxies</button>
+        <button type="button" data-tab="logs">Captcha</button>
+        <button type="button" data-tab="settings">Settings</button>
       </nav>
     </div>
     <div class="topbar-right" id="clock">--:--:--</div>
@@ -212,23 +707,14 @@
   </div>
 
   <div class="layout">
-    <aside class="sidebar">
-      <div class="card header-card">
-        <h2 class="hero-title">Stock Sentinel</h2>
-        <p class="subtitle">Operator Console</p>
-      </div>
-      <div class="card">
-        <h3 class="section-title">Up To Date</h3>
-        <div id="meta" class="small">Checking version info…</div>
-        <div class="actions" style="margin-top:10px;">
-          <button onclick="checkUpdates()">Check for Updates</button>
-        </div>
+    <aside class="sidebar sidebar-themed">
+      <div class="sidebar-brand">
+        <h2 class="hero-title">PokeYourMom AIO</h2>
+        <p class="subtitle">Version 1.0.1</p>
       </div>
       <div class="card">
         <h3 class="section-title">System Status</h3>
-        <div class="kpi-label">Task Engine</div>
         <div id="runtime_running_badge" class="status-value">READY</div>
-        <div class="kpi-label" style="margin-top:10px;">Latest Check</div>
         <div id="runtime_latest_check_badge" class="small">N/A</div>
       </div>
       <div class="card">
@@ -240,17 +726,25 @@
           <div><div class="kpi-label">Success</div><div id="kpi_success_rate_side" class="kpi-value">0%</div></div>
         </div>
       </div>
+      <div class="card">
+        <h3 class="section-title">Up To Date</h3>
+        <div id="meta" class="small">Checking version info…</div>
+        <div class="actions" style="margin-top:10px;"><button onclick="checkUpdates()">Check for Updates</button></div>
+      </div>
     </aside>
 
     <main class="content">
-      <section id="tab-home" class="tab active">
-        <h1>Analytics</h1>
-        <p class="small">Live workspace health and throughput metrics.</p>
-        <div class="kpi-grid">
-          <div class="card"><div class="kpi-label">Monitors</div><div id="kpi_total_monitors" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Enabled</div><div id="kpi_enabled_monitors" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Events (24h)</div><div id="kpi_events_24h" class="kpi-value">0</div></div>
-          <div class="card"><div class="kpi-label">Delivery Success</div><div id="kpi_success_rate" class="kpi-value">0%</div></div>
+      <section id="tab-home" class="tab active dashboard-shell">
+        <div class="dashboard-headline">
+          <h1>Dashboard</h1>
+          <p class="small">Tuesday, <span id="dashboard_now">--:--:--</span></p>
+        </div>
+        <div class="kpi-grid" style="margin-top:12px;">
+          <div class="card"><div class="kpi-label">Checks Total</div><div id="ops_checks_total" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Checks Failed</div><div id="ops_checks_failed_total" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Alerts Created</div><div id="ops_alerts_created_total" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Webhook Sent</div><div id="ops_webhook_sent_total" class="kpi-value">0</div></div>
+          <div class="card"><div class="kpi-label">Webhook Failed</div><div id="ops_webhook_failed_total" class="kpi-value">0</div></div>
         </div>
         <div class="kpi-grid" style="margin-top:12px;">
           <div class="card"><div class="kpi-label">Checks Total</div><div id="ops_checks_total" class="kpi-value">0</div></div>
@@ -278,147 +772,341 @@
               <button onclick="toggleLoop()" id="loopBtn">Start Monitor Loop</button>
             </div>
           </div>
-          <div class="card">
-            <h3 class="section-title">Policy</h3>
-            <p class="warn">Stock monitoring + Discord alerts only. Auto-checkout is intentionally not implemented.</p>
+          <div class="dash-stat rose">
+            <div class="dash-stat-label">Declines</div>
+            <div id="ops_checks_failed_total" class="dash-stat-value">0</div>
+            <div class="dash-stat-sub">Total Declines</div>
+          </div>
+          <div class="dash-stat blue">
+            <div class="dash-stat-label">Spent</div>
+            <div id="ops_webhook_sent_total" class="dash-stat-value">0</div>
+            <div class="dash-stat-sub">Total Spent</div>
+          </div>
+          <div class="dash-welcome card">
+            <h3>Welcome back, Operator!</h3>
+            <p class="small">Your daily overview is ready. Track checkouts, decline trends, and monitor health from one dashboard.</p>
           </div>
         </div>
-        <div class="grid" style="margin-top:16px;">
-          <div class="card">
-            <h3>Monitor Failure Trends</h3>
-            <table>
-              <thead><tr><th>Monitor</th><th>Failures (24h)</th><th>Failures (7d)</th></tr></thead>
-              <tbody id="ops_monitor_failure_trends"></tbody>
-            </table>
+
+        <div class="dashboard-chart-row">
+          <div class="card chart-card">
+            <h3>Amount Spent (Last 14 Days)</h3>
+            <div class="line-graph">
+              <span></span>
+              <svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                <polyline id="amount_spent_polyline" points="0,100 20,80 40,72 60,60 80,45 100,35 100,100 0,100"></polyline>
+              </svg>
+            </div>
           </div>
-          <div class="card">
-            <h3>Webhook Health Trends</h3>
-            <table>
-              <thead><tr><th>Webhook</th><th>Fail Streak</th><th>Last Code</th><th>Failures (24h)</th></tr></thead>
-              <tbody id="ops_webhook_health_trends"></tbody>
-            </table>
+          <div class="card donut-card">
+            <h3>Sites Checkouts</h3>
+            <div class="donut-wrap">
+              <div id="site_checkout_donut" class="donut">
+                <div id="site_checkout_donut_center" class="donut-center-label">0<br/>orders</div>
+              </div>
+              <ul id="site_checkout_legend" class="donut-legend">
+                <li><span class="dot w"></span>No checkout data yet</li>
+              </ul>
+            </div>
           </div>
+        </div>
+        <div class="insight-grid">
+          <div class="insight-card">
+            <strong>Conversion</strong>
+            <span id="dashboard_conversion_rate">0%</span>
+          </div>
+          <div class="insight-card">
+            <strong>Average Order</strong>
+            <span id="dashboard_average_order">$0.00</span>
+          </div>
+          <div class="insight-card">
+            <strong>Best Site</strong>
+            <span id="dashboard_best_site">N/A</span>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px;">
+          <h3>Product Orders</h3>
+          <table>
+            <thead><tr><th>Site</th><th>Product</th><th>Qty</th><th>Price</th><th>Spent</th><th>Purchased</th></tr></thead>
+            <tbody id="ops_monitor_failure_trends"></tbody>
+          </table>
+        </div>
+
+        <div class="card" style="margin-top:14px;">
+          <h3>Site Checkout Breakdown</h3>
+          <table>
+            <thead><tr><th>Site</th><th>Checkouts</th><th>Share</th></tr></thead>
+            <tbody id="ops_webhook_health_trends"></tbody>
+          </table>
+        </div>
+
+        <div style="display:none;">
+          <input id="runtime_running" disabled />
+          <input id="runtime_latest_check" disabled />
+          <div id="kpi_enabled_monitors">0</div>
+          <div id="kpi_events_24h">0</div>
+          <div id="kpi_success_rate">0%</div>
+          <div id="ops_checks_total">0</div>
+          <div id="ops_alerts_created_total">0</div>
+          <div id="ops_webhook_failed_total">0</div>
         </div>
       </section>
 
-      <section id="tab-monitors" class="tab">
-        <h1>Task Controls</h1>
-        <div class="card">
-          <h2>Create Automation Task</h2>
-          <div class="row">
-            <div>
-              <label>Retailer</label>
-              <select id="task_retailer">
-                <option>walmart</option>
-                <option>target</option>
-                <option>bestbuy</option>
-                <option>pokemoncenter</option>
+      <section id="tab-monitors" class="tab tasks-clone-tab">
+        <div class="tasks-clone-shell">
+          <aside class="tasks-clone-groups card">
+            <div class="tasks-groups-head">
+              <h2 class="section-title">My Task Groups</h2>
+              <button type="button" onclick="createTaskGroupPrompt()">+ New Task Group</button>
+            </div>
+            <input id="task_group_search" placeholder="Search tasks / SKU / profile" oninput="applyTaskSearchFilter()" />
+            <div id="task_group_list" class="task-group-list"></div>
+            <div class="small">Tip: groups are local UI folders to organize site-specific tasks.</div>
+          </aside>
+
+          <div class="tasks-clone-main card">
+            <div class="tasks-clone-header">
+              <h1>Tasks</h1>
+              <div class="task-toolbar-actions">
+                <button class="btn-primary" onclick="openTaskModal()">Create Task</button>
+                <button onclick="startAllTasks()">Start All</button>
+                <button class="btn-danger" onclick="stopAllTasks()">End All</button>
+                <button onclick="editAllTasks()">Edit All</button>
+                <button onclick="clearAllTasks()">Clear All</button>
+                <button onclick="openMonitorPulse()">Monitor</button>
+                <button onclick="importTasksPrompt()">Import</button>
+                <button onclick="exportTasksPrompt()">Export</button>
+                <button onclick="startSelectedTasksNow()">Start Now</button>
+              </div>
+            </div>
+
+            <div class="task-table-toolbar clone-toolbar">
+              <input id="task_search" placeholder="Search tasks" oninput="applyTaskSearchFilter()" />
+              <select id="task_status_filter" onchange="applyTaskSearchFilter()">
+                <option value="">All Statuses</option>
+                <option value="queued">Queued</option>
+                <option value="monitoring">Monitoring</option>
+                <option value="running">Running</option>
+                <option value="success">Success</option>
+                <option value="failed">Failed</option>
+                <option value="stopped">Stopped</option>
               </select>
             </div>
-            <div>
-              <label>Product URL</label>
-              <input id="task_url" placeholder="https://www.walmart.com/ip/..." />
-            </div>
-          </div>
-          <div class="row" style="margin-top:10px;">
-            <div>
-              <label>Profile</label>
-              <input id="task_profile" placeholder="profile-main" />
-            </div>
-            <div>
-              <label>Account</label>
-              <input id="task_account" placeholder="acc-primary" />
-            </div>
-          </div>
-          <div style="margin-top:10px;">
-            <label>Payment</label>
-            <input id="task_payment" placeholder="visa-ending-4242" />
-          </div>
-          <button style="margin-top:10px;" onclick="createTask()">Create Task</button>
-        </div>
 
-        <div class="card" style="margin-top:14px;">
-          <h2 class="section-title">Live Task Table</h2>
-          <table>
-            <thead><tr><th>ID</th><th>Retailer</th><th>State</th><th>Retries</th><th>Last Step</th><th>Last Error</th><th>Actions</th></tr></thead>
-            <tbody id="tasks"></tbody>
-          </table>
-        </div>
+            <div class="status-chip-row">
+              <button class="status-chip active" data-status="all" onclick="setTaskStatusChip('all')">All</button>
+              <button class="status-chip" data-status="running" onclick="setTaskStatusChip('running')">Running</button>
+              <button class="status-chip" data-status="queued" onclick="setTaskStatusChip('queued')">Queued</button>
+              <button class="status-chip" data-status="failed" onclick="setTaskStatusChip('failed')">Failed</button>
+              <button class="status-chip" data-status="success" onclick="setTaskStatusChip('success')">Success</button>
+            </div>
 
-        <div class="card" style="margin-top:14px;">
-          <h2 class="section-title">Per-Task Log Panel</h2>
-          <div class="small" id="task_log_title">Select a task to inspect attempts.</div>
-          <div id="task_logs" class="logs task-log-panel"></div>
-        </div>
-
-        <div class="card" style="margin-top:14px;">
-          <h2>Add Product Monitor</h2>
-          <div class="row">
-            <div>
-              <label>Retailer</label>
-              <select id="retailer">
-                <option>walmart</option>
-                <option>target</option>
-                <option>bestbuy</option>
-              </select>
-            </div>
-            <label class="small">Product URL</label>
-            <input id="product_url" placeholder="https://www.walmart.com/ip/..." />
-            <div class="row" style="margin-top: 10px;">
-              <div>
-                <label class="small">Keyword Filter</label>
-                <input id="keyword" placeholder="pokemon" />
-              </div>
-              <div>
-                <label class="small">Max Price Cents</label>
-                <input id="max_price_cents" type="number" placeholder="4000" />
-              </div>
-            </div>
-            <div style="margin-top:10px;">
-              <label class="small">Original MSRP Cents (Pokemon only)</label>
-              <input id="msrp_cents" type="number" placeholder="499" />
-            </div>
-            <input id="captcha_token" type="hidden" value="" />
-            {% if captcha_site_key %}
-            <div style="margin-top:10px;">
-              <label class="small">CAPTCHA Verification</label>
-              <div id="captcha_widget" class="cf-turnstile" data-sitekey="{{ captcha_site_key }}" data-theme="dark" data-callback="onCaptchaSuccess" data-expired-callback="onCaptchaExpired" data-error-callback="onCaptchaError"></div>
-            </div>
-            {% endif %}
-            <button style="margin-top:10px;" onclick="addMonitor()">Add Monitor</button>
-          </div>
-
-          <div class="card">
-            <h2 class="section-title">Bulk Schedules</h2>
-            <div class="row">
-              <div>
-                <label class="small">Run At (UTC ISO)</label>
-                <input id="schedule_run_at" placeholder="2026-04-18T15:00:00+00:00" />
-              </div>
-              <div>
-                <label class="small">New Poll Interval</label>
-                <input id="schedule_poll" type="number" value="20" />
-              </div>
-            </div>
-            <button style="margin-top:10px;" onclick="createSchedule()">Create Schedule For Selected</button>
-
-            <div style="margin-top: 12px;">
+            <div class="task-table-scroller clone-table-scroller">
               <table>
                 <thead>
-                  <tr><th>ID</th><th>Monitor</th><th>Run At</th><th>Applied</th><th>Actions</th></tr>
+                  <tr>
+                    <th class="task-checkbox-col"></th>
+                    <th>ID</th>
+                    <th>Mode</th>
+                    <th>Product</th>
+                    <th>Checkout Set</th>
+                    <th>Region</th>
+                    <th>Delay</th>
+                    <th>Qty</th>
+                    <th>Captcha Provider</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                  </tr>
                 </thead>
-                <tbody id="schedules"></tbody>
+                <tbody id="tasks"></tbody>
               </table>
+            </div>
+
+            <div class="kpi-grid task-summary-grid">
+              <div class="card"><div class="kpi-label">Total Tasks</div><div id="task_kpi_total" class="kpi-value">0</div></div>
+              <div class="card"><div class="kpi-label">Active</div><div id="task_kpi_active" class="kpi-value">0</div></div>
+              <div class="card"><div class="kpi-label">Queued</div><div id="task_kpi_queued" class="kpi-value">0</div></div>
+              <div class="card"><div class="kpi-label">Failed</div><div id="task_kpi_failed" class="kpi-value">0</div></div>
+            </div>
+
+            <div class="card detail-section">
+              <h2 class="section-title">Task Creation Guide</h2>
+              <p class="small">Create a site-specific task group (green +), choose the group, click Create Task, then fill mode/profile/proxies and site fields.</p>
+            </div>
+
+            <div class="card detail-section">
+              <h2 class="section-title">Per-Task Log Panel</h2>
+              <div class="small" id="task_log_title">Select a task to inspect attempts.</div>
+              <div id="task_logs" class="logs task-log-panel"></div>
             </div>
           </div>
         </div>
 
-        <div class="card" style="margin-top:14px;">
-          <h2 class="section-title">Monitor List</h2>
-          <table>
-            <thead><tr><th>ID</th><th>Select</th><th>Retailer</th><th>URL</th><th>Last Checked</th><th>Last Alert State</th><th>Actions</th></tr></thead>
-            <tbody id="monitors"></tbody>
-          </table>
+        <div id="task_modal_overlay" class="task-modal-overlay" onclick="dismissTaskModal(event)">
+          <div class="task-modal" role="dialog" aria-modal="true" aria-label="Create task">
+            <div class="task-modal-header">
+              <h2 class="section-title">New Task</h2>
+              <button onclick="closeTaskModal()">Close</button>
+            </div>
+            <div class="dense-grid">
+              <div class="dense-form-row"><label>Name</label><input id="task_name" placeholder="Enter Task Name" /></div>
+              <div class="dense-form-row"><label>Monitor</label><select id="task_monitor_id"></select></div>
+              <div class="dense-form-row"><label>Mode</label><select id="task_mode"><option value="default">default</option><option value="safe">safe</option><option value="fast">fast</option><option value="instore">instore</option></select></div>
+              <div class="dense-form-row"><label>Profile / Group</label><input id="task_profile_group" placeholder="Select Profile" /></div>
+              <div class="dense-form-row"><label>Monitor Proxy</label><input id="task_proxy_group" placeholder="Select Monitor Proxy" /></div>
+              <div class="dense-form-row"><label>Checkout Proxy</label><input id="task_checkout_proxy_group" placeholder="Select Checkout Proxy" /></div>
+              <div class="dense-form-row"><label>URL / SKU / PID</label><input id="task_products" placeholder="Enter URL or PID" /></div>
+              <div class="dense-form-row"><label>Region</label><input id="task_region" value="US" /></div>
+              <div class="dense-form-row"><label>Quantity</label><input id="task_quantity_override" type="number" min="1" value="1" /></div>
+              <div class="dense-form-row"><label>Giftcard(s)</label><input id="task_giftcards" placeholder="Enter Giftcard(s)" /></div>
+              <div class="dense-form-row"><label>Instore Distance</label><input id="task_instore_distance" placeholder="10" /></div>
+              <div class="dense-form-row"><label>Instore Pickup Name</label><input id="task_instore_pickup_name" placeholder="Enter Instore Pickup Name" /></div>
+              <div class="dense-form-row"><label>Zipcode</label><input id="task_zipcode" placeholder="95050" /></div>
+              <div class="dense-form-row"><label>Business Name</label><input id="task_business_name" placeholder="Enter Business Name" /></div>
+              <div class="dense-form-row"><label>Delay (ms)</label><input id="task_queue_entry_delay_ms" type="number" min="0" placeholder="3500" /></div>
+              <div class="dense-form-row"><label>Restart On Decline?</label><input id="task_restart_on_decline" type="checkbox" style="width:auto;" /></div>
+              <div class="dense-form-row"><label>Random Pickup Time?</label><input id="task_random_pickup_time" type="checkbox" style="width:auto;" /></div>
+              <div class="dense-form-row"><label>Promo Code</label><input id="task_promo_code" placeholder="SPRING24" /><div id="task_promo_warning" class="inline-warn"></div></div>
+              <div class="dense-form-row"><label>Qty</label><div class="stepper"><button type="button" onclick="adjustTaskCount(-1)">-</button><input id="task_count" type="number" min="1" max="100" value="1" /><button type="button" onclick="adjustTaskCount(1)">+</button></div></div>
+            </div>
+            <div id="create_task_error" class="inline-error"></div>
+            <div class="summary-panel">
+              <div class="summary-grid">
+                <div class="summary-item"><strong>Tasks</strong><span id="summary_task_count">1</span></div>
+                <div class="summary-item"><strong>Mode</strong><span id="summary_mode">default</span></div>
+                <div class="summary-item"><strong>Products</strong><span id="summary_products">monitor default</span></div>
+                <div class="summary-item"><strong>Profile Group</strong><span id="summary_profile_group">-</span></div>
+                <div class="summary-item"><strong>Proxy Group</strong><span id="summary_proxy_group">-</span></div>
+              </div>
+            </div>
+            <div class="modal-footer">
+              <button onclick="closeTaskModal()">Close</button>
+              <button id="create_task_btn" class="btn-primary" onclick="createTask()" disabled>Create (1)</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="task_group_modal_overlay" class="task-modal-overlay" onclick="dismissTaskGroupModal(event)">
+          <div class="task-modal" role="dialog" aria-modal="true" aria-label="Create task group" style="max-width:520px;">
+            <div class="task-modal-header">
+              <h2 class="section-title">New Task Group</h2>
+              <button onclick="closeTaskGroupModal()">Close</button>
+            </div>
+            <label>Group Name</label>
+            <input id="task_group_name_input" placeholder="iPhone 15 Pro" />
+            <label style="margin-top:10px;">Site</label>
+            <select id="task_group_site_select">
+              <option value="amazon">Amazon</option>
+              <option value="apple">Apple</option>
+              <option value="bestbuy">BestBuy</option>
+              <option value="costco">Costco</option>
+              <option value="target">Target</option>
+              <option value="walmart">Walmart</option>
+            </select>
+            <div class="modal-footer">
+              <button onclick="closeTaskGroupModal()">Cancel</button>
+              <button class="btn-primary" onclick="createTaskGroupFromModal()">Create Group</button>
+            </div>
+          </div>
+        </div>
+
+        <div style="display:none;">
+          <input id="quick_retailer" value="walmart" />
+          <input id="quick_poll_interval" value="20" />
+          <input id="quick_product_url" value="" />
+          <select id="quick_webhook_target"></select>
+          <select id="quick_monitor_selection"></select>
+          <input id="quick_keyword" value="" />
+          <input id="quick_max_price_cents" value="" />
+          <input id="quick_msrp_cents" value="" />
+          <input id="retailer" value="walmart" />
+          <input id="product_url" value="" />
+          <input id="keyword" value="" />
+          <input id="max_price_cents" value="" />
+          <input id="msrp_cents" value="" />
+          <input id="poll_interval" value="20" />
+          <textarea id="monitor_payload_input"></textarea>
+          <div id="monitor_payload_status"></div>
+          <div id="monitor_payload_candidates"></div>
+          <table><tbody id="monitors"></tbody></table>
+          <select id="manage_products_mode"></select>
+          <input id="manage_products_input" />
+          <table><tbody id="manage_products_rows"></tbody></table>
+          <div id="manage_products_meta"></div>
+        </div>
+      </section>
+
+      <section id="tab-profiles" class="tab">
+        <h1>Profiles</h1>
+        <p class="small">Create reusable checkout vaults with shipping + billing, store logins, and tokenized PayPal/card references.</p>
+        <div class="profiles-layout">
+          <div class="card">
+            <h2 class="section-title">Create Profile Vault</h2>
+            <div class="dense-grid">
+              <div class="dense-form-row"><label>Profile Name</label><input id="profile_name" placeholder="Primary US" /></div>
+              <div class="dense-form-row"><label>Email</label><input id="profile_email" placeholder="you@example.com" /></div>
+              <div class="dense-form-row"><label>Phone</label><input id="profile_phone" placeholder="+1 555 123 4567" /></div>
+              <div class="dense-form-row"><label>Shipping Line 1</label><input id="shipping_line1" placeholder="123 Main St" /></div>
+              <div class="dense-form-row"><label>Shipping City</label><input id="shipping_city" placeholder="Los Angeles" /></div>
+              <div class="dense-form-row"><label>Shipping State</label><input id="shipping_state" placeholder="CA" /></div>
+              <div class="dense-form-row"><label>Shipping Postal Code</label><input id="shipping_postal" placeholder="90001" /></div>
+              <div class="dense-form-row"><label>Shipping Country</label><input id="shipping_country" value="US" /></div>
+              <div class="dense-form-row"><label>Billing Line 1</label><input id="billing_line1" placeholder="123 Main St" /></div>
+              <div class="dense-form-row"><label>Billing City</label><input id="billing_city" placeholder="Los Angeles" /></div>
+              <div class="dense-form-row"><label>Billing State</label><input id="billing_state" placeholder="CA" /></div>
+              <div class="dense-form-row"><label>Billing Postal Code</label><input id="billing_postal" placeholder="90001" /></div>
+              <div class="dense-form-row"><label>Billing Country</label><input id="billing_country" value="US" /></div>
+            </div>
+            <h3 style="margin-top:10px;">Store Login</h3>
+            <div class="dense-grid">
+              <div class="dense-form-row"><label>Retailer</label><select id="account_retailer"><option>walmart</option><option>target</option><option>bestbuy</option><option>pokemoncenter</option></select></div>
+              <div class="dense-form-row"><label>Username (optional)</label><input id="account_username" placeholder="username" /></div>
+              <div class="dense-form-row"><label>Login Email (optional)</label><input id="account_email" placeholder="login@example.com" /></div>
+              <div class="dense-form-row"><label>Credential Ref*</label><input id="account_credential_ref" placeholder="vault://enc/retailer-login-token" /></div>
+            </div>
+            <h3 style="margin-top:10px;">Payment Method</h3>
+            <div class="dense-grid">
+              <div class="dense-form-row"><label>Label</label><input id="payment_label" placeholder="PayPal Primary" /></div>
+              <div class="dense-form-row"><label>Provider</label><select id="payment_provider"><option value="paypal">paypal</option><option value="stripe_card">stripe_card</option><option value="adyen_card">adyen_card</option></select></div>
+              <div class="dense-form-row"><label>Token Reference*</label><input id="payment_token_reference" placeholder="tok_live_... / paypal_ba_..." /></div>
+            </div>
+            <p class="small">Security: raw card number/CVV is intentionally blocked. Save only tokenized references.</p>
+
+            <h3 style="margin-top:10px;">Virtual Card Import (Excel)</h3>
+            <p class="small">Upload an .xlsx/.xls sheet with columns: <strong>label</strong> (optional), <strong>provider</strong> (optional), <strong>token_reference</strong> (required).</p>
+            <div class="dense-grid">
+              <div class="dense-form-row"><label>Excel File</label><input id="virtual_cc_file" type="file" accept=".xlsx,.xls" /></div>
+              <div class="dense-form-row"><label>Target Profile ID (optional)</label><input id="virtual_cc_profile_id" type="number" placeholder="Auto use newly created profile" /></div>
+            </div>
+            <div class="actions" style="margin-top:8px;">
+              <button type="button" onclick="importVirtualCardsFromExcel()">Import Virtual Cards</button>
+            </div>
+            <div id="virtual_cc_status" class="small"></div>
+
+            <button class="btn-primary" onclick="createVaultProfile()">Save Profile Vault</button>
+            <div id="profiles_error" class="inline-error"></div>
+          </div>
+          <div class="profiles-stack">
+            <div class="card">
+              <h2 class="section-title">Saved Profiles</h2>
+              <div class="table-shell">
+                <table><thead><tr><th>ID</th><th>Name</th><th>Email</th></tr></thead><tbody id="profiles_list"></tbody></table>
+              </div>
+            </div>
+            <div class="card">
+              <h2 class="section-title">Store Logins</h2>
+              <div class="table-shell">
+                <table><thead><tr><th>ID</th><th>Retailer</th><th>User</th></tr></thead><tbody id="accounts_list"></tbody></table>
+              </div>
+            </div>
+            <div class="card">
+              <h2 class="section-title">Payments</h2>
+              <div class="table-shell">
+                <table><thead><tr><th>ID</th><th>Provider</th><th>Label</th></tr></thead><tbody id="payments_list"></tbody></table>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -467,7 +1155,7 @@
           </div>
           <div class="card">
             <h2>Policy</h2>
-            <p class="warn">This app intentionally supports stock monitoring + Discord alerts only. Auto-checkout is not implemented.</p>
+            <p class="warn">This app includes stock monitoring + Discord alerts and an experimental checkout workflow.</p>
           </div>
         </div>
         <div class="card" style="margin-top:16px;">
@@ -493,8 +1181,95 @@
       </section>
 
       <section id="tab-logs" class="tab">
-        <h1>Automation Logs</h1>
-        <div id="logs" class="logs"></div>
+        <h1>Captcha Dashboard</h1>
+        <p class="helper">Configure captcha harvesters for One-Click Gmail sessions and review best-practice setup guidance before running tasks.</p>
+
+        <div class="grid" style="margin-top:16px;">
+          <div class="card">
+            <h2>Quick Start</h2>
+            <ol class="helper" style="padding-left:18px; margin:0; display:flex; flex-direction:column; gap:8px;">
+              <li>Install <strong>Google Chrome</strong>. Captcha solvers use your local Chrome browser profile.</li>
+              <li>Go to <strong>Captchas</strong> and click <strong>Add Captcha</strong> to create a harvester.</li>
+              <li>Optional: set a proxy in <strong>Enter Proxy</strong> if you want captcha traffic on a specific IP.</li>
+              <li>Click the <strong>YouTube</strong> button and sign in to a Google account (not required for Pokémon Center).</li>
+              <li>After sign-in succeeds, close the YouTube window and open the pop-out arrow window before tasks start.</li>
+            </ol>
+          </div>
+
+          <div class="card">
+            <h2>Buttons & Actions</h2>
+            <table>
+              <thead><tr><th>Control</th><th>What it does</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Add Captcha</strong></td><td>Creates another captcha harvester for additional accounts or parallel tasks.</td></tr>
+                <tr><td><strong>Enter Proxy</strong></td><td>Optional. If blank, harvester uses localhost IP. For reCAPTCHA targets, this field proxy is used.</td></tr>
+                <tr><td><strong>Pop-out Arrow</strong></td><td>Opens the harvester window so you can manually answer challenges.</td></tr>
+                <tr><td><strong>YouTube</strong></td><td>Opens Google sign-in flow for the harvester account session.</td></tr>
+                <tr><td><strong>Eraser</strong></td><td>Logs out Google and clears stored harvester state.</td></tr>
+                <tr><td><strong>Trash Can</strong></td><td>Deletes the harvester.</td></tr>
+                <tr><td><strong>Floppy Disk</strong></td><td>Saves current harvester settings and session-related data.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="grid" style="margin-top:16px;">
+          <div class="card">
+            <h2>Auto Click & Auto Solve</h2>
+            <ul class="helper" style="margin:0; padding-left:18px; display:flex; flex-direction:column; gap:8px;">
+              <li><strong>Auto Click</strong>: Works across all modules. Automatically clicks eligible one-click checkbox captchas.</li>
+              <li><strong>Auto Solve (Serverside)</strong>: Pokémon Center only. Uses remote infrastructure and is capped at <strong>10 enabled instances</strong> at once.</li>
+              <li><strong>Auto Solve (Local AI)</strong>: Pokémon Center only. Uses your local machine (GPU/CPU) for solving.</li>
+            </ul>
+            <p class="helper" style="margin-top:10px;">Recommendation: prefer <strong>Serverside</strong> on hosted/server environments. Use <strong>Local AI</strong> on a local PC with strong hardware.</p>
+          </div>
+
+          <div class="card">
+            <h2>Local AI Requirements</h2>
+            <ul class="helper" style="margin:0; padding-left:18px; display:flex; flex-direction:column; gap:8px;">
+              <li>Enable Local AI once; the model downloads automatically and only reinstalls for updates.</li>
+              <li>Before a Pokémon Center drop, confirm solver status shows <strong>Ready</strong> and run a <strong>Test</strong> solve.</li>
+              <li>Minimum <strong>8GB VRAM</strong> recommended. CPU fallback works but is significantly slower.</li>
+              <li>Validated examples include RTX 3060, 3070, and 4060 for stable multi-harvester usage.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+          <h2>Proxy Behavior Notes</h2>
+          <ul class="helper" style="margin:0; padding-left:18px; display:flex; flex-direction:column; gap:8px;">
+            <li>You can solve all captchas with one harvester; multiple harvesters are optional for scale.</li>
+            <li>If Gmail sign-in fails repeatedly, delete the harvester and create a new one.</li>
+            <li>For Pokémon Center-style captcha flows, <strong>task proxy settings take priority</strong> over harvester proxy.</li>
+            <li>For reCAPTCHA flows, the <strong>harvester proxy field</strong> is used for captcha solving.</li>
+          </ul>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+          <h2>Live Captcha Logs</h2>
+          <div id="captcha_guide_logs" class="logs"></div>
+        </div>
+        <h1>Captcha</h1>
+        <div class="grid">
+          <div class="card">
+            <h2 class="section-title">Captcha Auto Solver</h2>
+            <label>Checkout Task ID</label>
+            <input id="captcha_task_id" type="number" placeholder="123" />
+            <label>Solver Prefix</label>
+            <input id="captcha_solver_prefix" value="auto-solved-token" />
+            <label>Poll Interval (seconds)</label>
+            <input id="captcha_poll_seconds" type="number" min="3" value="8" />
+            <div class="actions" style="margin-top:10px;">
+              <button type="button" id="captcha_auto_btn" onclick="toggleCaptchaAutoSolve()">Start Auto Solve</button>
+              <button type="button" onclick="runCaptchaAutoSolveOnce()">Solve Pending Now</button>
+            </div>
+            <div id="captcha_auto_status" class="small" style="margin-top:8px;">Idle.</div>
+          </div>
+          <div class="card">
+            <h2 class="section-title">Captcha Activity</h2>
+            <div id="captcha_activity_logs" class="logs"></div>
+          </div>
+        </div>
       </section>
     </main>
   </div>
@@ -507,7 +1282,292 @@
     let loopRunning = false;
     let selectedTaskId = null;
     let taskMap = new Map();
+    let selectedTaskIds = new Set();
+    let taskStatusFilter = new Set(['all']);
+    let taskSortMode = 'id_desc';
+    const TASK_VIRTUALIZATION_THRESHOLD = 120;
+    const TASK_VIRTUAL_ROW_HEIGHT = 52;
+    const TASK_VIRTUAL_BUFFER = 8;
+    const QUICK_SETUP_POLICY_ENDPOINT = '/api/automation-policies';
+    let taskMonitorsById = new Map();
+    let taskGroups = [];
+    let selectedTaskGroupId = null;
     const toArray = (value, key) => Array.isArray(value) ? value : (value && Array.isArray(value[key]) ? value[key] : []);
+    function toggleTaskSelected(taskId, isSelected) {
+      if (isSelected) {
+        selectedTaskIds.add(taskId);
+      } else {
+        selectedTaskIds.delete(taskId);
+      }
+    }
+
+    function renderStatusChips() {
+      document.querySelectorAll('.status-chip[data-status]').forEach((chip) => {
+        const value = chip.dataset.status;
+        chip.classList.toggle('active', taskStatusFilter.has(value));
+      });
+    }
+    function updateTaskSelectionSummary() {}
+    function setTaskStatusChip(status) {
+      taskStatusFilter = new Set([status || 'all']);
+      renderStatusChips();
+      renderTaskTable();
+    }
+
+    function createTaskGroupPrompt() {
+      const modal = document.getElementById('task_group_modal_overlay');
+      if (!modal) return;
+      document.getElementById('task_group_name_input').value = '';
+      modal.classList.add('open');
+    }
+
+    function closeTaskGroupModal() {
+      document.getElementById('task_group_modal_overlay')?.classList.remove('open');
+    }
+
+    function dismissTaskGroupModal(event) {
+      if (event.target?.id === 'task_group_modal_overlay') closeTaskGroupModal();
+    }
+
+    function createTaskGroupFromModal() {
+      const name = (document.getElementById('task_group_name_input')?.value || '').trim();
+      const site = (document.getElementById('task_group_site_select')?.value || '').trim();
+      if (!name || !site) {
+        showToast('Task group requires a name and site.', true);
+        return;
+      }
+      const group = {id: Date.now(), name, site};
+      taskGroups.push(group);
+      selectedTaskGroupId = group.id;
+      persistTaskGroups();
+      renderTaskGroups();
+      closeTaskGroupModal();
+      showToast(`Created ${name} (${site.toUpperCase()}) group.`);
+    }
+
+    function ensureDefaultTaskGroups() {
+      if (taskGroups.length) return;
+      taskGroups = [
+        {id: 1, name: 'Amazon', site: 'amazon'},
+        {id: 2, name: 'BestBuy', site: 'bestbuy'},
+        {id: 3, name: 'Target', site: 'target'},
+        {id: 4, name: 'Walmart', site: 'walmart'},
+      ];
+      selectedTaskGroupId = taskGroups[0].id;
+      persistTaskGroups();
+      renderTaskGroups();
+    }
+
+    function persistTaskGroups() {
+      localStorage.setItem('task_groups_v1', JSON.stringify(taskGroups));
+      localStorage.setItem('task_groups_selected_v1', String(selectedTaskGroupId || ''));
+    }
+
+    function hydrateTaskGroups() {
+      try {
+        const rawGroups = JSON.parse(localStorage.getItem('task_groups_v1') || '[]');
+        if (Array.isArray(rawGroups)) taskGroups = rawGroups;
+        const selected = Number(localStorage.getItem('task_groups_selected_v1') || '');
+        if (Number.isFinite(selected) && selected > 0) selectedTaskGroupId = selected;
+      } catch (_) {}
+    }
+
+    function taskGroupMatchesSearch(group, term) {
+      if (!term) return true;
+      return `${group.name} ${group.site}`.toLowerCase().includes(term);
+    }
+
+    function selectTaskGroup(id) {
+      selectedTaskGroupId = id;
+      persistTaskGroups();
+      renderTaskGroups();
+      renderTaskTable();
+    }
+
+    function deleteTaskGroup(id) {
+      const group = taskGroups.find((g) => g.id === id);
+      if (!group) return;
+      if (!confirm(`Delete task group "${group.name}"?`)) return;
+      taskGroups = taskGroups.filter((g) => g.id !== id);
+      if (selectedTaskGroupId === id) selectedTaskGroupId = taskGroups[0]?.id || null;
+      persistTaskGroups();
+      renderTaskGroups();
+      renderTaskTable();
+    }
+
+    function toggleTaskGroupMenu(id) {
+      document.querySelectorAll('.task-group-menu').forEach((menu) => menu.classList.remove('open'));
+      const menu = document.getElementById(`task-group-menu-${id}`);
+      if (menu) menu.classList.toggle('open');
+    }
+
+    function renderTaskGroups() {
+      const list = document.getElementById('task_group_list');
+      if (!list) return;
+      const term = (document.getElementById('task_group_search')?.value || '').trim().toLowerCase();
+      list.innerHTML = '';
+      taskGroups.filter((group) => taskGroupMatchesSearch(group, term)).forEach((group) => {
+        const item = document.createElement('div');
+        item.className = `task-group-item ${selectedTaskGroupId === group.id ? 'active' : ''}`;
+        item.innerHTML = `
+          <div class="task-group-meta" onclick="selectTaskGroup(${group.id})">
+            <span class="task-group-name">${group.name}</span>
+            <span class="task-group-site">${group.site}</span>
+          </div>
+          <div class="task-group-menu-wrap">
+            <button class="task-group-menu-btn" onclick="toggleTaskGroupMenu(${group.id})">⋯</button>
+            <div id="task-group-menu-${group.id}" class="task-group-menu">
+              <button onclick="deleteTaskGroup(${group.id})">Delete</button>
+            </div>
+          </div>`;
+        list.appendChild(item);
+      });
+    }
+
+    function editAllTasks() {
+      showToast('Edit All opened in task modal.');
+      openTaskModal();
+    }
+
+    function clearAllTasks() {
+      if (!confirm('Delete all tasks currently loaded?')) return;
+      stopAllTasks().then(async () => {
+        for (const id of Array.from(taskMap.keys())) {
+          await apiFetch(`/api/checkout/tasks/${id}`, {method: 'DELETE'}).catch(() => null);
+        }
+        await loadTasks();
+        showToast('All tasks cleared.');
+      });
+    }
+
+    function openMonitorPulse() {
+      showToast('Monitor popup is not wired to backend yet; connect restock stream endpoint to enable.');
+    }
+
+    function importTasksPrompt() {
+      showToast('Import tool placeholder: connect to task import file endpoint.');
+    }
+
+    function exportTasksPrompt() {
+      const payload = JSON.stringify(Array.from(taskMap.values()), null, 2);
+      const blob = new Blob([payload], {type: 'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'tasks-export.json';
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast('Exported current task group.');
+    }
+
+    function applyTaskSearchFilter() {
+      renderTaskGroups();
+      renderTaskTable();
+    }
+
+    function openTaskModal() {
+      const modal = document.getElementById('task_modal_overlay');
+      if (!modal) return;
+      modal.classList.add('open');
+      updateTaskCreateSummary();
+    }
+
+    function closeTaskModal() {
+      document.getElementById('task_modal_overlay')?.classList.remove('open');
+    }
+
+    function dismissTaskModal(event) {
+      if (event.target?.id === 'task_modal_overlay') closeTaskModal();
+    }
+
+    async function editTask(taskId) {
+      const task = taskMap.get(taskId);
+      if (!task) return;
+      const config = task.task_config || {};
+      document.getElementById('task_name').value = task.task_name || '';
+      document.getElementById('task_mode').value = config.mode || 'default';
+      document.getElementById('task_profile_group').value = config.profile_group || '';
+      document.getElementById('task_proxy_group').value = config.proxy_group || '';
+      document.getElementById('task_queue_entry_delay_ms').value = config.queue_entry_delay_ms || '';
+      document.getElementById('task_products').value = config.products?.[0]?.pid || config.products?.[0]?.url || '';
+      document.getElementById('task_count').value = '1';
+      openTaskModal();
+      showToast(`Loaded task #${taskId} into editor.`);
+    }
+
+    async function duplicateTask(taskId) {
+      const task = taskMap.get(taskId);
+      if (!task) return;
+      const payload = {
+        monitor_id: task.monitor_id,
+        initial_state: 'queued',
+        task_name: `${task.task_name || 'task'} copy`,
+        task_config: structuredClone(task.task_config || {}),
+      };
+      const res = await apiFetch('/api/checkout/tasks', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        showToast('Failed to duplicate task.', true);
+        return;
+      }
+      await loadTasks();
+      showToast(`Duplicated task #${taskId}.`);
+    }
+
+    async function deleteTask(taskId) {
+      if (!confirm(`Delete task #${taskId}?`)) return;
+      await apiFetch(`/api/checkout/tasks/${taskId}`, {method: 'DELETE'});
+      await loadTasks();
+    }
+
+    async function createTasksForSelectedMonitors() {
+      const monitorIds = selectedMonitorIds();
+      if (!monitorIds.length) {
+        showToast('Select at least one monitor first.', true);
+        return;
+      }
+      const taskCount = clampTaskCount(document.getElementById('task_count')?.value || '1');
+      const mode = (document.getElementById('task_mode')?.value || 'default').trim();
+      const profileGroup = (document.getElementById('task_profile_group')?.value || '').trim();
+      const proxyGroup = (document.getElementById('task_proxy_group')?.value || '').trim();
+      const checkoutProxyGroup = (document.getElementById('task_checkout_proxy_group')?.value || '').trim();
+      const queueDelayRaw = (document.getElementById('task_queue_entry_delay_ms')?.value || '').trim();
+      let created = 0;
+      for (const monitorId of monitorIds) {
+        for (let i = 0; i < taskCount; i++) {
+          const res = await apiFetch('/api/checkout/tasks', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              monitor_id: monitorId,
+              initial_state: 'queued',
+              task_name: `auto-${monitorId}-${i + 1}`,
+              task_config: {
+                mode,
+                profile_group: profileGroup || null,
+                proxy_group: proxyGroup || null,
+                checkout_proxy_group: checkoutProxyGroup || null,
+                queue_entry_delay_ms: queueDelayRaw === '' ? null : Number(queueDelayRaw),
+              },
+            }),
+          });
+          if (res.ok) created += 1;
+        }
+      }
+      await loadTasks();
+      showToast(`Created ${created} auto-checkout bot task(s) for selected monitors.`);
+    }
+
+    function getSelectedTaskMonitorRetailer() {
+      const monitorId = Number(document.getElementById('task_monitor_id')?.value || '');
+      return taskMonitorsById.get(monitorId)?.retailer || null;
+    }
+
+    function updateTaskModeFields() {}
+
     function getCaptchaToken() {
       return (document.getElementById('captcha_token')?.value || "").trim();
     }
@@ -552,11 +1612,50 @@
       return token ? {...payload, captcha_token: token} : payload;
     }
 
+    function showToast(message, isError = false) {
+      const existing = document.getElementById('app_toast');
+      if (existing) existing.remove();
+      const toast = document.createElement('div');
+      toast.id = 'app_toast';
+      toast.textContent = message;
+      toast.style.position = 'fixed';
+      toast.style.right = '16px';
+      toast.style.bottom = '16px';
+      toast.style.zIndex = '1000';
+      toast.style.padding = '10px 12px';
+      toast.style.borderRadius = '8px';
+      toast.style.background = isError ? '#6d1e1e' : '#18392c';
+      toast.style.border = isError ? '1px solid #bb5a5a' : '1px solid #3e8b6a';
+      toast.style.color = '#f4f7ff';
+      document.body.appendChild(toast);
+      setTimeout(() => toast.remove(), 3500);
+    }
+
     function setTab(tab) {
+      const tabPane = document.getElementById(`tab-${tab}`);
+      const tabBtn = document.querySelector(`.top-nav button[data-tab="${tab}"]`);
+      if (!tabPane || !tabBtn) {
+        console.warn(`Unknown tab requested: ${tab}`);
+        return;
+      }
       document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
-      document.querySelectorAll('.top-nav button').forEach(el => el.classList.remove('active'));
-      document.getElementById(`tab-${tab}`).classList.add('active');
-      document.querySelector(`.top-nav button[data-tab="${tab}"]`).classList.add('active');
+      document.querySelectorAll('.top-nav button[data-tab]').forEach(el => el.classList.remove('active'));
+      tabPane.classList.add('active');
+      tabBtn.classList.add('active');
+      window.location.hash = `tab-${tab}`;
+    }
+
+    function initializeTabNavigation() {
+      document.querySelectorAll('.top-nav button[data-tab]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const target = button.dataset.tab;
+          if (target) setTab(target);
+        });
+      });
+      const hashTab = (window.location.hash || '').replace(/^#tab-/, '');
+      if (hashTab) {
+        setTab(hashTab);
+      }
     }
 
     function renderApiAuthWarning() {
@@ -571,9 +1670,11 @@
     }
 
     socket.on('log', (d) => {
-      const logs = document.getElementById('logs');
-      logs.textContent += d.message + "\n";
-      logs.scrollTop = logs.scrollHeight;
+      const logs = document.getElementById('captcha_activity_logs');
+      if (logs) {
+        logs.textContent += d.message + "\n";
+        logs.scrollTop = logs.scrollHeight;
+      }
       const selected = selectedTaskId;
       if (!selected) return;
       if ((d.message || '').includes(`Task ${selected}`)) {
@@ -644,29 +1745,53 @@
       const monitorData = await apiFetch('/api/ops/monitor-failure-trends').then(r => r.json()).catch(() => ({trends: []}));
       const webhookData = await apiFetch('/api/ops/webhook-health-trends').then(r => r.json()).catch(() => ({webhooks: []}));
 
-      const monitorRows = toArray(monitorData, 'trends');
+    async function loadCommerceDashboard() {
+      const commerce = await apiFetch('/api/dashboard/commerce').then(r => r.json()).catch(() => ({}));
+      const checkouts = Number(commerce.checkouts_total || 0);
+      const declines = Number(commerce.declines_total || 0);
+      const spent = Number(commerce.spent_total_cents || 0);
+      document.getElementById('kpi_total_monitors').textContent = checkouts;
+      document.getElementById('ops_checks_failed_total').textContent = declines;
+      document.getElementById('ops_webhook_sent_total').textContent = formatMoney(spent);
+      document.getElementById('dashboard_conversion_rate').textContent = `${Math.round(Number(commerce.success_rate || 0) * 100)}%`;
+      document.getElementById('dashboard_average_order').textContent = formatMoney(commerce.average_order_value_cents || 0);
+
+      const monitorRows = toArray(commerce, 'product_orders');
       const monitorBody = document.getElementById('ops_monitor_failure_trends');
       monitorBody.innerHTML = '';
       if (!monitorRows.length) {
-        monitorBody.innerHTML = '<tr><td colspan="3">No failures recorded.</td></tr>';
+        monitorBody.innerHTML = '<tr><td colspan="6">No successful orders yet. Start tasks to populate Product Orders.</td></tr>';
       }
       for (const row of monitorRows) {
+        const productName = String(row.product_name || 'Product').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const image = `https://logo.clearbit.com/${String(row.site || 'example.com').replace(/[^a-z0-9.-]/gi, '')}.com`;
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${row.monitor_id}</td><td>${row.failures_last_24h || 0}</td><td>${row.failures_last_7d || 0}</td>`;
+        tr.innerHTML = `<td>${String(row.site || '').toUpperCase()}</td>
+          <td><div class="order-product-cell"><img class="order-thumb" src="${image}" alt="${productName}" onerror="this.style.display='none';" /><a href="${row.product_url || '#'}" target="_blank" rel="noopener noreferrer">${productName}</a></div></td>
+          <td>${row.quantity || 1}</td>
+          <td>${formatMoney(row.price_cents || 0)}</td>
+          <td>${formatMoney(row.spent_cents || 0)}</td>
+          <td>${formatDateTime(row.purchased_at)}</td>`;
         monitorBody.appendChild(tr);
       }
 
-      const webhookRows = toArray(webhookData, 'webhooks');
+      const webhookRows = toArray(commerce, 'sites_checkouts');
       const webhookBody = document.getElementById('ops_webhook_health_trends');
       webhookBody.innerHTML = '';
+      const siteTotal = webhookRows.reduce((sum, row) => sum + Number(row.checkouts || 0), 0);
       if (!webhookRows.length) {
-        webhookBody.innerHTML = '<tr><td colspan="4">No webhook health data yet.</td></tr>';
+        webhookBody.innerHTML = '<tr><td colspan="3">No site checkout data yet.</td></tr>';
       }
       for (const row of webhookRows) {
+        const share = siteTotal > 0 ? `${((Number(row.checkouts || 0) / siteTotal) * 100).toFixed(1)}%` : '0%';
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${row.webhook_id}</td><td>${row.fail_streak || 0}</td><td>${row.last_status_code || '-'}</td><td>${row.recent_failures_24h || 0}</td>`;
+        tr.innerHTML = `<td>${String(row.site || 'unknown').toUpperCase()}</td><td>${row.checkouts || 0}</td><td>${share}</td>`;
         webhookBody.appendChild(tr);
       }
+
+      renderSiteCheckoutDonut(webhookRows);
+      renderAmountSpentLine(toArray(commerce, 'amount_spent_daily'));
+      document.getElementById('dashboard_best_site').textContent = webhookRows[0]?.site ? String(webhookRows[0].site).toUpperCase() : 'N/A';
     }
 
     async function savePlan() {
@@ -710,75 +1835,497 @@
     }
 
     async function addMonitor() {
-      const maxPrice = document.getElementById('max_price_cents').value;
-      const msrp = document.getElementById('msrp_cents').value;
+      const monitorInput = document.getElementById('product_url')?.value || '';
+      const monitorValidationError = validateMonitorInputClient(monitorInput, {isEditFlow: false, existingProductCount: 0});
+      const monitorErrorEl = document.getElementById('monitor_input_error');
+      if (monitorErrorEl) monitorErrorEl.textContent = monitorValidationError || '';
+      if (monitorValidationError) return;
+
+      const retailerEl = document.getElementById('retailer');
+      const productUrlEl = document.getElementById('product_url');
+      const pollIntervalEl = document.getElementById('poll_interval');
+      const keywordEl = document.getElementById('keyword');
+      const maxPriceEl = document.getElementById('max_price_cents');
+      const msrpEl = document.getElementById('msrp_cents');
+      const maxPrice = maxPriceEl?.value || '';
+      const msrp = msrpEl?.value || '';
+      const pollIntervalRaw = (pollIntervalEl?.value || '').trim();
+      const pollIntervalParsed = pollIntervalRaw === '' ? 20 : Number(pollIntervalRaw);
+      if (!Number.isFinite(pollIntervalParsed) || pollIntervalParsed <= 0) {
+        alert('Poll interval must be a valid positive number of seconds.');
+        return;
+      }
+
       const payload = {
-        retailer: document.getElementById('retailer').value,
-        product_url: document.getElementById('product_url').value,
-        poll_interval_seconds: Number(document.getElementById('poll_interval').value),
-        keyword: document.getElementById('keyword').value || null,
+        retailer: retailerEl?.value || '',
+        product_url: productUrlEl?.value || '',
+        poll_interval_seconds: pollIntervalParsed,
+        keyword: keywordEl?.value || null,
         max_price_cents: maxPrice ? Number(maxPrice) : null,
         msrp_cents: msrp ? Number(msrp) : null,
       };
 
-      const res = await apiFetch('/api/monitors', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))
+      try {
+        const res = await apiFetch('/api/monitors', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(appendCaptchaToken(payload))
+        });
+
+        let data;
+        try {
+          data = await res.json();
+        } catch (error) {
+          alert(`Failed to parse monitor API response: ${error?.message || error}`);
+          return;
+        }
+
+        if (!res.ok || data.error) {
+          alert(data?.error || `Failed to add monitor (HTTP ${res.status}).`);
+          return;
+        }
+
+        alert(`Monitor added (id=${data.id})`);
+        await loadMonitors();
+        await loadDashboardSummary();
+      } catch (error) {
+        alert(`Failed to add monitor due to a network or fetch error: ${error?.message || error}`);
+      }
+    }
+
+    async function createQuickSetupFlow(event) {
+      if (event) event.preventDefault();
+      const monitorInput = (document.getElementById('quick_product_url')?.value || '').trim();
+      const monitorValidationError = validateMonitorInputClient(monitorInput, {isEditFlow: false, existingProductCount: 0});
+      if (monitorValidationError) {
+        showToast(monitorValidationError, true);
+        return;
+      }
+
+      const selectedMonitorId = Number((document.getElementById('quick_monitor_selection')?.value || '').trim());
+      const pollIntervalRaw = (document.getElementById('quick_poll_interval')?.value || '').trim();
+      const pollIntervalParsed = pollIntervalRaw === '' ? 20 : Number(pollIntervalRaw);
+      if (!Number.isFinite(pollIntervalParsed) || pollIntervalParsed <= 0) {
+        showToast('Poll interval must be a valid positive number of seconds.', true);
+        return;
+      }
+
+      let monitorId = Number.isInteger(selectedMonitorId) && selectedMonitorId > 0 ? selectedMonitorId : null;
+      if (!monitorId) {
+        const maxPrice = document.getElementById('quick_max_price_cents')?.value || '';
+        const msrp = document.getElementById('quick_msrp_cents')?.value || '';
+        const monitorPayload = {
+          retailer: document.getElementById('quick_retailer')?.value || '',
+          product_url: monitorInput,
+          poll_interval_seconds: pollIntervalParsed,
+          keyword: (document.getElementById('quick_keyword')?.value || '').trim() || null,
+          max_price_cents: maxPrice ? Number(maxPrice) : null,
+          msrp_cents: msrp ? Number(msrp) : null,
+        };
+        const monitorRes = await apiFetch('/api/monitors', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(appendCaptchaToken(monitorPayload))
+        });
+        const monitorData = await monitorRes.json();
+        if (!monitorRes.ok || monitorData?.error || !monitorData?.id) {
+          showToast(monitorData?.error || `Failed to create monitor (HTTP ${monitorRes.status}).`, true);
+          return;
+        }
+        monitorId = Number(monitorData.id);
+      }
+
+      const webhookId = Number((document.getElementById('quick_webhook_target')?.value || '').trim());
+      if (!Number.isInteger(webhookId) || webhookId <= 0) {
+        showToast('Select a webhook target before enabling auto action.', true);
+        return;
+      }
+      const policyRes = await apiFetch(QUICK_SETUP_POLICY_ENDPOINT, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken({
+          monitor_id: monitorId,
+          webhook_id: webhookId,
+          auto_buy_enabled: true,
+          alert_enabled: true,
+        }))
       });
-      const data = await res.json();
-      alert(data.error || `Monitor added (id=${data.id})`);
+      const policyData = await policyRes.json();
+      if (!policyRes.ok || policyData?.error || !policyData?.id) {
+        showToast(policyData?.error || `Failed to create automation policy (HTTP ${policyRes.status}).`, true);
+        return;
+      }
+
+      showToast(`Quick setup complete: monitor #${monitorId}, policy #${policyData.id}.`);
       await loadMonitors();
+      await loadTasks();
       await loadDashboardSummary();
     }
 
     async function createTask() {
-      const payload = {
-        retailer: document.getElementById('task_retailer').value,
-        url: document.getElementById('task_url').value,
-        profile: document.getElementById('task_profile').value,
-        account: document.getElementById('task_account').value,
-        payment: document.getElementById('task_payment').value,
-      };
-      const res = await apiFetch('/api/tasks', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
-      });
-      const data = await res.json();
-      if (data.error) {
-        alert(data.error);
+      const monitorIdRaw = (document.getElementById('task_monitor_id')?.value || '').trim();
+      const taskName = (document.getElementById('task_name')?.value || '').trim();
+      const taskCount = clampTaskCount(document.getElementById('task_count')?.value || '1');
+      const taskInput = document.getElementById('task_products')?.value || '';
+      const taskValidationError = taskInput.trim()
+        ? validateMonitorInputClient(taskInput, {isEditFlow: false, existingProductCount: 0})
+        : null;
+      const taskErrorEl = document.getElementById('create_task_error');
+      if (taskErrorEl) taskErrorEl.textContent = taskValidationError || '';
+      if (taskValidationError) return;
+      const monitorId = Number(monitorIdRaw);
+      const monitoredRetailer = getSelectedTaskMonitorRetailer();
+
+      if (!Number.isInteger(monitorId) || monitorId <= 0) {
+        alert('Select a valid monitor before creating a task.');
         return;
       }
+
+      const mode = (document.getElementById('task_mode')?.value || 'default').trim();
+      const profileGroup = (document.getElementById('task_profile_group')?.value || '').trim();
+      const proxyGroup = (document.getElementById('task_proxy_group')?.value || '').trim();
+      const checkoutProxyGroup = (document.getElementById('task_checkout_proxy_group')?.value || '').trim();
+      const queueDelayRaw = (document.getElementById('task_queue_entry_delay_ms')?.value || '').trim();
+      const promoCode = (document.getElementById('task_promo_code')?.value || '').trim();
+      const payloadBase = {
+        monitor_id: monitorId,
+        initial_state: 'queued',
+        task_config: {
+          mode,
+          profile_group: profileGroup || null,
+          proxy_group: proxyGroup || null,
+          checkout_proxy_group: checkoutProxyGroup || null,
+          queue_entry_delay_ms: queueDelayRaw === '' ? null : Number(queueDelayRaw),
+          promo_code: promoCode || null,
+        }
+      };
+
+      if (taskName) {
+        payloadBase.task_name = taskName;
+      }
+      if (taskInput.trim()) {
+        payloadBase.task_config.products = parseProductsForTaskConfig(taskInput);
+      }
+
+      try {
+        for (let i = 0; i < taskCount; i++) {
+          const taskPayload = structuredClone(payloadBase);
+          if (taskName && taskCount > 1) {
+            taskPayload.task_name = `${taskName} (${i + 1}/${taskCount})`;
+          }
+          const res = await apiFetch('/api/checkout/tasks', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(appendCaptchaToken(taskPayload))
+          });
+          const data = await res.json();
+          if (!res.ok || data?.error) {
+            alert(data?.error || `Failed to create task (HTTP ${res.status}).`);
+            break;
+          }
+        }
+        await loadTasks();
+        updateTaskCreateSummary();
+        closeTaskModal();
+      } catch (error) {
+        alert(`Failed to create task due to a network or fetch error: ${error?.message || error}`);
+      }
+    }
+
+    function parseProductsForTaskConfig(rawInput) {
+      const value = (rawInput || '').trim();
+      if (!value) return [];
+      if (value.toLowerCase() === 'placeholder') return [{pid: 'placeholder', quantity: 1}];
+      if (value.startsWith('http://') || value.startsWith('https://')) return [{url: value, quantity: 1}];
+      return value.split(',').map((segment) => {
+        const [pidRaw, qtyRaw] = segment.trim().split(':');
+        return {pid: (pidRaw || '').trim(), quantity: qtyRaw ? Number(qtyRaw.trim()) : 1};
+      });
+    }
+
+    function clampTaskCount(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return 1;
+      return Math.max(1, Math.min(100, Math.floor(n)));
+    }
+
+    function adjustTaskCount(delta) {
+      const input = document.getElementById('task_count');
+      if (!input) return;
+      input.value = String(clampTaskCount(Number(input.value || 1) + delta));
+      updateTaskCreateSummary();
+    }
+
+    function isValidPromoCode(promoCode) {
+      if (!promoCode) return true;
+      return /^[A-Z0-9_-]{4,20}$/i.test(promoCode);
+    }
+
+    function updateTaskCreateSummary() {
+      const taskCount = clampTaskCount(document.getElementById('task_count')?.value || '1');
+      const mode = (document.getElementById('task_mode')?.value || 'default').trim();
+      const productInput = (document.getElementById('task_products')?.value || '').trim();
+      const profileGroup = (document.getElementById('task_profile_group')?.value || '').trim();
+      const proxyGroup = (document.getElementById('task_proxy_group')?.value || '').trim();
+      const monitorId = (document.getElementById('task_monitor_id')?.value || '').trim();
+      const promoCode = (document.getElementById('task_promo_code')?.value || '').trim();
+      const createBtn = document.getElementById('create_task_btn');
+      const promoWarning = document.getElementById('task_promo_warning');
+      const taskErrorEl = document.getElementById('create_task_error');
+      const productError = productInput ? validateMonitorInputClient(productInput, {isEditFlow: false, existingProductCount: 0}) : null;
+      const promoOk = isValidPromoCode(promoCode);
+
+      document.getElementById('summary_task_count').textContent = String(taskCount);
+      document.getElementById('summary_mode').textContent = mode || 'default';
+      document.getElementById('summary_products').textContent = productInput || 'monitor default';
+      document.getElementById('summary_profile_group').textContent = profileGroup || '-';
+      document.getElementById('summary_proxy_group').textContent = proxyGroup || '-';
+      if (promoWarning) promoWarning.textContent = promoOk ? '' : 'Promo code appears invalid and may be rejected at checkout.';
+      if (taskErrorEl) taskErrorEl.textContent = productError || '';
+
+      const valid = Boolean(monitorId) && !productError && promoOk && taskCount >= 1;
+      if (createBtn) {
+        createBtn.textContent = `Create (${taskCount})`;
+        createBtn.disabled = !valid;
+      }
+    }
+
+    function validateMonitorInputClient(rawInput, options = {}) {
+      const value = (rawInput || '').trim();
+      if (!value) return 'Product input is required.';
+      if (value.toLowerCase() === 'placeholder') return null;
+      if (value.startsWith('http://') || value.startsWith('https://')) return null;
+
+      const segments = value.split(',').map(s => s.trim());
+      if (segments.some(s => !s)) return 'invalid PID format: empty segment';
+      const quickEditMode = segments.length > 1 || segments.some(s => s.includes(':'));
+      if (quickEditMode && (!options.isEditFlow || options.existingProductCount !== 1)) {
+        return 'Quick Edit is only allowed when editing a task with exactly one product.';
+      }
+
+      for (const segment of segments) {
+        const [pid, qtyRaw] = segment.split(':');
+        if (!/^\d{2}-\d{5}-\d{3}$/.test((pid || '').trim())) {
+          return 'invalid PID format';
+        }
+        if (qtyRaw !== undefined) {
+          const qtyText = qtyRaw.trim();
+          if (!/^\d+$/.test(qtyText) || Number(qtyText) <= 0) return 'invalid quantity (must be an integer > 0)';
+        }
+      }
+      return null;
+    }
+
+    function normalizePidCandidate(raw) {
+      const digits = String(raw || '').replace(/\D/g, '');
+      if (digits.length !== 10) return null;
+      return `${digits.slice(0, 2)}-${digits.slice(2, 7)}-${digits.slice(7, 10)}`;
+    }
+
+    function extractPidCandidatesFromMonitorPayload(rawText) {
+      const text = String(rawText || '');
+      const candidates = new Set();
+      const pidRegex = /\b\d{2}-\d{5}-\d{3}\b/g;
+      const skuRegex = /\b\d{10}\b/g;
+      for (const match of text.match(pidRegex) || []) {
+        const normalized = normalizePidCandidate(match);
+        if (normalized) candidates.add(normalized);
+      }
+      for (const match of text.match(skuRegex) || []) {
+        const normalized = normalizePidCandidate(match);
+        if (normalized) candidates.add(normalized);
+      }
+      return Array.from(candidates);
+    }
+
+    function renderMonitorPayloadCandidates(candidates) {
+      const container = document.getElementById('monitor_payload_candidates');
+      const status = document.getElementById('monitor_payload_status');
+      container.innerHTML = '';
+      if (!candidates.length) {
+        status.textContent = 'No PID candidates found.';
+        return;
+      }
+      status.textContent = `Found ${candidates.length} candidate(s). Use "Apply to Group" for selected monitors.`;
+      for (const pid of candidates) {
+        const row = document.createElement('div');
+        row.className = 'assist-candidate-item';
+        row.innerHTML = `
+          <span>${pid}</span>
+          <button onclick="applyMonitorAssistPid('${pid}')">Apply to Group</button>
+        `;
+        container.appendChild(row);
+      }
+    }
+
+    function parseMonitorPayloadCandidates() {
+      const raw = document.getElementById('monitor_payload_input')?.value || '';
+      const candidates = extractPidCandidatesFromMonitorPayload(raw);
+      renderMonitorPayloadCandidates(candidates);
+      if (candidates.length) {
+        const productUrl = document.getElementById('product_url');
+        if (productUrl) {
+          productUrl.value = `https://www.pokemoncenter.com/product/${candidates[0]}`;
+        }
+      }
+    }
+
+    async function applyMonitorAssistPid(pid) {
+      const monitor_ids = selectedMonitorIds();
+      if (!monitor_ids.length) {
+        alert('Select at least one monitor in Monitor List before applying a PID.');
+        return;
+      }
+      const res = await apiFetch('/api/monitors/monitor-assist/apply', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({monitor_ids, pid}),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        alert(data.error || `Failed to apply PID (HTTP ${res.status})`);
+        return;
+      }
+      const productUrl = document.getElementById('product_url');
+      if (productUrl) {
+        productUrl.value = data.product_url || `https://www.pokemoncenter.com/product/${pid}`;
+      }
+      alert(`Applied ${pid} to ${data.updated_monitors || 0} monitor(s).`);
+      await loadMonitors();
       await loadTasks();
-      selectTask(data.id);
+      if (selectedTaskId) await loadTaskAttempts(selectedTaskId);
     }
 
     function taskErrorLabel(value) {
       return value ? value : '-';
     }
 
+    function statePill(state) {
+      const normalized = String(state || 'unknown').toLowerCase();
+      const safeText = normalized.replace(/[^a-z0-9_-]/g, '_');
+      return `<span class="state-pill state-${safeText}">${normalized}</span>`;
+    }
+
+    function taskStateTone(state) {
+      const normalized = (state || '').toLowerCase();
+      if (['success', 'verification_code_received'].includes(normalized)) return 'success';
+      if (['failed'].includes(normalized)) return 'danger';
+      if (['queued', 'carting', 'shipping', 'payment', 'submitting'].includes(normalized)) return 'warning';
+      if (['monitoring', 'running'].includes(normalized)) return 'info';
+      return 'neutral';
+    }
+
+    function renderStatusBadge(state) {
+      const tone = taskStateTone(state);
+      const label = state || 'unknown';
+      return `<span class="status-badge ${tone}">${label.replaceAll('_', ' ')}</span>`;
+    }
+
+    function renderTaskMetrics(rows) {
+      const counts = {
+        total: rows.length,
+        running: 0,
+        queued: 0,
+        success: 0,
+      };
+      for (const task of rows) {
+        const state = (task.state || '').toLowerCase();
+        if (state === 'monitoring' || state === 'running') counts.running += 1;
+        if (state === 'queued') counts.queued += 1;
+        if (state === 'success') counts.success += 1;
+      }
+      const metricTotal = document.getElementById('metric_total');
+      const metricRunning = document.getElementById('metric_running');
+      const metricQueued = document.getElementById('metric_queued');
+      const metricSuccess = document.getElementById('metric_success');
+      if (metricTotal) metricTotal.textContent = counts.total;
+      if (metricRunning) metricRunning.textContent = counts.running;
+      if (metricQueued) metricQueued.textContent = counts.queued;
+      if (metricSuccess) metricSuccess.textContent = counts.success;
+    }
+
     function renderTaskTable() {
       const tbody = document.getElementById('tasks');
       tbody.innerHTML = '';
       const rows = Array.from(taskMap.values()).sort((a, b) => b.id - a.id);
-      for (const task of rows) {
+      const search = (document.getElementById('task_search')?.value || document.getElementById('task_group_search')?.value || '').trim().toLowerCase();
+      const statusDropdown = (document.getElementById('task_status_filter')?.value || '').trim().toLowerCase();
+      const chipStatus = Array.from(taskStatusFilter)[0] || 'all';
+      const filtered = rows.filter((task) => {
+        const state = String(task.state || '').toLowerCase();
+        const retailer = String(task.retailer || taskMonitorsById.get(Number(task.monitor_id))?.retailer || '').toLowerCase();
+        const productText = String(task?.task_config?.products?.[0]?.pid || task?.task_config?.products?.[0]?.url || '-');
+        const haystack = `${task.id} ${task.task_name || ''} ${task.retailer || ''} ${task.monitor_id || ''} ${productText}`.toLowerCase();
+        const selectedGroup = taskGroups.find((g) => g.id === selectedTaskGroupId);
+        const siteMatch = !selectedGroup || !selectedGroup.site || retailer === selectedGroup.site.toLowerCase();
+        const statusMatch = (!statusDropdown || state === statusDropdown) && (chipStatus === 'all' || state === chipStatus || (chipStatus === 'running' && ['running', 'monitoring'].includes(state)));
+        const searchMatch = !search || haystack.includes(search);
+        return statusMatch && searchMatch && siteMatch;
+      });
+      const total = filtered.length;
+      const active = filtered.filter((task) => !['stopped', 'success', 'failed'].includes(String(task.state || '').toLowerCase())).length;
+      const queued = filtered.filter((task) => String(task.state || '').toLowerCase() === 'queued').length;
+      const failed = filtered.filter((task) => String(task.state || '').toLowerCase() === 'failed').length;
+      const kpiTotal = document.getElementById('task_kpi_total');
+      const kpiActive = document.getElementById('task_kpi_active');
+      const kpiQueued = document.getElementById('task_kpi_queued');
+      const kpiFailed = document.getElementById('task_kpi_failed');
+      if (kpiTotal) kpiTotal.textContent = String(total);
+      if (kpiActive) kpiActive.textContent = String(active);
+      if (kpiQueued) kpiQueued.textContent = String(queued);
+      if (kpiFailed) kpiFailed.textContent = String(failed);
+      renderTaskMetrics(filtered);
+      for (const task of filtered) {
+        const config = task.task_config || {};
+        const firstProduct = (config.products && config.products[0]) || {};
+        const productLabel = firstProduct.pid || firstProduct.url || '-';
+        const mode = config.mode || 'default';
+        const delay = config.queue_entry_delay_ms ?? '-';
+        const quantity = firstProduct.quantity ?? 1;
+        const checkoutSet = config.profile_group || 'Stella Alpha';
+        const region = config.region || 'US';
         const tr = document.createElement('tr');
         tr.innerHTML = `
+          <td><input type="checkbox" class="task-select" value="${task.id}" ${selectedTaskIds.has(task.id) ? 'checked' : ''} onchange="toggleTaskSelected(${task.id}, this.checked)" /></td>
           <td>${task.id}</td>
-          <td>${task.retailer}</td>
-          <td>${task.state}</td>
-          <td>${task.retries || 0}</td>
-          <td>${task.last_step || '-'}</td>
-          <td>${taskErrorLabel(task.last_error)}</td>
+          <td>${mode}</td>
+          <td>${productLabel}</td>
+          <td>${checkoutSet}</td>
+          <td>${region}</td>
+          <td>${delay}</td>
+          <td>${quantity}</td>
+          <td>Bot</td>
+          <td>${renderStatusBadge(task.state)}</td>
           <td class="actions">
-            <button onclick="startTask(${task.id})">Start</button>
-            <button onclick="stopTask(${task.id})">Stop</button>
-            <button onclick="selectTask(${task.id})">Logs</button>
+            <button class="task-icon-btn" title="Pause/Start" onclick="startTask(${task.id})">⏯</button>
+            <button class="task-icon-btn" title="Edit" onclick="editTask(${task.id})">✎</button>
+            <button class="task-icon-btn" title="Duplicate" onclick="duplicateTask(${task.id})">⧉</button>
+            <button class="task-icon-btn" title="Logs" onclick="selectTask(${task.id})">☰</button>
+            <button class="task-icon-btn" title="Delete" onclick="deleteTask(${task.id})">🗑</button>
           </td>
         `;
         tbody.appendChild(tr);
       }
+      renderStatusChips();
+      updateTaskSelectionSummary();
+    }
+
+    async function startAllTasks() {
+      const ids = Array.from(taskMap.keys());
+      for (const id of ids) {
+        await apiFetch(`/api/checkout/tasks/${id}/start`, {method: 'POST'});
+      }
+      await loadTasks();
+    }
+
+    async function stopAllTasks() {
+      const ids = Array.from(taskMap.keys());
+      for (const id of ids) {
+        await apiFetch(`/api/checkout/tasks/${id}/stop`, {method: 'POST'});
+      }
+      await loadTasks();
     }
 
     async function loadTasks() {
-      const rows = await apiFetch('/api/tasks').then(r => r.json()).catch(() => []);
+      const rows = await apiFetch('/api/checkout/tasks').then(r => r.json()).catch(() => []);
       taskMap = new Map();
       for (const row of rows) {
         taskMap.set(row.id, row);
@@ -787,12 +2334,48 @@
     }
 
     async function startTask(id) {
-      await apiFetch(`/api/tasks/${id}/start`, {method: 'POST'});
+      await apiFetch(`/api/checkout/tasks/${id}/start`, {method: 'POST'});
+      await loadTasks();
+    }
+
+    async function startTaskNow(id) {
+      await apiFetch('/api/checkout/tasks/start-now', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({task_ids: [id]})
+      });
+      await loadTasks();
+    }
+
+    async function startSelectedTasksNow() {
+      const ids = Array.from(document.querySelectorAll('.task-select:checked'))
+        .map((el) => Number(el.value))
+        .filter((id) => Number.isInteger(id) && id > 0);
+      if (ids.length === 0) {
+        alert('Select at least one task to use Start Now override.');
+        return;
+      }
+      await apiFetch('/api/checkout/tasks/start-now', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({task_ids: ids})
+      });
       await loadTasks();
     }
 
     async function stopTask(id) {
-      await apiFetch(`/api/tasks/${id}/stop`, {method: 'POST'});
+      await apiFetch(`/api/checkout/tasks/${id}/stop`, {method: 'POST'});
+      await loadTasks();
+    }
+
+    async function runTask(id) {
+      await apiFetch(`/api/checkout/tasks/${id}/run`, {method: 'POST'});
+      await loadTasks();
+      await loadTaskAttempts(id);
+    }
+
+    async function pauseTask(id) {
+      await apiFetch(`/api/checkout/tasks/${id}/pause`, {method: 'POST'});
       await loadTasks();
     }
 
@@ -804,18 +2387,59 @@
     }
 
     async function loadTaskAttempts(taskId) {
-      const attempts = await apiFetch(`/api/tasks/${taskId}/attempts`).then(r => r.json()).catch(() => []);
+      const attempts = await apiFetch(`/api/checkout/tasks/${taskId}/attempts`).then(r => r.json()).catch(() => []);
       const logs = document.getElementById('task_logs');
       logs.textContent = '';
       for (const attempt of attempts.slice().reverse()) {
-        logs.textContent += `[${attempt.created_at}] attempt=${attempt.attempt_number} state=${attempt.state} step=${attempt.step || '-'} err=${attempt.error || '-'}\n`;
+        const details = attempt.details || {};
+        const statusSignal = details.status_signal ? ` status=${details.status_signal}` : '';
+        const statusHint = details.status_hint ? ` hint=${details.status_hint}` : '';
+        logs.textContent += `[${attempt.created_at}] state=${attempt.state} step=${attempt.step || '-'}${statusSignal}${statusHint} err=${attempt.error || '-'}\n`;
       }
       logs.scrollTop = logs.scrollHeight;
     }
 
     async function loadMonitors() {
       const rows = await apiFetch('/api/monitors').then(r => r.json());
+      const taskMonitorSelect = document.getElementById('task_monitor_id');
+      const quickMonitorSelect = document.getElementById('quick_monitor_selection');
       const tbody = document.getElementById('monitors');
+      taskMonitorsById = new Map(Array.isArray(rows) ? rows.map((m) => [Number(m.id), m]) : []);
+      if (!Array.isArray(rows)) {
+        if (taskMonitorSelect) {
+          taskMonitorSelect.innerHTML = '<option disabled selected>Unable to load monitors (check API auth)</option>';
+        }
+        if (quickMonitorSelect) {
+          quickMonitorSelect.innerHTML = '<option disabled selected>Unable to load monitors</option>';
+        }
+        if (tbody) {
+          tbody.innerHTML = '';
+        }
+        return;
+      }
+      if (taskMonitorSelect) {
+        const previous = taskMonitorSelect.value;
+        if (rows.length === 0) {
+          taskMonitorSelect.innerHTML = '<option disabled selected>No monitors yet — add one below first</option>';
+        } else {
+          taskMonitorSelect.innerHTML = rows
+            .map((m) => `<option value="${m.id}">#${m.id} ${m.retailer} - ${m.product_url}</option>`)
+            .join('');
+          if (previous && rows.some((m) => String(m.id) === previous)) taskMonitorSelect.value = previous;
+        }
+        taskMonitorSelect.onchange = () => updateTaskModeFields();
+      }
+      if (quickMonitorSelect) {
+        const previousQuick = quickMonitorSelect.value;
+        if (rows.length === 0) {
+          quickMonitorSelect.innerHTML = '<option value="">Create a new monitor in Step 1</option>';
+        } else {
+          quickMonitorSelect.innerHTML = '<option value="">Create a new monitor in Step 1</option>' + rows
+            .map((m) => `<option value="${m.id}">Use #${m.id} ${m.retailer}</option>`)
+            .join('');
+          if (previousQuick && rows.some((m) => String(m.id) === previousQuick)) quickMonitorSelect.value = previousQuick;
+        }
+      }
       tbody.innerHTML = '';
       for (const r of rows) {
         const tr = document.createElement('tr');
@@ -861,8 +2485,22 @@
 
     async function loadWebhooks() {
       const hooks = await apiFetch('/api/webhooks').then(r => r.json());
+      const quickWebhookSelect = document.getElementById('quick_webhook_target');
       const tbody = document.getElementById('webhooks');
       tbody.innerHTML = '';
+      if (quickWebhookSelect) {
+        const previous = quickWebhookSelect.value;
+        if (!Array.isArray(hooks) || hooks.length === 0) {
+          quickWebhookSelect.innerHTML = '<option value="">Add a webhook first</option>';
+        } else {
+          quickWebhookSelect.innerHTML = hooks
+            .map((h) => `<option value="${h.id}">#${h.id} ${h.name}</option>`)
+            .join('');
+          if (previous && hooks.some((h) => String(h.id) === previous)) {
+            quickWebhookSelect.value = previous;
+          }
+        }
+      }
       for (const h of hooks) {
         const tr = document.createElement('tr');
         tr.innerHTML = `
@@ -878,6 +2516,132 @@
         `;
         tbody.appendChild(tr);
       }
+    }
+
+    async function createCaptchaHarvester() {
+      const payload = {
+        name: (document.getElementById('captcha_name')?.value || '').trim() || 'Harvester',
+        proxy_url: (document.getElementById('captcha_proxy')?.value || '').trim() || null,
+        auto_click_enabled: document.getElementById('captcha_auto_click')?.checked ?? true,
+        auto_solve_mode: document.getElementById('captcha_auto_solve_mode')?.value || 'off',
+      };
+      const res = await apiFetch('/api/captcha/harvesters', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken(payload)),
+      });
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Failed to create harvester (HTTP ${res.status})`, true);
+        return;
+      }
+      const nameEl = document.getElementById('captcha_name');
+      const proxyEl = document.getElementById('captcha_proxy');
+      if (nameEl) nameEl.value = '';
+      if (proxyEl) proxyEl.value = '';
+      showToast(`Created captcha harvester #${data.id}.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function loadCaptchaHarvesters() {
+      const rows = await apiFetch('/api/captcha/harvesters').then(r => r.json()).catch(() => []);
+      const tbody = document.getElementById('captcha_harvesters');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+      const records = Array.isArray(rows) ? rows : [];
+      if (!records.length) {
+        tbody.innerHTML = '<tr><td colspan="7">No harvesters yet. Click Add Captcha to create one.</td></tr>';
+        return;
+      }
+      for (const row of records) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${row.id}</td>
+          <td>${row.name || '-'}</td>
+          <td>${row.gmail_email || '-'}</td>
+          <td>${row.proxy_url || '-'}</td>
+          <td>${row.auto_solve_mode || 'off'}<div class="muted">Auto Click: ${row.auto_click_enabled ? 'on' : 'off'}</div></td>
+          <td>${row.session_status || '-'}<div class="muted">Local AI: ${row.local_ai_status || '-'}</div></td>
+          <td class="actions">
+            <button onclick="signinCaptchaHarvester(${row.id})">YouTube</button>
+            <button onclick="saveCaptchaHarvester(${row.id})">💾 Save</button>
+            <button onclick="testCaptchaLocalAi(${row.id})">Test AI</button>
+            <button onclick="clearCaptchaHarvester(${row.id})">🧽 Erase</button>
+            <button onclick="deleteCaptchaHarvester(${row.id})">🗑 Delete</button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function signinCaptchaHarvester(id) {
+      const gmail_email = prompt('Enter Gmail for this harvester:');
+      if (!gmail_email) return;
+      const res = await apiFetch(`/api/captcha/harvesters/${id}/youtube-signin`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken({gmail_email})),
+      });
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Sign-in failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} signed in.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function saveCaptchaHarvester(id) {
+      const auto_solve_mode = document.getElementById('captcha_auto_solve_mode')?.value || 'off';
+      const auto_click_enabled = document.getElementById('captcha_auto_click')?.checked ?? true;
+      const proxy_url = (document.getElementById('captcha_proxy')?.value || '').trim() || null;
+      const res = await apiFetch(`/api/captcha/harvesters/${id}`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken({auto_solve_mode, auto_click_enabled, proxy_url})),
+      });
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Save failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} saved.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function testCaptchaLocalAi(id) {
+      const res = await apiFetch(`/api/captcha/harvesters/${id}/local-ai-test`, {method: 'POST'});
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Local AI test failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} local AI is ready.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function clearCaptchaHarvester(id) {
+      const res = await apiFetch(`/api/captcha/harvesters/${id}/clear`, {method: 'POST'});
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Clear failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} cleared.`);
+      await loadCaptchaHarvesters();
+    }
+
+    async function deleteCaptchaHarvester(id) {
+      const confirmed = confirm(`Delete captcha harvester #${id}?`);
+      if (!confirmed) return;
+      const res = await apiFetch(`/api/captcha/harvesters/${id}`, {method: 'DELETE'});
+      const data = await res.json();
+      if (!res.ok || data?.error) {
+        showToast(data?.error || `Delete failed (HTTP ${res.status})`, true);
+        return;
+      }
+      showToast(`Harvester #${id} deleted.`);
+      await loadCaptchaHarvesters();
     }
 
     async function testWebhook(id) {
@@ -898,9 +2662,311 @@
       await loadWebhooks();
     }
 
+    function profileAddress(prefix) {
+      return {
+        line1: document.getElementById(`${prefix}_line1`)?.value || '',
+        city: document.getElementById(`${prefix}_city`)?.value || '',
+        state: document.getElementById(`${prefix}_state`)?.value || '',
+        postal_code: document.getElementById(`${prefix}_postal`)?.value || '',
+        country: document.getElementById(`${prefix}_country`)?.value || '',
+      };
+    }
+
+    async function loadProfilesPanel() {
+      const [profiles, accounts, payments] = await Promise.all([
+        apiFetch('/api/profiles').then(r => r.json()).catch(() => []),
+        apiFetch('/api/accounts').then(r => r.json()).catch(() => []),
+        apiFetch('/api/payments').then(r => r.json()).catch(() => []),
+      ]);
+
+      const profileBody = document.getElementById('profiles_list');
+      if (profileBody) {
+        profileBody.innerHTML = '';
+        for (const row of (Array.isArray(profiles) ? profiles : [])) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${row.id}</td><td>${row.name}</td><td>${row.email || '-'}</td>`;
+          profileBody.appendChild(tr);
+        }
+        if (!profileBody.innerHTML) profileBody.innerHTML = '<tr><td colspan="3">No profiles yet.</td></tr>';
+      }
+
+      const accountsBody = document.getElementById('accounts_list');
+      if (accountsBody) {
+        accountsBody.innerHTML = '';
+        for (const row of (Array.isArray(accounts) ? accounts : [])) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${row.id}</td><td>${row.retailer}</td><td>${row.username || row.email || '-'}</td>`;
+          accountsBody.appendChild(tr);
+        }
+        if (!accountsBody.innerHTML) accountsBody.innerHTML = '<tr><td colspan="3">No store logins yet.</td></tr>';
+      }
+
+      const paymentsBody = document.getElementById('payments_list');
+      if (paymentsBody) {
+        paymentsBody.innerHTML = '';
+        for (const row of (Array.isArray(payments) ? payments : [])) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${row.id}</td><td>${row.provider || '-'}</td><td>${row.label}</td>`;
+          paymentsBody.appendChild(tr);
+        }
+        if (!paymentsBody.innerHTML) paymentsBody.innerHTML = '<tr><td colspan="3">No payment methods yet.</td></tr>';
+      }
+    }
+
+    async function createVaultProfile() {
+      const errorEl = document.getElementById('profiles_error');
+      if (errorEl) errorEl.textContent = '';
+      const payload = {
+        name: document.getElementById('profile_name')?.value || '',
+        email: document.getElementById('profile_email')?.value || '',
+        phone: document.getElementById('profile_phone')?.value || '',
+        shipping_address: profileAddress('shipping'),
+        billing_address: profileAddress('billing'),
+      };
+      const profileRes = await apiFetch('/api/profiles', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(appendCaptchaToken(payload)),
+      });
+      const profileData = await profileRes.json();
+      if (!profileRes.ok || profileData.error) {
+        if (errorEl) errorEl.textContent = profileData.error || `Failed to save profile (HTTP ${profileRes.status})`;
+        return;
+      }
+
+      const accountCredential = (document.getElementById('account_credential_ref')?.value || '').trim();
+      const accountEmail = (document.getElementById('account_email')?.value || '').trim();
+      const accountUsername = (document.getElementById('account_username')?.value || '').trim();
+      if (accountCredential && (accountEmail || accountUsername)) {
+        await apiFetch('/api/accounts', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(appendCaptchaToken({
+            retailer: document.getElementById('account_retailer')?.value || 'walmart',
+            username: accountUsername || null,
+            email: accountEmail || null,
+            encrypted_credential_ref: accountCredential,
+            session_status: 'logged_out',
+          })),
+        });
+      }
+
+      const paymentRef = (document.getElementById('payment_token_reference')?.value || '').trim();
+      if (paymentRef) {
+        await apiFetch('/api/payments', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(appendCaptchaToken({
+            label: (document.getElementById('payment_label')?.value || 'Primary payment').trim(),
+            provider: (document.getElementById('payment_provider')?.value || '').trim(),
+            token_reference: paymentRef,
+            billing_profile_id: profileData.id,
+          })),
+        });
+      }
+      showToast('Profile vault saved.');
+      await loadProfilesPanel();
+    }
+
+
+    let captchaAutoSolveTimer = null;
+
+    function logCaptchaTool(message) {
+      const logEl = document.getElementById('captcha_guide_logs');
+      if (!logEl) return;
+      const stamp = new Date().toISOString();
+      logEl.textContent = `[${stamp}] ${message}
+` + (logEl.textContent || '');
+    }
+
+    async function importVirtualCardsFromExcel() {
+      const statusEl = document.getElementById('virtual_cc_status');
+      const fileInput = document.getElementById('virtual_cc_file');
+      const explicitProfileIdRaw = (document.getElementById('virtual_cc_profile_id')?.value || '').trim();
+      if (statusEl) statusEl.textContent = '';
+      const file = fileInput?.files?.[0];
+      if (!file) {
+        if (statusEl) statusEl.textContent = 'Please select an Excel file first.';
+        return;
+      }
+      const parsedProfileId = explicitProfileIdRaw ? Number(explicitProfileIdRaw) : null;
+      if (explicitProfileIdRaw && (!Number.isInteger(parsedProfileId) || parsedProfileId <= 0)) {
+        if (statusEl) statusEl.textContent = 'Target Profile ID must be a positive integer.';
+        return;
+      }
+      try {
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf, {type: 'array'});
+        const first = wb.SheetNames[0];
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[first], {defval: ''});
+        if (!Array.isArray(rows) || rows.length === 0) throw new Error('No rows found in spreadsheet.');
+
+        let created = 0;
+        let skipped = 0;
+        const profileId = parsedProfileId || null;
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i] || {};
+          const tokenReference = String(row.token_reference || row.token || row.card || '').trim();
+          if (!tokenReference) {
+            skipped += 1;
+            continue;
+          }
+          const payload = appendCaptchaToken({
+            label: String(row.label || `Virtual Card ${i + 1}`).trim(),
+            provider: String(row.provider || 'virtual_card').trim(),
+            token_reference: tokenReference,
+            billing_profile_id: profileId,
+          });
+          const res = await apiFetch('/api/payments', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload),
+          });
+          if (res.ok) created += 1;
+          else skipped += 1;
+        }
+        if (statusEl) statusEl.textContent = `Import completed: ${created} added, ${skipped} skipped.`;
+        await loadProfilesPanel();
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `Import failed: ${err?.message || err}`;
+      }
+    }
+
+    async function runCaptchaAutoSolveOnce() {
+      const taskId = Number((document.getElementById('captcha_task_id')?.value || '').trim());
+      const statusEl = document.getElementById('captcha_auto_status');
+      const prefix = (document.getElementById('captcha_solver_prefix')?.value || 'auto-solved-token').trim();
+      if (!Number.isInteger(taskId) || taskId <= 0) {
+        if (statusEl) statusEl.textContent = 'Enter a valid checkout task id first.';
+        return;
+      }
+      try {
+        const listRes = await apiFetch(`/api/checkout/tasks/${taskId}/captcha-challenges`);
+        const challenges = await listRes.json();
+        if (!Array.isArray(challenges)) throw new Error('Invalid challenge payload');
+        const pending = challenges.filter((c) => (c.status || '').toLowerCase() === 'pending');
+        if (!pending.length) {
+          if (statusEl) statusEl.textContent = `No pending challenges for task ${taskId}.`;
+          logCaptchaTool(`No pending challenges for task ${taskId}.`);
+          return;
+        }
+        let solvedCount = 0;
+        for (const challenge of pending) {
+          const solvedToken = `${prefix}-${taskId}-${challenge.id}-${Date.now()}`;
+          const solveRes = await apiFetch(`/api/checkout/captcha-challenges/${challenge.id}/manual-solve`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(appendCaptchaToken({
+              solved_token: solvedToken,
+              operator_note: 'Auto-solved from Captcha tab tool',
+            })),
+          });
+          if (solveRes.ok) {
+            solvedCount += 1;
+            logCaptchaTool(`Solved challenge #${challenge.id} for task ${taskId}.`);
+          }
+        }
+        if (statusEl) statusEl.textContent = `Auto-solver processed ${pending.length} pending challenge(s), solved ${solvedCount}.`;
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `Auto-solver error: ${err?.message || err}`;
+        logCaptchaTool(`Auto-solver error: ${err?.message || err}`);
+      }
+    }
+
+    function toggleCaptchaAutoSolve() {
+      const btn = document.getElementById('captcha_auto_btn');
+      const intervalSeconds = Number((document.getElementById('captcha_poll_seconds')?.value || '8').trim()) || 8;
+      if (captchaAutoSolveTimer) {
+        clearInterval(captchaAutoSolveTimer);
+        captchaAutoSolveTimer = null;
+        if (btn) btn.textContent = 'Start Auto Solve';
+        const statusEl = document.getElementById('captcha_auto_status');
+        if (statusEl) statusEl.textContent = 'Auto solve stopped.';
+        return;
+      }
+      captchaAutoSolveTimer = setInterval(() => {
+        runCaptchaAutoSolveOnce();
+      }, Math.max(3000, intervalSeconds * 1000));
+      if (btn) btn.textContent = 'Stop Auto Solve';
+      const statusEl = document.getElementById('captcha_auto_status');
+      if (statusEl) statusEl.textContent = `Auto solve active every ${Math.max(3, intervalSeconds)}s.`;
+      runCaptchaAutoSolveOnce();
+    }
 
     function selectedMonitorIds() {
       return Array.from(document.querySelectorAll('.monitor-select:checked')).map(x => Number(x.value));
+    }
+
+    function renderManageProductsRows(products = []) {
+      const tbody = document.getElementById('manage_products_rows');
+      const mode = document.getElementById('manage_products_mode')?.value || 'edit';
+      if (!tbody) return;
+      tbody.innerHTML = '';
+      for (const [index, product] of products.entries()) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td><input type="checkbox" class="manage-remove-row" data-index="${index}" ${mode === 'remove' ? '' : 'disabled'} /></td>
+          <td>${index + 1}</td>
+          <td>${product.pid || '-'}</td>
+          <td>${product.quantity || 1}</td>
+          <td><input type="checkbox" class="manage-skip-row" data-index="${index}" ${product.skip_if_oos ? 'checked' : ''} /></td>
+        `;
+        tbody.appendChild(tr);
+      }
+      if (!products.length) {
+        tbody.innerHTML = '<tr><td colspan="5">No products available in selected running tasks.</td></tr>';
+      }
+    }
+
+    async function previewManageProducts() {
+      const monitor_ids = selectedMonitorIds();
+      if (!monitor_ids.length) {
+        alert('Select at least one monitor first.');
+        return;
+      }
+      const res = await apiFetch('/api/checkout/task-groups/products/preview', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({monitor_ids}),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(data.error || 'Failed to load product preview.', true);
+        return;
+      }
+      renderManageProductsRows(data.products || []);
+      const meta = document.getElementById('manage_products_meta');
+      if (meta) meta.textContent = `Previewing ${data.products?.length || 0} product row(s) from ${data.tasks_found || 0} running task(s).`;
+    }
+
+    async function applyManageProducts() {
+      const monitor_ids = selectedMonitorIds();
+      if (!monitor_ids.length) {
+        alert('Select at least one monitor first.');
+        return;
+      }
+      const mode = document.getElementById('manage_products_mode')?.value || 'edit';
+      const input = document.getElementById('manage_products_input')?.value || '';
+      const remove_indices = Array.from(document.querySelectorAll('.manage-remove-row:checked')).map((el) => Number(el.dataset.index));
+      const skip_updates = Array.from(document.querySelectorAll('.manage-skip-row')).map((el) => ({
+        index: Number(el.dataset.index),
+        skip_if_oos: !!el.checked,
+      }));
+
+      const operation = {mode, input, remove_indices, skip_updates};
+      const res = await apiFetch('/api/checkout/task-groups/products', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({monitor_ids, operation}),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showToast(data.error || 'Failed to update task group products.', true);
+        return;
+      }
+      showToast(`Updated ${data.updated || 0} task(s); rejected ${data.rejected || 0}.`, (data.rejected || 0) > 0);
+      await loadTasks();
+      await previewManageProducts();
     }
 
     async function createSchedule() {
@@ -966,6 +3032,43 @@
       await loadDashboardSummary();
     }
 
+    async function deleteAllMonitors() {
+      const monitorRows = await apiFetch('/api/monitors').then(r => r.json()).catch(() => []);
+      if (!Array.isArray(monitorRows) || !monitorRows.length) {
+        alert('No monitors to delete.');
+        return;
+      }
+      const confirmed = confirm(`Delete all ${monitorRows.length} monitors? This cannot be undone.`);
+      if (!confirmed) return;
+      for (const monitor of monitorRows) {
+        await apiFetch(`/api/monitors/${monitor.id}`, {method: 'DELETE'});
+      }
+      await loadMonitors();
+      await loadDashboardSummary();
+    }
+
+    async function bulkStopRunningGroup() {
+      const groupMonitorId = Number((document.getElementById('task_monitor_id')?.value || '').trim());
+      if (!Number.isInteger(groupMonitorId) || groupMonitorId <= 0) {
+        alert('Select a monitor/group first.');
+        return;
+      }
+      const tasks = await apiFetch('/api/checkout/tasks').then(r => r.json()).catch(() => []);
+      const running = (Array.isArray(tasks) ? tasks : []).filter(t =>
+        Number(t.monitor_id) === groupMonitorId && ['monitoring', 'carting', 'shipping', 'payment', 'submitting'].includes(String(t.current_state || '').toLowerCase())
+      );
+      if (!running.length) {
+        alert('No running tasks found for that group.');
+        return;
+      }
+      const confirmed = confirm(`Stop ${running.length} running task(s) for monitor/group ${groupMonitorId}?`);
+      if (!confirmed) return;
+      for (const task of running) {
+        await apiFetch(`/api/checkout/tasks/${task.id}/stop`, {method: 'POST'});
+      }
+      await loadTasks();
+    }
+
     async function toggleLoop() {
       const endpoint = loopRunning ? '/api/stop' : '/api/start';
       await apiFetch(endpoint, {method: 'POST'});
@@ -976,20 +3079,53 @@
 
     function startClock() {
       const el = document.getElementById('clock');
-      if (!el) return;
+      const dashNow = document.getElementById('dashboard_now');
+      if (!el && !dashNow) return;
       const paint = () => {
         const now = new Date();
-        el.textContent = now.toLocaleTimeString();
+        const timeText = now.toLocaleTimeString();
+        if (el) el.textContent = timeText;
+        if (dashNow) dashNow.textContent = timeText;
       };
       paint();
       setInterval(paint, 1000);
     }
 
+    initializeTabNavigation();
     renderApiAuthWarning();
+    hydrateTaskGroups();
+    ensureDefaultTaskGroups();
+    renderTaskGroups();
+    ['task_monitor_id', 'task_name', 'task_count', 'task_mode', 'task_products', 'task_profile_group', 'task_proxy_group', 'task_checkout_proxy_group', 'task_queue_entry_delay_ms', 'task_promo_code']
+      .forEach((id) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('input', updateTaskCreateSummary);
+        el.addEventListener('change', updateTaskCreateSummary);
+        el.addEventListener('keydown', async (event) => {
+          if (event.key === 'ArrowUp' && id === 'task_count') {
+            event.preventDefault();
+            adjustTaskCount(1);
+          } else if (event.key === 'ArrowDown' && id === 'task_count') {
+            event.preventDefault();
+            adjustTaskCount(-1);
+          } else if (event.key === 'Enter' && !event.shiftKey) {
+            event.preventDefault();
+            const createBtn = document.getElementById('create_task_btn');
+            if (createBtn && !createBtn.disabled) {
+              await createTask();
+            }
+          }
+        });
+      });
+    updateTaskCreateSummary();
     loadWorkspace();
     loadMeta();
     loadWebhooks();
+    loadCaptchaHarvesters();
+    loadProfilesPanel();
     loadMonitors();
+    updateTaskModeFields();
     loadTasks();
     loadDashboardSummary();
     startClock();
