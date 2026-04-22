@@ -4942,39 +4942,66 @@ def api_checkout_task_state(task_id: int):
     ).fetchone()
     conn.close()
 
-    return jsonify(
-        {
-            "task_id": task_id,
-            "current_state": row["current_state"],
-            "last_error": row["last_error"],
-            "last_transition_at": row["last_transition_at"],
-            "last_attempt": (
-                {
-                    "id": last_attempt["id"],
-                    "task_id": last_attempt["task_id"],
-                    "state": last_attempt["state"],
-                    "step": last_attempt["status"],
-                    "details": parse_json_object(last_attempt["details"]),
-                    "error": last_attempt["error_text"],
-                    "created_at": last_attempt["created_at"],
-                }
-                if last_attempt
-                else None
-            ),
-        }
-    )
 
-
-@app.post("/api/checkout/tasks/<int:task_id>/captcha-challenges")
+@app.get("/api/checkout/tasks/<int:task_id>/state")
 @require_auth
-def api_create_checkout_captcha_challenge(task_id: int):
-    body = request.json or {}
+def api_checkout_task_state(task_id: int):
     conn = db()
     workspace_id = current_workspace_id()
-    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
-    if not task:
+    row = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+    if not row:
         conn.close()
         return jsonify({"error": "Checkout task not found"}), 404
+
+    last_attempt = conn.execute(
+        """
+        select id, task_id, state, step, details, error_text, created_at
+        from checkout_attempts
+        where task_id = ? and workspace_id = ?
+        order by id desc
+        limit 1
+        """,
+        (task_id, workspace_id),
+    ).fetchone()
+    conn.close()
+
+    payload = {
+        "task_id": task_id,
+        "current_state": row["current_state"],
+        "last_error": row["last_error"],
+        "last_transition_at": row["last_transition_at"],
+        "last_attempt": None,
+    }
+    if last_attempt:
+        payload["last_attempt"] = {
+            "id": last_attempt["id"],
+            "task_id": last_attempt["task_id"],
+            "state": last_attempt["state"],
+            "step": last_attempt["step"],
+            "details": parse_json_object(last_attempt["details"]),
+            "error": last_attempt["error_text"],
+            "created_at": last_attempt["created_at"],
+        }
+    return jsonify(payload)
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/start")
+@require_auth
+def api_start_checkout_task(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
+        conn,
+        task_id=task_id,
+        workspace_id=current_workspace_id(),
+        requested_state="monitoring",
+        reason="api_start",
+    )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
 
     retailer_account_id = body.get("retailer_account_id")
     if retailer_account_id is not None:
@@ -4984,19 +5011,30 @@ def api_create_checkout_captcha_challenge(task_id: int):
             conn.close()
             return jsonify({"error": "retailer_account_id must be an integer"}), 400
 
-    challenge = checkout_captcha_service.create_challenge(
+@app.post("/api/checkout/tasks/<int:task_id>/pause")
+@require_auth
+def api_pause_checkout_task(task_id: int):
+    conn = db()
+    row = transition_checkout_task(
         conn,
-        workspace_id=workspace_id,
         task_id=task_id,
-        retailer_account_id=retailer_account_id,
-        provider_name=CAPTCHA_PROVIDER,
-        expires_in_seconds=int(body.get("expires_in_seconds", 300)),
+        workspace_id=current_workspace_id(),
+        requested_state="paused",
+        reason="api_pause",
     )
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
     conn.commit()
     conn.close()
-    assert challenge is not None
-    emit_captcha_challenge_update(challenge)
-    return jsonify(serialize_challenge(challenge)), 201
+    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+
+
+def emit_captcha_challenge_update(challenge_row: sqlite3.Row) -> None:
+    try:
+        socketio.emit("checkout_captcha_challenge_updated", serialize_challenge(challenge_row))
+    except Exception:
+        return
 
 
 @app.get("/api/checkout/tasks/<int:task_id>/captcha-challenges")
@@ -5020,6 +5058,34 @@ def api_list_checkout_captcha_challenges(task_id: int):
     conn.commit()
     conn.close()
     return jsonify([serialize_challenge(row) for row in rows])
+
+
+@app.post("/api/checkout/tasks/<int:task_id>/captcha-challenges")
+@require_auth
+def api_create_checkout_captcha_challenge(task_id: int):
+    conn = db()
+    workspace_id = current_workspace_id()
+    task = get_checkout_task_for_workspace(conn, task_id, workspace_id)
+    if not task:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+
+    body = request.json or {}
+    retailer_account_id = body.get("retailer_account_id")
+    provider_name = (body.get("provider") or CHECKOUT_CAPTCHA_SOLVE_PROVIDER or "manual").strip() or "manual"
+
+    challenge = checkout_captcha_service.create_challenge(
+        conn,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        retailer_account_id=retailer_account_id,
+        provider_name=provider_name,
+    )
+    conn.commit()
+    conn.close()
+    assert challenge is not None
+    emit_captcha_challenge_update(challenge)
+    return jsonify(serialize_challenge(challenge)), 201
 
 
 @app.post("/api/checkout/captcha-challenges/<int:challenge_id>/manual-solve")
@@ -5069,26 +5135,17 @@ def api_issue_captcha_handoff_token(challenge_id: int):
 
     conn = db()
     row = conn.execute(
-        """
-        select * from captcha_challenges
-        where id = ? and workspace_id = ?
-        """,
+        "select * from captcha_challenges where id = ? and workspace_id = ?",
         (challenge_id, current_workspace_id()),
     ).fetchone()
     if not row:
         conn.close()
         return jsonify({"error": "Captcha challenge not found"}), 404
-
     try:
-        token = checkout_captcha_service.issue_worker_handoff_token(
-            conn,
-            challenge_id=challenge_id,
-            ttl_seconds=ttl_seconds,
-        )
+        token = checkout_captcha_service.issue_worker_handoff_token(conn, challenge_id=challenge_id)
     except ValueError as exc:
         conn.close()
         return jsonify({"error": str(exc)}), 400
-
     updated = conn.execute("select * from captcha_challenges where id = ?", (challenge_id,)).fetchone()
     conn.commit()
     conn.close()
