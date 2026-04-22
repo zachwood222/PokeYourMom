@@ -120,6 +120,26 @@ Best practice: after a drop, filter to **Checkout Details** to identify where ti
     - plan mapping fields: `plan_code`, `plan_interval`, `plan_lookup_key`
     - `created_at`, `updated_at`
 
+
+## Secret encryption and key management
+
+Stored credentials in `account_secrets` are encrypted with Fernet (AEAD-style authenticated encryption) and include a `key_version` metadata field.
+
+Expected environment configuration:
+
+- `SECRET_ENCRYPTION_KEY_VERSION`: active key version used for all new writes (for example, `v2`).
+- `SECRET_ENCRYPTION_KEYS`: comma-separated version map such as `v1:<key>,v2:<key>`.
+- `SECRET_ENCRYPTION_KEY`: compatibility fallback for the active version when `SECRET_ENCRYPTION_KEYS` is not set.
+
+Rotation expectations:
+
+1. Add the new key/version to `SECRET_ENCRYPTION_KEYS`.
+2. Flip `SECRET_ENCRYPTION_KEY_VERSION` to the new version.
+3. Keep older versions configured until all secrets have been read at least once and transparently re-encrypted.
+4. Remove retired keys only after migration is complete and validated.
+
+Legacy ciphertext (pre-migration custom crypto) is still readable and is automatically re-encrypted into the active Fernet key/version on successful read.
+
 ## Runtime flow
 
 1. Operator adds monitors and webhooks in the dashboard.
@@ -129,6 +149,31 @@ Best practice: after a drop, filter to **Checkout Details** to identify where ti
 5. Eligibility logic applies stock markers + optional keyword/price/MSRP filters.
 6. Eligible checks are deduplicated and inserted into `events`.
 7. Event payloads are delivered to all enabled webhooks and logged in `deliveries`.
+
+## Security/runtime configuration
+
+### Required environment variables in production
+
+When running with a non-development environment (for example `APP_ENV=production`), startup fails fast unless these are set:
+
+- `API_AUTH_TOKEN`: required API bearer token for `/api/*` endpoints.
+- `SECRET_ENCRYPTION_KEY`: encryption/HMAC key for sensitive stored values.
+
+### CORS policy
+
+- Development mode permits wildcard origins (`*`) for local iteration.
+- Non-development mode uses `ALLOWED_ORIGINS` (comma-separated) as the CORS allowlist.
+- Wildcard `*` is rejected outside development mode.
+
+Safe example:
+
+```bash
+export APP_ENV=production
+export API_AUTH_TOKEN='replace-with-strong-random-token'
+export SECRET_ENCRYPTION_KEY='replace-with-32+-char-random-secret'
+export ALLOWED_ORIGINS='https://app.example.com,https://admin.example.com'
+python app.py
+```
 
 ## Canonical checkout task API
 
