@@ -1394,6 +1394,24 @@ def init_db() -> None:
             foreign key(retailer_account_id) references retailer_accounts(id)
         );
 
+        create table if not exists captcha_harvesters (
+            id integer primary key autoincrement,
+            workspace_id integer not null,
+            name text not null,
+            proxy_url text,
+            gmail_email text,
+            session_status text not null default 'logged_out',
+            auto_click_enabled integer not null default 1,
+            auto_solve_mode text not null default 'off',
+            local_ai_enabled integer not null default 0,
+            local_ai_status text not null default 'not_installed',
+            notes text,
+            last_tested_at text,
+            created_at text not null,
+            updated_at text not null,
+            foreign key(workspace_id) references workspaces(id)
+        );
+
         create table if not exists task_logs (
             id integer primary key autoincrement,
             task_id integer not null,
@@ -1693,6 +1711,8 @@ def init_db() -> None:
     ensure_column(conn, "checkout_attempts", "error", "text")
     ensure_column(conn, "checkout_attempts", "updated_at", "text")
     ensure_column(conn, "checkout_tasks", "status_timestamps_json", "text")
+    ensure_column(conn, "captcha_harvesters", "notes", "text")
+    ensure_column(conn, "captcha_harvesters", "last_tested_at", "text")
     run_legacy_tasks_migration(conn)
     run_pokemon_center_task_group_config_migration(conn)
     conn.commit()
@@ -7696,6 +7716,217 @@ def api_delete_webhook(webhook_id: int):
         conn.close()
         return jsonify({"error": "Webhook not found"}), 404
     conn.execute("delete from webhooks where id = ? and workspace_id = ?", (webhook_id, workspace_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+def _captcha_harvester_for_workspace(
+    conn: sqlite3.Connection, harvester_id: int, workspace_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "select * from captcha_harvesters where id = ? and workspace_id = ?",
+        (harvester_id, workspace_id),
+    ).fetchone()
+
+
+@app.get("/api/captcha/harvesters")
+@require_auth
+def api_list_captcha_harvesters():
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    rows = conn.execute(
+        "select * from captcha_harvesters where workspace_id = ? order by id asc",
+        (workspace_id,),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(row) for row in rows])
+
+
+@app.post("/api/captcha/harvesters")
+@require_auth
+def api_create_captcha_harvester():
+    body = request.json or {}
+    workspace_id = get_workspace_id_for_request()
+    now_iso = utc_now()
+    name = (body.get("name") or f"Harvester {int(time.time())}").strip()
+    proxy_url = (body.get("proxy_url") or "").strip() or None
+    auto_click_enabled = int(bool(body.get("auto_click_enabled", True)))
+    auto_solve_mode = (body.get("auto_solve_mode") or "off").strip().lower()
+    if auto_solve_mode not in {"off", "serverside", "local_ai"}:
+        return jsonify({"error": "auto_solve_mode must be one of: off, serverside, local_ai"}), 400
+    local_ai_enabled = int(auto_solve_mode == "local_ai")
+    local_ai_status = "ready" if local_ai_enabled else "not_installed"
+
+    conn = db()
+    cur = conn.execute(
+        """
+        insert into captcha_harvesters(
+            workspace_id, name, proxy_url, auto_click_enabled, auto_solve_mode,
+            local_ai_enabled, local_ai_status, created_at, updated_at
+        )
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            workspace_id,
+            name,
+            proxy_url,
+            auto_click_enabled,
+            auto_solve_mode,
+            local_ai_enabled,
+            local_ai_status,
+            now_iso,
+            now_iso,
+        ),
+    )
+    conn.commit()
+    row = conn.execute("select * from captcha_harvesters where id = ?", (cur.lastrowid,)).fetchone()
+    conn.close()
+    return jsonify(dict(row)), 201
+
+
+@app.patch("/api/captcha/harvesters/<int:harvester_id>")
+@require_auth
+def api_update_captcha_harvester(harvester_id: int):
+    body = request.json or {}
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    row = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Captcha harvester not found"}), 404
+
+    updates: dict[str, Any] = {}
+    if "name" in body:
+        updates["name"] = (body.get("name") or "").strip() or row["name"]
+    if "proxy_url" in body:
+        updates["proxy_url"] = (body.get("proxy_url") or "").strip() or None
+    if "gmail_email" in body:
+        updates["gmail_email"] = (body.get("gmail_email") or "").strip() or None
+    if "auto_click_enabled" in body:
+        updates["auto_click_enabled"] = int(bool(body.get("auto_click_enabled")))
+    if "notes" in body:
+        updates["notes"] = (body.get("notes") or "").strip() or None
+    if "auto_solve_mode" in body:
+        mode = (body.get("auto_solve_mode") or "off").strip().lower()
+        if mode not in {"off", "serverside", "local_ai"}:
+            conn.close()
+            return jsonify({"error": "auto_solve_mode must be one of: off, serverside, local_ai"}), 400
+        updates["auto_solve_mode"] = mode
+        updates["local_ai_enabled"] = int(mode == "local_ai")
+        if mode == "local_ai":
+            updates["local_ai_status"] = row["local_ai_status"] if row["local_ai_status"] != "not_installed" else "ready"
+        else:
+            updates["local_ai_status"] = "not_installed"
+
+    if not updates:
+        conn.close()
+        return jsonify({"error": "No mutable fields provided"}), 400
+
+    updates["updated_at"] = utc_now()
+    set_sql = ", ".join(f"{key} = ?" for key in updates.keys())
+    conn.execute(
+        f"update captcha_harvesters set {set_sql} where id = ? and workspace_id = ?",
+        (*updates.values(), harvester_id, workspace_id),
+    )
+    conn.commit()
+    refreshed = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
+    conn.close()
+    return jsonify(dict(refreshed))
+
+
+@app.post("/api/captcha/harvesters/<int:harvester_id>/youtube-signin")
+@require_auth
+def api_signin_captcha_harvester(harvester_id: int):
+    body = request.json or {}
+    workspace_id = get_workspace_id_for_request()
+    gmail_email = (body.get("gmail_email") or "").strip()
+    if not gmail_email:
+        return jsonify({"error": "gmail_email is required"}), 400
+    now_iso = utc_now()
+    conn = db()
+    row = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Captcha harvester not found"}), 404
+    conn.execute(
+        """
+        update captcha_harvesters
+        set gmail_email = ?, session_status = 'signed_in', updated_at = ?
+        where id = ? and workspace_id = ?
+        """,
+        (gmail_email, now_iso, harvester_id, workspace_id),
+    )
+    conn.commit()
+    refreshed = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
+    conn.close()
+    return jsonify(dict(refreshed))
+
+
+@app.post("/api/captcha/harvesters/<int:harvester_id>/clear")
+@require_auth
+def api_clear_captcha_harvester(harvester_id: int):
+    workspace_id = get_workspace_id_for_request()
+    now_iso = utc_now()
+    conn = db()
+    row = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Captcha harvester not found"}), 404
+    conn.execute(
+        """
+        update captcha_harvesters
+        set gmail_email = null, session_status = 'logged_out', notes = null, updated_at = ?
+        where id = ? and workspace_id = ?
+        """,
+        (now_iso, harvester_id, workspace_id),
+    )
+    conn.commit()
+    refreshed = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
+    conn.close()
+    return jsonify(dict(refreshed))
+
+
+@app.post("/api/captcha/harvesters/<int:harvester_id>/local-ai-test")
+@require_auth
+def api_test_captcha_local_ai(harvester_id: int):
+    workspace_id = get_workspace_id_for_request()
+    now_iso = utc_now()
+    conn = db()
+    row = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Captcha harvester not found"}), 404
+    if row["auto_solve_mode"] != "local_ai":
+        conn.close()
+        return jsonify({"error": "Local AI test is only available when auto_solve_mode is local_ai"}), 400
+    conn.execute(
+        """
+        update captcha_harvesters
+        set local_ai_status = 'ready', last_tested_at = ?, updated_at = ?
+        where id = ? and workspace_id = ?
+        """,
+        (now_iso, now_iso, harvester_id, workspace_id),
+    )
+    conn.commit()
+    refreshed = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
+    conn.close()
+    return jsonify({"ok": True, "harvester": dict(refreshed)})
+
+
+@app.delete("/api/captcha/harvesters/<int:harvester_id>")
+@require_auth
+def api_delete_captcha_harvester(harvester_id: int):
+    workspace_id = get_workspace_id_for_request()
+    conn = db()
+    row = _captcha_harvester_for_workspace(conn, harvester_id, workspace_id)
+    if not row:
+        conn.close()
+        return jsonify({"error": "Captcha harvester not found"}), 404
+    conn.execute(
+        "delete from captcha_harvesters where id = ? and workspace_id = ?",
+        (harvester_id, workspace_id),
+    )
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
