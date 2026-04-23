@@ -3184,6 +3184,17 @@ def normalize_checkout_state(raw_state: Any, *, allow_control_states: bool = Tru
     return state
 
 
+def serialize_checkout_state(state: Any) -> str:
+    normalized = str(state or "").strip().lower()
+    compatibility = {
+        "monitoring_product": "monitoring",
+        "adding_to_cart": "carting",
+        "checking_out": "shipping",
+        "decline": "failed",
+    }
+    return compatibility.get(normalized, normalized)
+
+
 def record_checkout_attempt(
     conn: sqlite3.Connection,
     *,
@@ -3771,6 +3782,7 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
         payload["task_config"] = json.loads(config_raw) if config_raw else {}
     except (TypeError, json.JSONDecodeError):
         payload["task_config"] = {}
+    payload["current_state"] = serialize_checkout_state(payload.get("current_state"))
     return payload
 
 
@@ -4269,6 +4281,19 @@ def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return None
     payload = dict(row)
     payload["webhook_url"] = redact_webhook_url(payload.get("webhook_url") or "")
+    return payload
+
+
+def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    config_raw = payload.get("task_config")
+    try:
+        payload["task_config"] = json.loads(config_raw) if config_raw else {}
+    except (TypeError, json.JSONDecodeError):
+        payload["task_config"] = {}
+    payload["current_state"] = serialize_checkout_state(payload.get("current_state"))
     return payload
 
 
@@ -7061,7 +7086,7 @@ def api_checkout_task_state_v2(task_id: int):
     conn.close()
     payload = {
         "task_id": task_id,
-        "current_state": row["current_state"],
+        "current_state": serialize_checkout_state(row["current_state"]),
         "last_error": row["last_error"],
         "last_transition_at": row["last_transition_at"],
         "autopilot_profile_id": row["autopilot_profile_id"],
