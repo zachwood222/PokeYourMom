@@ -624,35 +624,28 @@
     }
     .task-modal-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
     .monitor-pulse-feed {
-      max-height: 60vh;
-      overflow-y: auto;
       display: grid;
       gap: 8px;
-      margin-top: 10px;
+      max-height: 62vh;
+      overflow-y: auto;
+      padding-right: 4px;
     }
     .monitor-pulse-item {
       border: 1px solid #27344d;
       border-radius: 8px;
-      padding: 8px 10px;
+      padding: 9px;
       background: #0e1523;
       font-size: 12px;
-      display: grid;
-      gap: 4px;
+      line-height: 1.4;
     }
-    .monitor-pulse-meta { color: var(--muted); font-size: 11px; }
-    .monitor-pulse-badge {
-      display: inline-flex;
-      align-items: center;
-      border-radius: 999px;
-      padding: 2px 8px;
-      font-size: 10px;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      margin-right: 6px;
+    .monitor-pulse-item-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 4px;
+      font-weight: 600;
     }
-    .monitor-pulse-badge.stock { background: rgba(87, 226, 150, 0.18); color: #7cffb5; border: 1px solid rgba(87, 226, 150, 0.4); }
-    .monitor-pulse-badge.oos { background: rgba(123, 137, 169, 0.18); color: #b9c6db; border: 1px solid rgba(123, 137, 169, 0.4); }
-    .monitor-pulse-badge.error { background: rgba(237, 109, 109, 0.18); color: #ffb8b8; border: 1px solid rgba(237, 109, 109, 0.45); }
+    .monitor-pulse-item-meta { color: var(--muted); font-size: 11px; }
 
     .app-shell {
       display: grid;
@@ -1687,16 +1680,94 @@
       });
     }
 
-    function openMonitorPulse() {
-      document.getElementById('monitor_pulse_modal_overlay')?.classList.add('open');
+    function monitorPulseEventTime(eventRow) {
+      return eventRow?.checked_at || eventRow?.event_time || eventRow?.created_at || null;
+    }
+
+    function monitorPulseEscape(value) {
+      return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function monitorPulsePriceText(eventRow) {
+      const numeric = eventRow?.price_cents;
+      if (Number.isFinite(Number(numeric))) return `$${(Number(numeric) / 100).toFixed(2)}`;
+      if (eventRow?.price != null && String(eventRow.price).trim() !== '') return String(eventRow.price);
+      return 'N/A';
+    }
+
+    function appendMonitorPulseItem(eventRow) {
+      const feed = document.getElementById('monitor_pulse_feed');
+      if (!feed || !eventRow) return;
+      const monitorId = eventRow.monitor_id ?? eventRow.monitorId ?? 'n/a';
+      const retailer = eventRow.retailer || eventRow.site || 'unknown';
+      const stockState = eventRow.stock_state || eventRow.stock || eventRow.state || 'unknown';
+      const price = monitorPulsePriceText(eventRow);
+      const checkedAt = monitorPulseEventTime(eventRow);
+      const checkedText = checkedAt ? new Date(checkedAt).toLocaleString() : 'N/A';
+
+      const item = document.createElement('div');
+      item.className = 'monitor-pulse-item';
+      item.innerHTML = `
+        <div class="monitor-pulse-item-head">
+          <span>Monitor #${monitorPulseEscape(monitorId)}</span>
+          <span>${monitorPulseEscape(stockState)}</span>
+        </div>
+        <div>Retailer: ${monitorPulseEscape(retailer)}</div>
+        <div>Price: ${monitorPulseEscape(price)}</div>
+        <div class="monitor-pulse-item-meta">Checked: ${monitorPulseEscape(checkedText)}</div>
+      `;
+      feed.appendChild(item);
+    }
+
+    async function loadInitialMonitorPulse() {
+      const feed = document.getElementById('monitor_pulse_feed');
+      if (!feed) return;
+      try {
+        const res = await apiFetch('/api/events');
+        if (!res.ok) {
+          feed.innerHTML = `<div class="small">Failed to load monitor events (HTTP ${res.status}).</div>`;
+          return;
+        }
+        const data = await res.json();
+        const rows = Array.isArray(data) ? data : (Array.isArray(data?.events) ? data.events : []);
+        feed.innerHTML = '';
+        if (!rows.length) {
+          feed.innerHTML = '<div class="small">No monitor events yet.</div>';
+          monitorPulseHasLoaded = true;
+          return;
+        }
+        rows
+          .slice()
+          .sort((a, b) => new Date(monitorPulseEventTime(b) || 0) - new Date(monitorPulseEventTime(a) || 0))
+          .forEach((eventRow) => appendMonitorPulseItem(eventRow));
+        monitorPulseHasLoaded = true;
+      } catch (err) {
+        feed.innerHTML = `<div class="small">Unable to load monitor events: ${monitorPulseEscape(err?.message || err)}</div>`;
+      }
+    }
+
+    async function openMonitorPulse({resetFeed = true} = {}) {
+      const overlay = document.getElementById('monitor_pulse_overlay');
+      const feed = document.getElementById('monitor_pulse_feed');
+      if (!overlay || !feed) return;
+      overlay.classList.add('open');
+      if (resetFeed || !monitorPulseHasLoaded) {
+        feed.innerHTML = '<div class="small">Loading latest monitor events…</div>';
+      }
+      await loadInitialMonitorPulse();
     }
 
     function closeMonitorPulse() {
-      document.getElementById('monitor_pulse_modal_overlay')?.classList.remove('open');
+      document.getElementById('monitor_pulse_overlay')?.classList.remove('open');
     }
 
-    function dismissMonitorPulseModal(event) {
-      if (event.target?.id === 'monitor_pulse_modal_overlay') closeMonitorPulse();
+    function dismissMonitorPulse(event) {
+      if (event.target?.id === 'monitor_pulse_overlay') closeMonitorPulse();
     }
 
     function importTasksPrompt() {
@@ -3570,7 +3641,13 @@
         });
       });
     updateTaskCreateSummary();
-    document.getElementById('monitor_pulse_show_all')?.addEventListener('change', renderMonitorPulseFeed);
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      const monitorOverlay = document.getElementById('monitor_pulse_overlay');
+      if (monitorOverlay?.classList.contains('open')) {
+        closeMonitorPulse();
+      }
+    });
     loadWorkspace();
     loadMeta();
     loadWebhooks();

@@ -7024,7 +7024,9 @@ def api_start_checkout_task_v2(task_id: int):
         return jsonify({"error": "Checkout task not found"}), 404
     conn.commit()
     conn.close()
-    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+    task_payload = serialize_checkout_task(row) or {}
+    task_payload["current_state"] = "monitoring"
+    return jsonify({"ok": True, "task": task_payload})
 
 
 @app.post("/api/checkout/tasks/<int:task_id>/pause")
