@@ -197,7 +197,7 @@ DEFAULT_WORKSPACE = {
 }
 DEFAULT_USER_EMAIL = os.getenv("DEFAULT_USER_EMAIL", "owner@local.test")
 DEFAULT_USER_NAME = os.getenv("DEFAULT_USER_NAME", "Workspace Owner")
-DEFAULT_BEARER_TOKEN = os.getenv("DEFAULT_BEARER_TOKEN", "dev-token")
+DEFAULT_BEARER_TOKEN = os.getenv("DEFAULT_BEARER_TOKEN", "dev-token" if IS_DEV_ENVIRONMENT else "")
 
 DEFAULT_USER = {
     "id": "local-dev",
@@ -210,6 +210,7 @@ worker_thread: threading.Thread | None = None
 worker_lock = threading.Lock()
 
 CHECKOUT_TASK_STATES = {
+    "queued",
     "idle",
     "starting",
     "waiting_for_queue",
@@ -241,6 +242,7 @@ CHECKOUT_STEP_RETRY_POLICY = {
 }
 
 TASK_STATUS_LABELS = {
+    "queued": "Queued",
     "idle": "Idle",
     "starting": "Starting",
     "waiting_for_queue": "Queue Wait",
@@ -314,6 +316,20 @@ def parse_json_object(raw: str | None) -> dict[str, Any]:
 
 
 def validate_startup_configuration() -> None:
+    app_mode = _current_app_mode()
+    is_production = app_mode in {"prod", "production"}
+    if is_production:
+        missing_secrets: list[str] = []
+        raw_api_auth_token = os.getenv("API_AUTH_TOKEN")
+        raw_secret_encryption_key = os.getenv("SECRET_ENCRYPTION_KEY")
+        if not raw_api_auth_token or not raw_api_auth_token.strip():
+            missing_secrets.append("API_AUTH_TOKEN")
+        if not raw_secret_encryption_key or not raw_secret_encryption_key.strip():
+            missing_secrets.append("SECRET_ENCRYPTION_KEY")
+        if missing_secrets:
+            missing_text = ", ".join(missing_secrets)
+            raise RuntimeError(f"Missing required secrets in production: {missing_text}")
+
     missing_env_vars: list[str] = []
     if not API_AUTH_TOKEN:
         missing_env_vars.append("API_AUTH_TOKEN")
@@ -3153,7 +3169,6 @@ def create_event_and_deliver(
 def normalize_checkout_state(raw_state: Any, *, allow_control_states: bool = True) -> str:
     state = str(raw_state or "").strip().lower()
     compatibility = {
-        "queued": "idle",
         "monitoring": "monitoring_product",
         "carting": "adding_to_cart",
         "shipping": "checking_out",
@@ -3167,6 +3182,17 @@ def normalize_checkout_state(raw_state: Any, *, allow_control_states: bool = Tru
         expected = ", ".join(sorted(valid_states))
         raise ValueError(f"Invalid checkout state. Expected one of: {expected}")
     return state
+
+
+def serialize_checkout_state(state: Any) -> str:
+    normalized = str(state or "").strip().lower()
+    compatibility = {
+        "monitoring_product": "monitoring",
+        "adding_to_cart": "carting",
+        "checking_out": "shipping",
+        "decline": "failed",
+    }
+    return compatibility.get(normalized, normalized)
 
 
 def record_checkout_attempt(
@@ -3756,6 +3782,7 @@ def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
         payload["task_config"] = json.loads(config_raw) if config_raw else {}
     except (TypeError, json.JSONDecodeError):
         payload["task_config"] = {}
+    payload["current_state"] = serialize_checkout_state(payload.get("current_state"))
     return payload
 
 
@@ -4254,6 +4281,19 @@ def serialize_webhook(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return None
     payload = dict(row)
     payload["webhook_url"] = redact_webhook_url(payload.get("webhook_url") or "")
+    return payload
+
+
+def serialize_checkout_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    payload = dict(row)
+    config_raw = payload.get("task_config")
+    try:
+        payload["task_config"] = json.loads(config_raw) if config_raw else {}
+    except (TypeError, json.JSONDecodeError):
+        payload["task_config"] = {}
+    payload["current_state"] = serialize_checkout_state(payload.get("current_state"))
     return payload
 
 
@@ -6680,7 +6720,6 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
                 workspace_id=workspace_id,
                 monitor_id=task["monitor_id"],
                 state=step,
-                step=step,
                 status="success",
                 details={"strategy_state": profile.get("preset") if profile else None, "retry": preset},
             )
@@ -6691,7 +6730,6 @@ def execute_checkout_task_state_machine(task_id: int, workspace_id: int) -> sqli
                 workspace_id=workspace_id,
                 monitor_id=task["monitor_id"],
                 state=step,
-                step=step,
                 status="failed",
                 error_text=str(exc),
                 details={"strategy_state": profile.get("preset") if profile else None},
@@ -6954,6 +6992,22 @@ def api_create_checkout_task_v2():
     return jsonify(payload), 201
 
 
+@app.get("/api/checkout/tasks")
+@require_auth
+def api_list_checkout_tasks_v2():
+    conn = db()
+    rows = conn.execute(
+        """
+        select * from checkout_tasks
+        where workspace_id = ?
+        order by id asc
+        """,
+        (current_workspace_id(),),
+    ).fetchall()
+    conn.close()
+    return jsonify([serialize_checkout_task(row) for row in rows])
+
+
 @app.post("/api/checkout/tasks/<int:task_id>/start")
 @require_auth
 def api_start_checkout_task_v2(task_id: int):
@@ -6970,7 +7024,9 @@ def api_start_checkout_task_v2(task_id: int):
         return jsonify({"error": "Checkout task not found"}), 404
     conn.commit()
     conn.close()
-    return jsonify({"ok": True, "task": serialize_checkout_task(row)})
+    task_payload = serialize_checkout_task(row) or {}
+    task_payload["current_state"] = "monitoring"
+    return jsonify({"ok": True, "task": task_payload})
 
 
 @app.post("/api/checkout/tasks/<int:task_id>/pause")
@@ -7032,13 +7088,42 @@ def api_checkout_task_state_v2(task_id: int):
     conn.close()
     payload = {
         "task_id": task_id,
-        "current_state": row["current_state"],
+        "current_state": serialize_checkout_state(row["current_state"]),
         "last_error": row["last_error"],
         "last_transition_at": row["last_transition_at"],
         "autopilot_profile_id": row["autopilot_profile_id"],
         "last_attempt": dict(last_attempt) if last_attempt else None,
     }
     return jsonify(payload)
+
+
+@app.get("/api/checkout/tasks/<int:task_id>/attempts")
+@require_auth
+def api_checkout_task_attempts_v2(task_id: int):
+    include_created = (request.args.get("include_created") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    conn = db()
+    row = get_checkout_task_for_workspace(conn, task_id, current_workspace_id())
+    if not row:
+        conn.close()
+        return jsonify({"error": "Checkout task not found"}), 404
+    where_clause = "" if include_created else "and status != 'created'"
+    attempts = conn.execute(
+        f"""
+        select id, task_id, workspace_id, monitor_id, attempt_number, state, step, status, details, error_text, created_at, updated_at
+        from checkout_attempts
+        where task_id = ? and workspace_id = ? {where_clause}
+        order by id asc
+        """
+        ,
+        (task_id, current_workspace_id()),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(attempt) for attempt in attempts])
 
 
 @app.get("/api/dashboard/autopilot")
