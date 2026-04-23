@@ -623,6 +623,29 @@
       padding: 14px;
     }
     .task-modal-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+    .monitor-pulse-feed {
+      display: grid;
+      gap: 8px;
+      max-height: 62vh;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .monitor-pulse-item {
+      border: 1px solid #27344d;
+      border-radius: 8px;
+      padding: 9px;
+      background: #0e1523;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .monitor-pulse-item-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 4px;
+      font-weight: 600;
+    }
+    .monitor-pulse-item-meta { color: var(--muted); font-size: 11px; }
 
     .app-shell {
       display: grid;
@@ -1206,6 +1229,19 @@
             </div>
           </div>
         </div>
+
+        <div id="monitor_pulse_overlay" class="task-modal-overlay" onclick="dismissMonitorPulse(event)">
+          <div class="task-modal" role="dialog" aria-modal="true" aria-label="Monitor pulse feed" style="max-width:860px;">
+            <div class="task-modal-header">
+              <h2 class="section-title">Monitor Pulse</h2>
+              <button type="button" onclick="closeMonitorPulse()">Close</button>
+            </div>
+            <p class="small">Live and recent monitor checks from <code>/api/events</code>.</p>
+            <div id="monitor_pulse_feed" class="monitor-pulse-feed" aria-live="polite">
+              <div class="small">Loading latest monitor events…</div>
+            </div>
+          </div>
+        </div>
       </section>
 
       <section id="tab-webhooks" class="tab">
@@ -1388,6 +1424,7 @@
     const API_AUTH_TOKEN_NORMALIZED = typeof API_AUTH_TOKEN === 'string' ? API_AUTH_TOKEN.trim() : '';
     const HAS_API_AUTH_TOKEN = API_AUTH_TOKEN_NORMALIZED.length > 0;
     let loopRunning = false;
+    let monitorPulseHasLoaded = false;
     let selectedTaskId = null;
     let taskMap = new Map();
     let selectedTaskIds = new Set();
@@ -1548,8 +1585,94 @@
       });
     }
 
-    function openMonitorPulse() {
-      showToast('Monitor popup is not wired to backend yet; connect restock stream endpoint to enable.');
+    function monitorPulseEventTime(eventRow) {
+      return eventRow?.checked_at || eventRow?.event_time || eventRow?.created_at || null;
+    }
+
+    function monitorPulseEscape(value) {
+      return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function monitorPulsePriceText(eventRow) {
+      const numeric = eventRow?.price_cents;
+      if (Number.isFinite(Number(numeric))) return `$${(Number(numeric) / 100).toFixed(2)}`;
+      if (eventRow?.price != null && String(eventRow.price).trim() !== '') return String(eventRow.price);
+      return 'N/A';
+    }
+
+    function appendMonitorPulseItem(eventRow) {
+      const feed = document.getElementById('monitor_pulse_feed');
+      if (!feed || !eventRow) return;
+      const monitorId = eventRow.monitor_id ?? eventRow.monitorId ?? 'n/a';
+      const retailer = eventRow.retailer || eventRow.site || 'unknown';
+      const stockState = eventRow.stock_state || eventRow.stock || eventRow.state || 'unknown';
+      const price = monitorPulsePriceText(eventRow);
+      const checkedAt = monitorPulseEventTime(eventRow);
+      const checkedText = checkedAt ? new Date(checkedAt).toLocaleString() : 'N/A';
+
+      const item = document.createElement('div');
+      item.className = 'monitor-pulse-item';
+      item.innerHTML = `
+        <div class="monitor-pulse-item-head">
+          <span>Monitor #${monitorPulseEscape(monitorId)}</span>
+          <span>${monitorPulseEscape(stockState)}</span>
+        </div>
+        <div>Retailer: ${monitorPulseEscape(retailer)}</div>
+        <div>Price: ${monitorPulseEscape(price)}</div>
+        <div class="monitor-pulse-item-meta">Checked: ${monitorPulseEscape(checkedText)}</div>
+      `;
+      feed.appendChild(item);
+    }
+
+    async function loadInitialMonitorPulse() {
+      const feed = document.getElementById('monitor_pulse_feed');
+      if (!feed) return;
+      try {
+        const res = await apiFetch('/api/events');
+        if (!res.ok) {
+          feed.innerHTML = `<div class="small">Failed to load monitor events (HTTP ${res.status}).</div>`;
+          return;
+        }
+        const data = await res.json();
+        const rows = Array.isArray(data) ? data : (Array.isArray(data?.events) ? data.events : []);
+        feed.innerHTML = '';
+        if (!rows.length) {
+          feed.innerHTML = '<div class="small">No monitor events yet.</div>';
+          monitorPulseHasLoaded = true;
+          return;
+        }
+        rows
+          .slice()
+          .sort((a, b) => new Date(monitorPulseEventTime(b) || 0) - new Date(monitorPulseEventTime(a) || 0))
+          .forEach((eventRow) => appendMonitorPulseItem(eventRow));
+        monitorPulseHasLoaded = true;
+      } catch (err) {
+        feed.innerHTML = `<div class="small">Unable to load monitor events: ${monitorPulseEscape(err?.message || err)}</div>`;
+      }
+    }
+
+    async function openMonitorPulse({resetFeed = true} = {}) {
+      const overlay = document.getElementById('monitor_pulse_overlay');
+      const feed = document.getElementById('monitor_pulse_feed');
+      if (!overlay || !feed) return;
+      overlay.classList.add('open');
+      if (resetFeed || !monitorPulseHasLoaded) {
+        feed.innerHTML = '<div class="small">Loading latest monitor events…</div>';
+      }
+      await loadInitialMonitorPulse();
+    }
+
+    function closeMonitorPulse() {
+      document.getElementById('monitor_pulse_overlay')?.classList.remove('open');
+    }
+
+    function dismissMonitorPulse(event) {
+      if (event.target?.id === 'monitor_pulse_overlay') closeMonitorPulse();
     }
 
     function importTasksPrompt() {
@@ -3393,6 +3516,13 @@
         });
       });
     updateTaskCreateSummary();
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      const monitorOverlay = document.getElementById('monitor_pulse_overlay');
+      if (monitorOverlay?.classList.contains('open')) {
+        closeMonitorPulse();
+      }
+    });
     loadWorkspace();
     loadMeta();
     loadWebhooks();
