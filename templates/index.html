@@ -1255,6 +1255,19 @@
             </div>
           </div>
         </div>
+
+        <div id="monitor_pulse_overlay" class="task-modal-overlay" onclick="dismissMonitorPulse(event)">
+          <div class="task-modal" role="dialog" aria-modal="true" aria-label="Monitor pulse feed" style="max-width:860px;">
+            <div class="task-modal-header">
+              <h2 class="section-title">Monitor Pulse</h2>
+              <button type="button" onclick="closeMonitorPulse()">Close</button>
+            </div>
+            <p class="small">Live and recent monitor checks from <code>/api/events</code>.</p>
+            <div id="monitor_pulse_feed" class="monitor-pulse-feed" aria-live="polite">
+              <div class="small">Loading latest monitor events…</div>
+            </div>
+          </div>
+        </div>
       </section>
 
       <section id="tab-webhooks" class="tab">
@@ -1437,6 +1450,7 @@
     const API_AUTH_TOKEN_NORMALIZED = typeof API_AUTH_TOKEN === 'string' ? API_AUTH_TOKEN.trim() : '';
     const HAS_API_AUTH_TOKEN = API_AUTH_TOKEN_NORMALIZED.length > 0;
     let loopRunning = false;
+    let monitorPulseHasLoaded = false;
     let selectedTaskId = null;
     let taskMap = new Map();
     let selectedTaskIds = new Set();
