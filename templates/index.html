@@ -1249,18 +1249,6 @@
           </div>
         </div>
 
-        <div id="monitor_pulse_overlay" class="task-modal-overlay" onclick="dismissMonitorPulse(event)">
-          <div class="task-modal" role="dialog" aria-modal="true" aria-label="Monitor pulse feed" style="max-width:860px;">
-            <div class="task-modal-header">
-              <h2 class="section-title">Monitor Pulse</h2>
-              <button type="button" onclick="closeMonitorPulse()">Close</button>
-            </div>
-            <p class="small">Live and recent monitor checks from <code>/api/events</code>.</p>
-            <div id="monitor_pulse_feed" class="monitor-pulse-feed" aria-live="polite">
-              <div class="small">Loading latest monitor events…</div>
-            </div>
-          </div>
-        </div>
       </section>
 
       <section id="tab-webhooks" class="tab">
@@ -1752,7 +1740,7 @@
     }
 
     async function openMonitorPulse({resetFeed = true} = {}) {
-      const overlay = document.getElementById('monitor_pulse_overlay');
+      const overlay = document.getElementById('monitor_pulse_modal_overlay') || document.getElementById('monitor_pulse_overlay');
       const feed = document.getElementById('monitor_pulse_feed');
       if (!overlay || !feed) return;
       overlay.classList.add('open');
@@ -1763,11 +1751,16 @@
     }
 
     function closeMonitorPulse() {
+      document.getElementById('monitor_pulse_modal_overlay')?.classList.remove('open');
       document.getElementById('monitor_pulse_overlay')?.classList.remove('open');
     }
 
     function dismissMonitorPulse(event) {
-      if (event.target?.id === 'monitor_pulse_overlay') closeMonitorPulse();
+      if (event.target?.id === 'monitor_pulse_overlay' || event.target?.id === 'monitor_pulse_modal_overlay') closeMonitorPulse();
+    }
+
+    function dismissMonitorPulseModal(event) {
+      if (event.target?.id === 'monitor_pulse_modal_overlay') closeMonitorPulse();
     }
 
     function importTasksPrompt() {
