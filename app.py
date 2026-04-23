@@ -317,7 +317,8 @@ def parse_json_object(raw: str | None) -> dict[str, Any]:
 
 def validate_startup_configuration() -> None:
     app_mode = _current_app_mode()
-    if app_mode == "production":
+    is_production = app_mode in {"prod", "production"}
+    if is_production:
         missing_secrets: list[str] = []
         raw_api_auth_token = os.getenv("API_AUTH_TOKEN")
         raw_secret_encryption_key = os.getenv("SECRET_ENCRYPTION_KEY")
