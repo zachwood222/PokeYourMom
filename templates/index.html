@@ -623,6 +623,36 @@
       padding: 14px;
     }
     .task-modal-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+    .monitor-pulse-feed {
+      max-height: 60vh;
+      overflow-y: auto;
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .monitor-pulse-item {
+      border: 1px solid #27344d;
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #0e1523;
+      font-size: 12px;
+      display: grid;
+      gap: 4px;
+    }
+    .monitor-pulse-meta { color: var(--muted); font-size: 11px; }
+    .monitor-pulse-badge {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      margin-right: 6px;
+    }
+    .monitor-pulse-badge.stock { background: rgba(87, 226, 150, 0.18); color: #7cffb5; border: 1px solid rgba(87, 226, 150, 0.4); }
+    .monitor-pulse-badge.oos { background: rgba(123, 137, 169, 0.18); color: #b9c6db; border: 1px solid rgba(123, 137, 169, 0.4); }
+    .monitor-pulse-badge.error { background: rgba(237, 109, 109, 0.18); color: #ffb8b8; border: 1px solid rgba(237, 109, 109, 0.45); }
 
     .app-shell {
       display: grid;
@@ -1099,6 +1129,25 @@
           </div>
         </div>
 
+        <div id="monitor_pulse_modal_overlay" class="task-modal-overlay" onclick="dismissMonitorPulseModal(event)">
+          <div class="task-modal" role="dialog" aria-modal="true" aria-label="Monitor pulse feed" style="max-width:820px;">
+            <div class="task-modal-header">
+              <h2 class="section-title">Monitor Pulse</h2>
+              <div class="actions">
+                <label style="display:flex;align-items:center;gap:6px;margin:0;">
+                  <input id="monitor_pulse_show_all" type="checkbox" style="width:auto;" />
+                  Show all checks
+                </label>
+                <button onclick="closeMonitorPulse()">Close</button>
+              </div>
+            </div>
+            <div id="monitor_pulse_status" class="small">Listening for monitor updates.</div>
+            <div id="monitor_pulse_feed" class="monitor-pulse-feed">
+              <div class="small">No monitor events yet.</div>
+            </div>
+          </div>
+        </div>
+
         <div style="display:none;">
           <input id="quick_retailer" value="walmart" />
           <input id="quick_poll_interval" value="20" />
@@ -1400,7 +1449,83 @@
     let taskMonitorsById = new Map();
     let taskGroups = [];
     let selectedTaskGroupId = null;
+    let activeWorkspaceId = null;
+    const MONITOR_PULSE_MAX_ITEMS = 100;
+    const monitorPulseBuffer = [];
     const toArray = (value, key) => Array.isArray(value) ? value : (value && Array.isArray(value[key]) ? value[key] : []);
+    const safeHtml = (value) => String(value ?? '')
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
+
+    function monitorWorkspaceId(payload) {
+      if (!payload || typeof payload !== 'object') return null;
+      const raw = payload.workspace_id ?? payload.workspaceId ?? payload.workspace?.id ?? null;
+      if (raw === null || raw === undefined || raw === '') return null;
+      const asNum = Number(raw);
+      return Number.isFinite(asNum) ? asNum : String(raw);
+    }
+
+    function isMonitorEventForActiveWorkspace(payload) {
+      if (activeWorkspaceId === null || activeWorkspaceId === undefined) return true;
+      const eventWorkspaceId = monitorWorkspaceId(payload);
+      if (eventWorkspaceId === null || eventWorkspaceId === undefined) return true;
+      return String(eventWorkspaceId) === String(activeWorkspaceId);
+    }
+
+    function normalizeMonitorPulsePayload(payload, kind = 'update') {
+      if (!payload || typeof payload !== 'object') return null;
+      const monitorId = Number(payload.monitor_id);
+      const retailer = String(payload.retailer || '').trim();
+      const checkedAt = payload.checked_at || payload.checkedAt || payload.timestamp || null;
+      if (!Number.isInteger(monitorId) || monitorId <= 0 || !retailer || !checkedAt) return null;
+      const inStock = payload.in_stock === true;
+      return {
+        type: kind,
+        monitor_id: monitorId,
+        retailer,
+        checked_at: checkedAt,
+        in_stock: inStock,
+        status: kind === 'error' ? 'ERROR' : (inStock ? 'IN STOCK' : 'OOS'),
+        product_url: payload.product_url || payload.url || null,
+        message: payload.message || payload.error || payload.reason || '',
+      };
+    }
+
+    function appendMonitorPulseItem(entry) {
+      const feed = document.getElementById('monitor_pulse_feed');
+      if (!feed || !entry) return;
+      if (feed.querySelector('.small')) feed.innerHTML = '';
+      const item = document.createElement('div');
+      item.className = 'monitor-pulse-item';
+      const badgeClass = entry.type === 'error' ? 'error' : (entry.in_stock ? 'stock' : 'oos');
+      const checkedAt = new Date(entry.checked_at);
+      const checkedText = Number.isNaN(checkedAt.getTime()) ? String(entry.checked_at) : checkedAt.toLocaleString();
+      item.innerHTML = `
+        <div><span class="monitor-pulse-badge ${badgeClass}">${safeHtml(entry.status)}</span>${safeHtml(entry.retailer)} • monitor #${safeHtml(entry.monitor_id)}</div>
+        <div>${safeHtml(entry.message || (entry.in_stock ? 'Stock detected.' : 'Checked, still out of stock.'))}</div>
+        <div class="monitor-pulse-meta">${safeHtml(checkedText)}${entry.product_url ? ` • <a href="${safeHtml(entry.product_url)}" target="_blank" rel="noopener noreferrer">product</a>` : ''}</div>
+      `;
+      feed.prepend(item);
+      while (feed.children.length > MONITOR_PULSE_MAX_ITEMS) {
+        feed.removeChild(feed.lastElementChild);
+      }
+    }
+
+    function renderMonitorPulseFeed() {
+      const feed = document.getElementById('monitor_pulse_feed');
+      if (!feed) return;
+      const showAll = !!document.getElementById('monitor_pulse_show_all')?.checked;
+      feed.innerHTML = '';
+      const visible = monitorPulseBuffer.filter((entry) => showAll || entry.type === 'error' || entry.in_stock === true);
+      if (!visible.length) {
+        feed.innerHTML = '<div class="small">No monitor events yet.</div>';
+        return;
+      }
+      for (const entry of visible) appendMonitorPulseItem(entry);
+    }
     function toggleTaskSelected(taskId, isSelected) {
       if (isSelected) {
         selectedTaskIds.add(taskId);
@@ -1549,7 +1674,15 @@
     }
 
     function openMonitorPulse() {
-      showToast('Monitor popup is not wired to backend yet; connect restock stream endpoint to enable.');
+      document.getElementById('monitor_pulse_modal_overlay')?.classList.add('open');
+    }
+
+    function closeMonitorPulse() {
+      document.getElementById('monitor_pulse_modal_overlay')?.classList.remove('open');
+    }
+
+    function dismissMonitorPulseModal(event) {
+      if (event.target?.id === 'monitor_pulse_modal_overlay') closeMonitorPulse();
     }
 
     function importTasksPrompt() {
@@ -1827,10 +1960,40 @@
       }
     });
 
+    socket.on('monitor_update', (payload) => {
+      const normalized = normalizeMonitorPulsePayload(payload, 'update');
+      if (!normalized) return;
+      if (!isMonitorEventForActiveWorkspace(payload)) return;
+      const showAll = !!document.getElementById('monitor_pulse_show_all')?.checked;
+      if (!showAll && normalized.in_stock !== true) return;
+      monitorPulseBuffer.unshift(normalized);
+      if (monitorPulseBuffer.length > MONITOR_PULSE_MAX_ITEMS) {
+        monitorPulseBuffer.length = MONITOR_PULSE_MAX_ITEMS;
+      }
+      appendMonitorPulseItem(normalized);
+    });
+
+    socket.on('monitor_error', (payload) => {
+      const normalized = normalizeMonitorPulsePayload(payload, 'error');
+      if (!normalized) return;
+      if (!isMonitorEventForActiveWorkspace(payload)) return;
+      monitorPulseBuffer.unshift(normalized);
+      if (monitorPulseBuffer.length > MONITOR_PULSE_MAX_ITEMS) {
+        monitorPulseBuffer.length = MONITOR_PULSE_MAX_ITEMS;
+      }
+      const showAll = !!document.getElementById('monitor_pulse_show_all')?.checked;
+      if (!showAll) {
+        renderMonitorPulseFeed();
+        return;
+      }
+      appendMonitorPulseItem(normalized);
+    });
+
     async function loadWorkspace() {
       const data = await apiFetch('/api/workspace').then(r => r.json());
       if (data.workspace) {
         document.getElementById('plan').value = data.workspace.plan;
+        activeWorkspaceId = data.workspace.id ?? data.workspace.workspace_id ?? null;
       }
     }
 
@@ -3393,6 +3556,7 @@
         });
       });
     updateTaskCreateSummary();
+    document.getElementById('monitor_pulse_show_all')?.addEventListener('change', renderMonitorPulseFeed);
     loadWorkspace();
     loadMeta();
     loadWebhooks();
